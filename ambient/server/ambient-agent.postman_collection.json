@@ -1,0 +1,350 @@
+{
+  "info": {
+    "_postman_id": "ce6a4bf8-4120-4b1f-9a36-9d3f6e64d4b5",
+    "name": "Ambient Agent API",
+    "description": "Two interfaces over one engine:\n\n1. **Managed Agents** (`/v1`, `x-api-key`) — the Anthropic SDK protocol. Flow: Create Agent → Create Environment → Create Session → Send Event → Stream Events.\n2. **Native Ambient** (`/ambient/v1`, Bearer) — the original video-first API.\n\nThe video is passed on session create via `metadata.video_id` (Managed Agents) or `video_id` (native).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8080" },
+    { "key": "api_key", "value": "dev-token" },
+    { "key": "video_id", "value": "Seattle_bad_driver_accident" },
+    { "key": "title", "value": "Seattle accident questions" },
+    { "key": "model", "value": "openai/gpt-5.5" },
+    { "key": "question", "value": "How long after the accident did the police car arrive? and when did the tow vehicle arrive?" },
+    { "key": "agent_id", "value": "" },
+    { "key": "environment_id", "value": "" },
+    { "key": "file_id", "value": "" },
+    { "key": "session_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "auth": { "type": "noauth" },
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/v1/healthz",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "healthz"]
+        }
+      }
+    },
+    {
+      "name": "Managed Agents (Anthropic SDK protocol)",
+      "description": "x-api-key auth. Run top-to-bottom: Create Agent → Create Environment → Create Session → (wait for status idle) → Send Event → Stream Events.",
+      "item": [
+        {
+          "name": "Create Agent",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('ok', () => pm.response.code < 300);",
+                  "pm.collectionVariables.set('agent_id', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Video Analyst\",\n  \"model\": \"{{model}}\",\n  \"system\": \"Analyze videos and answer with citations.\",\n  \"tools\": [{ \"type\": \"agent_toolset_20260401\" }]\n}"
+            },
+            "url": { "raw": "{{base_url}}/v1/agents?beta=true", "host": ["{{base_url}}"], "path": ["v1", "agents"], "query": [{ "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "Create Environment",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('ok', () => pm.response.code < 300);",
+                  "pm.collectionVariables.set('environment_id', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"local-video\"\n}" },
+            "url": { "raw": "{{base_url}}/v1/environments?beta=true", "host": ["{{base_url}}"], "path": ["v1", "environments"], "query": [{ "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "Upload File (video)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('ok', () => pm.response.code < 300);",
+                  "pm.collectionVariables.set('file_id', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "POST",
+            "header": [],
+            "description": "Select a video for the 'file' form field. Returns FileMetadata; id is captured into {{file_id}}. Then create a session with resources=[{type:file,file_id:{{file_id}}}] instead of metadata.video_id.",
+            "body": { "mode": "formdata", "formdata": [ { "key": "file", "type": "file", "src": [] } ] },
+            "url": { "raw": "{{base_url}}/v1/files?beta=true", "host": ["{{base_url}}"], "path": ["v1", "files"], "query": [{ "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "Create Session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('created', () => pm.response.code === 201);",
+                  "pm.collectionVariables.set('session_id', pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent\": \"{{agent_id}}\",\n  \"environment_id\": \"{{environment_id}}\",\n  \"title\": \"{{title}}\",\n  \"metadata\": {\n    \"video_id\": \"{{video_id}}\",\n    \"max_turns_per_run\": \"20\"\n  }\n}"
+            },
+            "url": { "raw": "{{base_url}}/v1/sessions?beta=true", "host": ["{{base_url}}"], "path": ["v1", "sessions"], "query": [{ "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "Get Session (poll until status idle)",
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/v1/sessions/{{session_id}}?beta=true", "host": ["{{base_url}}"], "path": ["v1", "sessions", "{{session_id}}"], "query": [{ "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "Send Event (user.message)",
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('accepted', () => pm.response.code < 300);"] }
+            }
+          ],
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"events\": [\n    { \"type\": \"user.message\", \"content\": \"{{question}}\" }\n  ]\n}"
+            },
+            "url": { "raw": "{{base_url}}/v1/sessions/{{session_id}}/events?beta=true", "host": ["{{base_url}}"], "path": ["v1", "sessions", "{{session_id}}", "events"], "query": [{ "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "Stream Events (SSE)",
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "text/event-stream" }],
+            "description": "Distinct /events/stream path. Run-scoped: closes on session.status_idle. Events: user.message, session.status_running, agent.tool_use, agent.tool_result, agent.message (the answer), session.status_idle.",
+            "url": { "raw": "{{base_url}}/v1/sessions/{{session_id}}/events/stream?after_seq=0&beta=true", "host": ["{{base_url}}"], "path": ["v1", "sessions", "{{session_id}}", "events", "stream"], "query": [{ "key": "after_seq", "value": "0" }, { "key": "beta", "value": "true" }] }
+          }
+        },
+        {
+          "name": "List Events (mapped)",
+          "request": {
+            "auth": { "type": "apikey", "apikey": [
+              { "key": "key", "value": "x-api-key" },
+              { "key": "value", "value": "{{api_key}}" },
+              { "key": "in", "value": "header" }
+            ] },
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/v1/sessions/{{session_id}}/events?after_seq=0&limit=200&beta=true", "host": ["{{base_url}}"], "path": ["v1", "sessions", "{{session_id}}", "events"], "query": [{ "key": "after_seq", "value": "0" }, { "key": "limit", "value": "200" }, { "key": "beta", "value": "true" }] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Native Ambient API (/ambient/v1)",
+      "description": "Bearer auth. Video-first surface; video_id is a top-level field.",
+      "auth": {
+        "type": "bearer",
+        "bearer": [{ "key": "token", "value": "{{api_key}}", "type": "string" }]
+      },
+      "item": [
+        {
+          "name": "Upload Video",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('created', () => pm.response.code === 201);",
+                  "pm.collectionVariables.set('video_id', pm.response.json().video_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "description": "Select a video for the 'file' form field. Captures video_id into {{video_id}} for the next Create Session.",
+            "body": { "mode": "formdata", "formdata": [ { "key": "file", "type": "file", "src": [] } ] },
+            "url": { "raw": "{{base_url}}/ambient/v1/videos", "host": ["{{base_url}}"], "path": ["ambient", "v1", "videos"] }
+          }
+        },
+        {
+          "name": "Create Session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('created', () => pm.response.code === 201);",
+                  "pm.collectionVariables.set('session_id', pm.response.json().session_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"video_id\": \"{{video_id}}\",\n  \"title\": \"{{title}}\",\n  \"model\": \"{{model}}\",\n  \"max_turns_per_run\": 20,\n  \"permission_policy\": { \"type\": \"always_allow\" }\n}"
+            },
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions"] }
+          }
+        },
+        {
+          "name": "Get Session",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}"] }
+          }
+        },
+        {
+          "name": "List Sessions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions?limit=10", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions"], "query": [{ "key": "limit", "value": "10" }] }
+          }
+        },
+        {
+          "name": "Send Agent Question",
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('accepted', () => pm.response.code === 200);"] }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"user.message\",\n  \"content\": \"{{question}}\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}/events", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}", "events"] }
+          }
+        },
+        {
+          "name": "Send Agent Question (structured output)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"type\": \"user.message\",\n  \"content\": \"{{question}}\",\n  \"output_structure\": {\n    \"type\": \"object\",\n    \"properties\": {\n      \"time_taken_police_car_seconds\": { \"type\": \"number\" },\n      \"time_taken_tow_vehicle_seconds\": { \"type\": \"number\" },\n      \"description\": { \"type\": \"string\" }\n    },\n    \"required\": [\"time_taken_police_car_seconds\", \"time_taken_tow_vehicle_seconds\", \"description\"]\n  }\n}"
+            },
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}/events", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}", "events"] }
+          }
+        },
+        {
+          "name": "Fetch Events",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}/events?after_seq=0&limit=100", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}", "events"], "query": [{ "key": "after_seq", "value": "0" }, { "key": "limit", "value": "100" }] }
+          }
+        },
+        {
+          "name": "Stream Events SSE",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "text/event-stream" }],
+            "description": "Run-scoped SSE (?stream=true). Closes on run.completed. Resume with after_seq past the last run when reusing a session.",
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}/events?stream=true&after_seq=0", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}", "events"], "query": [{ "key": "stream", "value": "true" }, { "key": "after_seq", "value": "0" }] }
+          }
+        },
+        {
+          "name": "Cancel Run",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}/cancel", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}", "cancel"] }
+          }
+        },
+        {
+          "name": "Delete Session",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": { "raw": "{{base_url}}/ambient/v1/sessions/{{session_id}}", "host": ["{{base_url}}"], "path": ["ambient", "v1", "sessions", "{{session_id}}"] }
+          }
+        }
+      ]
+    }
+  ]
+}

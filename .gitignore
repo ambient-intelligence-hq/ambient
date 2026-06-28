@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Notebooks
+notebooks/
+local_db/
+tests/test_images/
+trajectories/
+
+.git
+.venv
+**/__pycache__/
+*.pyc
+.env
+.DS_Store
+**/.DS_Store
+.vscode/
+notebooks/
+tests/
+*.sqlite
+*.sqlite-*
+*.mp4
+*.mp3
+*.srt
+ambient/trajectories/

@@ -1,0 +1,56 @@
+# Full local stack for the managed-agents server: the API itself plus its
+# backing services — Postgres (durable sessions/events/metadata + runner
+# messages) and Redis (run-ownership lease + SSE fan-out).
+#   docker compose up -d --build       # api + postgres + redis
+#   docker compose up -d postgres redis  # just infra, run the server locally
+services:
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # LLM / S3 / E2B keys (and SANDBOX_BACKEND) come from .env; the two URLs below
+    # override it to reach the sibling services over the compose network. Run
+    # multiple workers off the shared Postgres + Redis via SERVER_WORKERS.
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://ambient:ambient@postgres:5432/ambient
+      REDIS_URL: redis://redis:6379/0
+      SERVER_WORKERS: "2"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ambient_videos:/data
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ambient
+      POSTGRES_PASSWORD: ambient
+      POSTGRES_DB: ambient
+    ports:
+      - "5432:5432"
+    volumes:
+      - ambient_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ambient"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ambient_pgdata:
+  ambient_videos:
