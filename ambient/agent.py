@@ -313,6 +313,7 @@ async def run_agent(
     question: str,
     max_turns: int = 5,
     model: str = settings.agent_model,
+    video_description: Optional[str] = "",
     subtitle_path: Optional[str] = None,
     output_structure: Optional[dict] = None,
 ) -> list[dict]:
@@ -326,7 +327,7 @@ async def run_agent(
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": f"Video id: {video_id}, question to answer: {question}, Your final answer should strictly follow the schema: {output_structure.model_json_schema()}"}
+                {"type": "text", "text": f"Video id: {video_id},Video Description: {video_description if video_description else ''}, question to answer: {question}, Your final answer should strictly follow the schema: {output_structure.model_json_schema()}"}
             ],
         },
     ]

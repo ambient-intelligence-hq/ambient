@@ -30,6 +30,14 @@ class VideoFrameTools:
     # Maximum frames decoded and held in RAM at once by the decord backend.
     # At 1080p a single RGB frame is ~6 MB; 32 frames ~= 200 MB, well within budget.
     DECORD_BATCH_SIZE = 32
+    # Frames are written as JPEG, not PNG: PNG is lossless and barely compresses
+    # photographic frames (~0.8 MB each at 768px), which bloats both disk and the
+    # base64 payload sent to the vision LLM. JPEG is ~10x smaller with no visible
+    # loss for analysis. FRAME_EXT drives the filenames; the two knobs below set
+    # quality per backend (PIL: 1-95 higher=better; ffmpeg -q:v: 2-31 lower=better).
+    FRAME_EXT = "jpg"
+    JPEG_QUALITY = 90          # decord/PIL save quality
+    FFMPEG_QSCALE = 3          # ffmpeg mjpeg quality (~q90)
     PROMPT = """You are video analysis expert, your are given frames from a video (with equal interval sampling), 
     Please describe the content of the viewed video frames in detail with their timestamps (each frame with ~25 words). If query related content is found, please highlight the timestamps of the video frames that are relevant to the question and explain why (each timestamp with additional ~50 words). Do not answer the question directly.
     
@@ -177,7 +185,7 @@ class VideoFrameTools:
         return start, end
 
     def _frame_cache_path(self, frame_index: int) -> str:
-        return os.path.join(self.frame_dir, f"frame_{frame_index:09d}.png")
+        return os.path.join(self.frame_dir, f"frame_{frame_index:09d}.{self.FRAME_EXT}")
 
     def _fps_cache_dir(
         self,
@@ -223,7 +231,7 @@ class VideoFrameTools:
         Timestamps are the frames' true positions in the source video. When the
         window is capped to `max_frames`, frames are sampled *uniformly across the
         whole window* (not truncated to the first N), so the timestamps are
-        persisted alongside the PNGs (frames are renumbered sequentially and can't
+        persisted alongside the frames (frames are renumbered sequentially and can't
         be recovered from filenames alone).
         """
         self._ensure_backend()
@@ -232,12 +240,12 @@ class VideoFrameTools:
         times_path = os.path.join(cache_dir, "times.json")
 
         if os.path.exists(done_marker):
-            cached = sorted(glob.glob(os.path.join(cache_dir, "frame_*.png")))
+            cached = sorted(glob.glob(os.path.join(cache_dir, f"frame_*.{self.FRAME_EXT}")))
             if cached:
                 return list(zip(cached, self._load_times(times_path, cached, fps, start_time)))
 
         # Rebuild cache for this fps bucket.
-        for existing in glob.glob(os.path.join(cache_dir, "frame_*.png")):
+        for existing in glob.glob(os.path.join(cache_dir, f"frame_*.{self.FRAME_EXT}")):
             try:
                 os.remove(existing)
             except OSError:
@@ -250,7 +258,7 @@ class VideoFrameTools:
         else:
             timestamps = self._extract_frames_ffmpeg(fps, start_time, duration_sec, cache_dir, max_frames)
 
-        paths = sorted(glob.glob(os.path.join(cache_dir, "frame_*.png")))
+        paths = sorted(glob.glob(os.path.join(cache_dir, f"frame_*.{self.FRAME_EXT}")))
         # Guard against any count drift (e.g. ffmpeg emitting +/-1 frame).
         if len(timestamps) != len(paths):
             base = start_time or 0.0
@@ -330,8 +338,12 @@ class VideoFrameTools:
                         (self.max_frame_dimention, self.max_frame_dimention),
                         pil_image.Resampling.LANCZOS,
                     )
+                if image.mode != "RGB":
+                    image = image.convert("RGB")  # JPEG has no alpha channel
                 image.save(
-                    os.path.join(cache_dir, f"frame_{out_idx:09d}.png"), format="PNG"
+                    os.path.join(cache_dir, f"frame_{out_idx:09d}.{self.FRAME_EXT}"),
+                    format="JPEG",
+                    quality=self.JPEG_QUALITY,
                 )
                 out_idx += 1
             del batch  # release the numpy array before the next batch
@@ -367,7 +379,7 @@ class VideoFrameTools:
             f"start_time: {start_time}, duration_sec: {duration_sec}, "
             f"max_frames: {max_frames} using ffmpeg backend"
         )
-        output_pattern = os.path.join(cache_dir, "frame_%09d.png")
+        output_pattern = os.path.join(cache_dir, f"frame_%09d.{self.FRAME_EXT}")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
         if start_time is not None and start_time > 0:
             cmd += ["-ss", str(start_time)]
@@ -381,10 +393,11 @@ class VideoFrameTools:
                 "force_original_aspect_ratio=decrease"
             )
         cmd += ["-vf", ",".join(vf_parts)]
+        cmd += ["-q:v", str(self.FFMPEG_QSCALE)]
         cmd.append(output_pattern)
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-        paths = sorted(glob.glob(os.path.join(cache_dir, "frame_*.png")))
+        paths = sorted(glob.glob(os.path.join(cache_dir, f"frame_*.{self.FRAME_EXT}")))
         return [base + i / effective_fps for i in range(len(paths))]
 
     def fetch_frames(
@@ -476,8 +489,12 @@ class VideoFrameTools:
             cmd.extend(["-c:v", "libx264", "-crf", str(crf), "-preset", "fast"])
         vf_parts = []
         if max_dimentions is not None:
+            # force_divisible_by=2 rounds both dims to even numbers: libx264 (the
+            # default .mp4 encoder) uses 4:2:0 chroma and refuses odd dimensions
+            # (e.g. a 579x768 fit would fail the encoder with exit 187).
             vf_parts.append(
-                f"scale={max_dimentions}:{max_dimentions}:force_original_aspect_ratio=decrease"
+                f"scale={max_dimentions}:{max_dimentions}:"
+                "force_original_aspect_ratio=decrease:force_divisible_by=2"
             )
         if fps is not None:
             vf_parts.append(f"fps={fps}")

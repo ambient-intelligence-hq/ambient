@@ -55,6 +55,10 @@ async def focus_clip(
     # backend returns local files that still need uploading.
     for clip in clips:
         if clip.clip_url is None:
+            if settings.inline_clips:
+                # No S3: leave clip_url unset so construct_payload embeds the clip
+                # as a base64 data URL instead.
+                continue
             key = f"{clip.video_id}/clips/{clip.id}.mp4"
             s3_client.upload_file(clip.clip_file_path, key)
             clip.clip_url = s3_client.get_presigned_url(key, expires_in=7200)

@@ -47,9 +47,10 @@ async def search_clip(video_id: str, query: str, start_time: float, end_time: fl
     # backend returns bare local files that still need handling here.
     for clip in clips:
         if clip.clip_url is None:
-            if is_local_llm:
-                # Local server can't reach an S3 presigned URL; leave clip_url unset
-                # so construct_payload embeds the clip as a base64 data URL instead.
+            if is_local_llm or settings.inline_clips:
+                # Local server can't reach an S3 presigned URL (and inline_clips
+                # forces this for an S3-less run); leave clip_url unset so
+                # construct_payload embeds the clip as a base64 data URL instead.
                 clip.clip_url = None
             else:
                 key = f"{clip.video_id}/clips/{clip.id}.mp4"

@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.10",
+    "anthropic>=0.111.0",
     "asyncpg>=0.31.0",
     "boto3>=1.42.73",
+    "datasets>=5.0.0",
     "e2b>=2.25.1",
     "fastapi>=0.115",
     "httpx>=0.28",
@@ -21,6 +23,8 @@ dependencies = [
     "sqlite-vec>=0.1.7",
     "sse-starlette>=2.1",
     "tenacity>=9.1.4",
+    "torch>=2.13.0",
+    "torchcodec>=0.14.0",
     "typer>=0.15",
     "uvicorn[standard]>=0.32",
 ]

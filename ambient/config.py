@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     #   "inprocess" -> ffmpeg/decord run locally in ambient/tools/video_tools.py
     #   "e2b"       -> media ops run in an E2B sandbox (LLM calls always stay on the host)
     sandbox_backend: str = "inprocess"
+    # When True, clip tools skip the S3 upload and leave clip_url unset so the LLM
+    # payload embeds the local clip as a base64 data URL instead. Lets the core
+    # agent run with no S3/R2 bucket (see notebooks/test_sdk.ipynb).
+    inline_clips: bool = False
     sandbox_cpu_seconds: int = 600
     sandbox_memory_mb: int = 4096
     sandbox_wall_seconds: int = 1800

@@ -29,6 +29,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
 from redis.exceptions import (
     ConnectionError as RedisConnectionError,
     ResponseError,
@@ -184,6 +186,12 @@ class IngestWorker:
             self.redis_url,
             decode_responses=True,
             socket_timeout=settings.ingest_block_ms / 1000 + 5,
+            # TLS handshake to a managed Redis (Upstash) can be slow, and with
+            # multiple workers connecting at once a single slow connect used to
+            # kill startup. Give the connect room and retry a few times.
+            socket_connect_timeout=10,
+            retry=Retry(ExponentialBackoff(cap=3, base=0.5), retries=5),
+            retry_on_error=[RedisConnectionError, RedisTimeoutError],
             socket_keepalive=True,
             health_check_interval=30,
         )
