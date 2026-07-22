@@ -21,7 +21,7 @@ import uuid
 from typing import Any, Optional
 
 from ambient.config import settings
-from ambient.prompt import SYSTEM_PROMPT
+from ambient.prompt import SYSTEM_PROMPT, SYSTEM_PROMPT_PARALLEL
 from ambient.server.broker import Broker
 from ambient.server.llm_client import assemble_assistant_message, stream_chat_completion
 from ambient.server.sandbox import SandboxLimits, ToolDispatcher
