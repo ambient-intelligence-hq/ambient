@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     llm_model: str = "qwen/qwen3.5-27b"
     llm_base_url: str | None = None
     llm_api_key: str | None = None
+    agent_base_url: str | None = None
+    agent_api_key: str | None = None
+
 
     agent_model: str = "google/gemini-3.1-pro-preview"
 

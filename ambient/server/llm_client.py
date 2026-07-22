@@ -25,7 +25,8 @@ async def stream_chat_completion(
     api_key: Optional[str] = None,
     timeout: int = 300,
 ) -> AsyncIterator[dict]:
-    endpoint = (base_url or settings.llm_base_url or "").rstrip("/")
+    endpoint = (base_url or settings.agent_base_url or settings.llm_base_url or "").rstrip("/")
+    api_key = api_key or settings.agent_api_key or settings.llm_api_key
     if not endpoint.endswith("/chat/completions"):
         endpoint = f"{endpoint}/chat/completions"
 
@@ -43,7 +44,7 @@ async def stream_chat_completion(
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key or settings.llm_api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Accept": "text/event-stream",
     }
 
