@@ -69,6 +69,7 @@ async def search_clip(video_id: str, query: str, start_time: float, end_time: fl
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             video_clips=clips,
+            timeout=120,
         )
     except (aiohttp.ClientResponseError, asyncio.TimeoutError) as exc:
         status = getattr(exc, "status", None)

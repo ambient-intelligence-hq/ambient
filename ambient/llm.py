@@ -120,8 +120,8 @@ def get_provider_params(model: str, base_url: str) -> dict:
 
 
 @tenacity.retry(
-    stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
+    stop=tenacity.stop_after_attempt(2),
+    wait=tenacity.wait_exponential(multiplier=1, min=2, max=6),
     retry=tenacity.retry_if_exception(is_retryable_exception),
 )
 async def llm_call(
@@ -134,6 +134,8 @@ async def llm_call(
     history: Optional[List[dict]] = None,
     timeout: int = 300,
     video_frames: Optional[List[Frame]] = None,
+    reasoning_enabled: bool = True,
+    max_tokens: Optional[int] = None,
 ) -> BaseModel:
     payload = construct_payload(video_clips,video_frames)
     
@@ -165,7 +167,8 @@ async def llm_call(
                         ],
                     },
                 ],
-                "reasoning": {"enabled": True},
+                "reasoning": {"enabled": reasoning_enabled},
+                **({"max_tokens": max_tokens} if max_tokens else {}),
                 **provider_params,
             },
         ) as response:

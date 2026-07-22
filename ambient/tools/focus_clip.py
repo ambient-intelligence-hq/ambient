@@ -73,6 +73,7 @@ async def focus_clip(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             video_clips=clips,
+            timeout=120,
         )
 
     except (aiohttp.ClientResponseError, asyncio.TimeoutError) as exc:

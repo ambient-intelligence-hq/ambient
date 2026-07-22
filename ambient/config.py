@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     sandbox_wall_seconds: int = 1800
     e2b_template: str = "video-analysis-v1"
     max_turns_per_run: int = 5
+    # Analysis-clip quality for the local (non-gemini) vision endpoint. Lower
+    # fps/dimension and a size cap make each focus_clip/search_clip analysis call
+    # dramatically faster on the vLLM endpoint (60s@2fps/768px≈18s vs
+    # 30s@1fps/512px≈4.5s) at some loss of temporal/spatial detail. Tunable via
+    # ANALYSIS_* env vars so the benchmark can sweep speed/accuracy.
+    analysis_fps: int = 2
+    analysis_max_dim: int = 768
+    analysis_max_size_mb: int = 8
+    
 
     # Background video-description ingestion. On upload we enqueue the video id
     # on a Redis stream; a per-worker consumer boots an ephemeral E2B sandbox,
@@ -139,7 +148,11 @@ def get_provider_quality_settings(model: str) -> provider_quality_settings:
     if "gemini" in model:
         return provider_quality_settings(max_size_mb=14)
     else:
-        return provider_quality_settings()
+        return provider_quality_settings(
+            fps=settings.analysis_fps,
+            max_dimentions=settings.analysis_max_dim,
+            max_size_mb=settings.analysis_max_size_mb,
+        )
 
 
 settings = get_settings()
