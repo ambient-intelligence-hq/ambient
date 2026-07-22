@@ -1,4 +1,6 @@
-import tenacity
+import logging
+import asyncio
+import aiohttp
 from typing import List, Dict
 from ambient.config import settings, get_provider_quality_settings
 from ambient.tools.video_backend import make_video_tools
@@ -12,6 +14,7 @@ from ambient.tools.citations import _replace_citations_with_global_video_timesta
 
 s3_client = get_s3_client()
 ENABLE_RETURN_CITATION_IMAGES = False
+log = logging.getLogger(__name__)
 
 class SearchClipTool(BaseModel):
     video_id: str = Field(description="The id of the video to search the clip from.")
@@ -19,11 +22,6 @@ class SearchClipTool(BaseModel):
     start_time: float = Field(description="The start time of the clip to search in seconds.")
     end_time: float = Field(description="The end time of the clip to search in seconds. The end time should be within 5 mins from the start_time.")
 
-@tenacity.retry(
-    stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
-    reraise=True,
-)
 async def search_clip(video_id: str, query: str, start_time: float, end_time: float, video_description: str = None) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
     video_tools = make_video_tools(video_id, max_frame_dimention=provider_quality_settings.max_dimentions)
@@ -63,20 +61,41 @@ async def search_clip(video_id: str, query: str, start_time: float, end_time: fl
 
     print(f"[search_clip] clips: {clips}")
 
-    llm_response = await llm_call(
-        prompt=PROMPT,
-        query=f"Query: {query}",
-        model=settings.llm_model,
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        video_clips=clips,
-    )
+    try:
+        llm_response = await llm_call(
+            prompt=PROMPT,
+            query=f"Query: {query}",
+            model=settings.llm_model,
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            video_clips=clips,
+        )
+    except (aiohttp.ClientResponseError, asyncio.TimeoutError) as exc:
+        status = getattr(exc, "status", None)
+        log.error("[search_clip] LLM request failed for %s (%s-%ss): %s", video_id, start_time, end_time, exc)
+        return (
+            f"Error analyzing clip: LLM request failed"
+            f"{f' (HTTP {status})' if status else ''}. "
+            "The analysis server may be overloaded or the clip may be too large. "
+            "Try a smaller time window or retry later.",
+            [],
+        )
+    except Exception as exc:
+        log.exception("[search_clip] unexpected error for %s", video_id)
+        return f"Error analyzing clip: {type(exc).__name__}: {exc}", []
 
-    reasoning = llm_response.get('raw', {}).get('choices', [{}])[0].get('message', {}).get('reasoning')
-    if "choinces" not in llm_response:
-        print(f"[search_clip] No choices in LLM Response: {llm_response}")
-    response_text = llm_response["choices"][0]["message"]["content"]
+    choices = llm_response.get("choices") or []
     
+    if not choices:
+        log.error("[search_clip] No choices in LLM response: %s", llm_response)
+        return "Error analyzing clip: LLM returned an empty response. Please try again.", []   
+    
+    message = choices[0].get("message") or {}
+    reasoning = message.get("reasoning")
+    response_text = message.get("content") or ""
+    if not response_text:
+        return "Error analyzing clip: LLM returned no content. Please try again.", []
+
     citations = _extract_temporal_citations(response_text)
     # clip_start is the window's global start; the model's local mm:ss citations
     # map to absolute video time by adding it.

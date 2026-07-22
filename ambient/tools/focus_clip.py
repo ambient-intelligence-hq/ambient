@@ -1,4 +1,6 @@
-import tenacity
+import logging
+import asyncio
+import aiohttp
 from typing import List, Dict
 from ambient.config import settings, get_provider_quality_settings
 from ambient.tools.video_backend import make_video_tools
@@ -15,7 +17,7 @@ from ambient.prompt import FOCUS_CLIP_TOOL_PROMPT
 
 s3_client = get_s3_client()
 ENABLE_RETURN_CITATION_IMAGES = False
-
+log = logging.getLogger(__name__)
 
 class FocusClipTool(BaseModel):
     video_id: str = Field(description="The id of the video to focus the clip from.")
@@ -27,11 +29,6 @@ class FocusClipTool(BaseModel):
     )
 
 
-@tenacity.retry(
-    stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_exponential(multiplier=1, min=4, max=10),
-    reraise=True,
-)
 async def focus_clip(
     video_id: str, start_time: float, end_time: float, video_description: str = None
 ) -> tuple[str, List[Dict]]:
@@ -68,14 +65,39 @@ async def focus_clip(
     if video_description:
         PROMPT = PROMPT + f"\n\n Highlevel overview of the Video:\n{video_description}"
 
-    llm_response = await llm_call(
-        prompt=PROMPT,
-        query="Provide the description of the video now:",
-        model=settings.llm_model,
-        base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
-        video_clips=clips,
-    )
+    try:
+        llm_response = await llm_call(
+            prompt=PROMPT,
+            query="Provide the description of the video now:",
+            model=settings.llm_model,
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key,
+            video_clips=clips,
+        )
+
+    except (aiohttp.ClientResponseError, asyncio.TimeoutError) as exc:
+        status = getattr(exc, "status", None)
+        log.error("[focus_clip] LLM request failed for %s (%s-%ss): %s", video_id, start_time, end_time, exc)
+        return (
+            f"Error analyzing clip: LLM request failed"
+            f"{f' (HTTP {status})' if status else ''}. "
+            "The analysis server may be overloaded or the clip may be too large. "
+            "Try a smaller time window or retry later.",
+            [],
+        )
+    except Exception as exc:
+        log.exception("[focus_clip] unexpected error for %s", video_id)
+        return f"Error analyzing clip: {type(exc).__name__}: {exc}", []
+
+    choices = llm_response.get("choices") or []
+    if not choices:
+        log.error("[focus_clip] No choices in LLM response: %s", llm_response)
+        return "Error analyzing clip: LLM returned an empty response. Please try again.", []
+
+    description = (choices[0].get("message") or {}).get("content") or ""
+    if not description:
+        return "Error analyzing clip: LLM returned no content. Please try again.", []
+
     # print(f"[focus_clip] LLM Response: {llm_response}")
     description = llm_response["choices"][0]["message"]["content"]
     try:
