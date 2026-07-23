@@ -149,6 +149,12 @@ class SessionRunner:
         self._run_lock = asyncio.Lock()
         self._status = "created"
         self._cancel_requested = False
+        # Background task that resolves the video description off the critical
+        # path (Phase 1: session readiness never blocks on the ingest pipeline).
+        self._description_task: Optional[asyncio.Task] = None
+        # Set once the youtube source MP4 is confirmed on S3, so media tools don't
+        # fetch a not-yet-uploaded clip. Non-youtube sources are ready immediately.
+        self._source_ready = False
 
     # --- lifecycle --------------------------------------------------------
 
@@ -177,16 +183,12 @@ class SessionRunner:
             await self._emit("error", {"code": "sandbox_boot_failed", "message": str(exc), "fatal": True})
             await self._set_status("failed")
             raise
-        
-        try:
-            self.video_description = await ensure_description(self.store, self.video_id, box=self._media_box)
-            log.info(f"Description for video {self.video_id} is {self.video_description}")
-        except Exception as exc:  # noqa: BLE001
-            log.error(f"Error ensuring description for video {self.video_id}: {str(exc)}")
-            await self._emit("error", {"code": "video_description_failed", "message": str(exc), "fatal": True})
-            await self._set_status("failed")
-            raise
-        
+
+        # Resolve the video description in the background: the session is ready to
+        # take input as soon as the sandbox boots. `_run_until_done` injects the
+        # description into the conversation once it lands.
+        self._maybe_start_description()
+
         boot_ms = int((time.monotonic() - t0) * 1000)
         await self._emit("session.status_changed", {
             "status": "ready",
@@ -194,6 +196,41 @@ class SessionRunner:
             "sandbox": {"status": "ready", "id": self.sandbox_id, "boot_ms": boot_ms, "region": None},
         })
         self._status = "ready"
+
+    _DESC_INJECT_MARKER = "[system update] Video description"
+
+    def _maybe_start_description(self) -> None:
+        """Start the background description resolver unless it's already running,
+        already resolved, or already present in the (rehydrated) conversation."""
+        if self._description_task is not None:
+            return
+        if self.video_description is not None or self._description_injected():
+            return
+        self._description_task = asyncio.create_task(
+            self._resolve_description(), name=f"desc-{self.session_id}"
+        )
+
+    async def _resolve_description(self) -> None:
+        """Resolve the video description off the critical path.
+
+        Never flips the session to `failed`: the agent's tools work without a
+        description, so a failure here is a non-fatal error event and the session
+        stays usable. On success the description is also published to the tool
+        dispatcher's cache so clip tools receive it.
+        """
+        try:
+            description = await ensure_description(self.store, self.video_id, box=self._media_box)
+            self.video_description = description
+            if description:
+                self._dispatcher._video_description[self.video_id] = description
+            log.info(f"Description ready for video {self.video_id}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"Error ensuring description for video {self.video_id}: {str(exc)}")
+            await self._emit("error", {
+                "code": "video_description_failed", "message": str(exc), "fatal": False,
+            })
 
     async def attach_sandbox(self, sandbox_rec: dict) -> None:
         """Reattach a rehydrated runner to its session's sandbox.
@@ -209,6 +246,7 @@ class SessionRunner:
         sid = (sandbox_rec or {}).get("id")
         if self.backend != "e2b":
             self.sandbox_id = sid or f"ip_{uuid.uuid4().hex[:12]}"
+            self._maybe_start_description()
             return
         if not sid:
             raise SandboxNotReady(self.session_id)
@@ -219,8 +257,18 @@ class SessionRunner:
         self._dispatcher.media_box = box
         self.sandbox_id = box.id
         self._status = "ready"
+        # A rehydrated worker may pick up a session whose description never landed
+        # (creator died mid-boot); resolve it here unless it's already in the
+        # persisted conversation.
+        self._maybe_start_description()
 
     async def terminate(self) -> None:
+        if self._description_task and not self._description_task.done():
+            self._description_task.cancel()
+            try:
+                await self._description_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._run_task and not self._run_task.done():
             self._run_task.cancel()
             try:
@@ -255,12 +303,8 @@ class SessionRunner:
             )
 
         if len(self.messages) == 1:
-            log.info(f"Waiting for video description for video {self.video_id}")
-            while self.video_description is None:
-                self.video_description = await ensure_description(self.store, self.video_id, box=self._media_box)
-                await asyncio.sleep(1)
-            log.info(f"Got video description for video {self.video_id}")
-            self.messages.append({"role": "user", "content": [{"type": "text", "text": f"Video id: {self.video_id}, Description: {self.video_description}"}]})
+            seed = await self._build_seed_text()
+            self.messages.append({"role": "user", "content": [{"type": "text", "text": seed}]})
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
         # Persist the user turn up front so a rehydrating worker sees it even if
         # this run is interrupted before producing an assistant turn.
@@ -292,11 +336,30 @@ class SessionRunner:
         await self._emit("run.started", {"run_id": run_id, "model": model})
         stop_reason = "end_turn"
         final_answer = ""
+
+        # Ground the first answer in the description: wait (bounded) for it before
+        # the first LLM call. Session readiness is unaffected; only this run waits,
+        # and only until the description lands or the timeout elapses.
+        if settings.first_turn_wait_for_description and not self._description_injected():
+            await self._emit("tool.progress", {
+                "run_id": run_id,
+                "turn": 1,
+                "progress": {"message": "preparing video description"},
+            })
+            await self._await_description(settings.first_turn_description_timeout_seconds)
+
         try:
             for turn in range(1, self.max_turns_per_run + 1):
                 # Keep the ownership lease alive for the duration of the run.
                 await self.broker.renew(self.session_id)
                 await self._emit("turn.start", {"run_id": run_id, "turn": turn})
+
+                # Fold in the background-resolved description as soon as it lands.
+                if self.video_description and not self._description_injected():
+                    self.messages.append({"role": "user", "content": [{
+                        "type": "text",
+                        "text": f"{self._DESC_INJECT_MARKER} now available:\n{self.video_description}",
+                    }]})
 
                 prepared = _normalize_for_openai(self.messages)
                 prepared = _retain_last_n_by_type(prepared, "video_url", MAX_CLIPS)
@@ -360,6 +423,18 @@ class SessionRunner:
             await self.broker.release(self.session_id)
 
     async def _run_tool_calls(self, run_id: str, turn: int, tool_uses: list[dict]) -> None:
+        # Media tools read the source from S3; for a fresh youtube import that
+        # upload may still be in flight (the description no longer gates readiness).
+        # Wait for it once, telling the client why (only if we actually block).
+        async def _on_wait() -> None:
+            await self._emit("tool.progress", {
+                "run_id": run_id,
+                "turn": turn,
+                "progress": {"message": "waiting for video import to finish"},
+            })
+
+        await self._await_source_ready(on_wait=_on_wait)
+
         async def _run_one(block: dict) -> tuple[str, dict | None, dict | None]:
             tool_use_id = block["id"]
             name = block["name"]
@@ -438,6 +513,93 @@ class SessionRunner:
                 self.messages.append({"role": "user", "content": user_message_contents})
 
     # --- helpers ----------------------------------------------------------
+
+    async def _build_seed_text(self) -> str:
+        """First-turn context. Uses the full description if it's already resolved,
+        otherwise a metadata-only seed so the turn never blocks on ingestion."""
+        if self.video_description:
+            return f"Video id: {self.video_id}, Description: {self.video_description}"
+        title = duration = None
+        try:
+            rec = await self.store.get_file(self.video_id)
+        except Exception:  # noqa: BLE001 - direct video id / store hiccup
+            rec = None
+        if rec:
+            yt = rec.get("youtube") or {}
+            title = yt.get("title") or rec.get("filename")
+            duration = yt.get("duration")
+        return (
+            f"Video id: {self.video_id}\n"
+            f"Title: {title or 'unknown'}\n"
+            f"Duration: {duration if duration is not None else 'unknown'} seconds\n"
+            "Note: a detailed video description is being generated in the background "
+            "and will be provided in a later message. You can use your video tools "
+            "immediately."
+        )
+
+    def _description_injected(self) -> bool:
+        """True if the full description is already in the conversation — either as
+        the first-turn seed (`Video id: ..., Description: ...`) or a later
+        `[system update]` injection. Scans `self.messages` so it survives
+        rehydration (a rebuilt runner has `video_description=None`)."""
+        for message in self.messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = block.get("text", "")
+                if text.startswith("Video id:") and "Description:" in text:
+                    return True
+                if self._DESC_INJECT_MARKER in text:
+                    return True
+        return False
+
+    async def _await_description(self, timeout: float) -> None:
+        """Wait (bounded) for the background description task to finish.
+
+        Used on the first run so the first answer is grounded in the description.
+        Returns immediately if it's already resolved, never started, or already
+        done (including failed). On timeout the description task keeps running
+        (shielded) and is injected on a later turn instead."""
+        task = self._description_task
+        if self.video_description is not None or task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:  # noqa: BLE001 - resolver reports its own failure
+            pass
+
+    async def _await_source_ready(self, on_wait=None) -> None:
+        """Block until a youtube source MP4 is on S3 (uploaded by the ingest job).
+
+        With the description off the critical path a session can start before its
+        source is uploaded; media tools would then fetch a missing S3 object. This
+        waits cleanly instead. Non-youtube sources (direct uploads) are ready
+        immediately. `on_wait` (if given) is awaited once, only when we actually
+        have to block. Cached after the first success."""
+        if self._source_ready:
+            return
+        try:
+            rec = await self.store.get_file(self.video_id)
+        except Exception:  # noqa: BLE001
+            rec = None
+        if not rec or rec.get("source_type") != "youtube" or rec.get("source_status") == "ready":
+            self._source_ready = True
+            return
+        if on_wait is not None:
+            await on_wait()
+        while rec.get("source_status") != "ready":
+            if rec.get("source_status") == "failed":
+                raise RuntimeError(f"video source failed: {rec.get('source_error')}")
+            await asyncio.sleep(2)
+            rec = await self.store.get_file(self.video_id)
+        self._source_ready = True
 
     def _extract_answer_text(self, assistant_msg: dict) -> str:
         parts: list[str] = []

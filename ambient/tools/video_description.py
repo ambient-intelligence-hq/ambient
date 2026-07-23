@@ -28,8 +28,8 @@ async def get_video_description(video_id: str) -> str:
     # print(f"Transcription: {transcription}")
 
     start_time = time.time()
-    video_tools = make_video_tools(video_id, max_frame_dimention=768)
-    video_tools.OVERVIEW_MAX_FRAMES = 50
+    video_tools = make_video_tools(video_id, max_frame_dimention=settings.description_max_dim)
+    video_tools.OVERVIEW_MAX_FRAMES = settings.description_max_frames
     frames = video_tools.get_overview_frames()
     end_time = time.time()
     log.info(f"Time taken to get overview frames: {end_time - start_time} seconds")
@@ -41,11 +41,11 @@ async def get_video_description(video_id: str) -> str:
     llm_response = await llm_call(
         prompt=prompt,
         query="Provide the description of the video now:",
-        model=settings.llm_model,
+        model=settings.description_model or settings.llm_model,
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         video_frames=frames,
-    )   
+    )
     end_time = time.time()
     log.info(f"Time taken to get LLM response: {end_time - start_time} seconds")
     log.info(f"Received LLM response for video {video_id}")

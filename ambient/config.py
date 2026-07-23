@@ -89,6 +89,21 @@ class Settings(BaseSettings):
     analysis_max_size_mb: int = 8
     
 
+    # Video-description generation (the high-level overview computed at ingestion).
+    # Exposed as knobs; an optional faster `description_model` is the main lever
+    # for trimming the description LLM call once the source download is off the
+    # path. Frame count is kept at 50 (do not reduce) for description quality.
+    description_max_frames: int = 50           # overview frames sent to the LLM
+    description_max_dim: int = 768             # frame longest-edge for the description
+    description_model: str | None = None       # None -> settings.llm_model
+
+    # If True, the first agent run waits (bounded) for the video description to
+    # land before its first LLM call, so the first answer is grounded in the
+    # description. Session readiness is unaffected (still ~instant); only the first
+    # run blocks. On timeout it falls back to the metadata seed + later injection.
+    first_turn_wait_for_description: bool = True
+    first_turn_description_timeout_seconds: int = 300
+
     # Background video-description ingestion. On upload we enqueue the video id
     # on a Redis stream; a per-worker consumer boots an ephemeral E2B sandbox,
     # runs get_video_description, and persists the result on the files row.
@@ -124,6 +139,10 @@ class Settings(BaseSettings):
     # YouTube URL imports. The API records the URL and the ingest worker asks an
     # ephemeral E2B sandbox to download/remux/upload it before description.
     youtube_import_enabled: bool = True
+    # Cap the YouTube download height. Downstream consumers never use more than
+    # 768px (tiles, description frames, provider quality caps), so 720p loses
+    # nothing while downloading 3-10x less. 0 = uncapped (old behavior).
+    youtube_max_height: int = 720
     youtube_max_duration_seconds: int = 3 * 60 * 60
     youtube_max_size_bytes: int = 5 * 1024 * 1024 * 1024
     youtube_download_timeout_seconds: int = 900

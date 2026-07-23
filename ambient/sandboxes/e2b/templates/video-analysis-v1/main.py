@@ -81,6 +81,7 @@ STREAM_MIN_BYTES = int(os.environ.get("STREAM_MIN_BYTES", str(100 * 1024 * 1024)
 OVERVIEW_SEEK_CONCURRENCY = int(os.environ.get("OVERVIEW_SEEK_CONCURRENCY", "16"))
 
 # --- YouTube imports -------------------------------------------------------
+YOUTUBE_MAX_HEIGHT = int(os.environ.get("YOUTUBE_MAX_HEIGHT", "720"))
 YOUTUBE_MAX_DURATION_SECONDS = int(os.environ.get("YOUTUBE_MAX_DURATION_SECONDS", str(3 * 60 * 60)))
 YOUTUBE_MAX_SIZE_BYTES = int(os.environ.get("YOUTUBE_MAX_SIZE_BYTES", str(5 * 1024 * 1024 * 1024)))
 YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
@@ -95,6 +96,22 @@ TILE_SECONDS = int(os.environ.get("TILE_SECONDS", "45"))
 TILE_FPS = int(os.environ.get("TILE_FPS", "2"))
 TILE_MAX_DIM = int(os.environ.get("TILE_MAX_DIM", "768"))
 TILE_WORKERS = int(os.environ.get("TILE_WORKERS", str(os.cpu_count() or 4)))
+
+
+def _scale_even_filter(dim: int) -> str:
+    """ffmpeg -vf scale that fits within dim x dim (aspect preserved) AND forces
+    even width/height.
+
+    `force_original_aspect_ratio=decrease` alone can yield an odd side (e.g.
+    573x768), which libx264 rejects ("width not divisible by 2"). The trailing
+    ``scale=trunc(iw/2)*2:trunc(ih/2)*2`` snaps both sides down to even. Written as
+    a second scale (not `force_divisible_by`, which needs ffmpeg >= 4.4) so it
+    works on any ffmpeg build in the sandbox base image.
+    """
+    return (
+        f"scale={dim}:{dim}:force_original_aspect_ratio=decrease,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +453,23 @@ class PrepareYoutubeResult(BaseModel):
     height: Optional[int] = None
     source_kind: str = "youtube"
     download_info: dict[str, Any]
+
+
+class ProbeYoutubeResult(BaseModel):
+    video_id: str
+    title: Optional[str] = None
+    duration: Optional[float] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    webpage_url: Optional[str] = None
+    extractor: Optional[str] = None
+
+
+class UploadSourceResult(BaseModel):
+    video_id: str
+    r2_key: str
+    s3_uri: str
+    size_bytes: int
 
 
 class ResultError(BaseModel):
@@ -791,7 +825,7 @@ class VideoFrameTools:
             if self.max_frame_dimension is not None:
                 cmd += [
                     "-vf",
-                    f"scale={self.max_frame_dimension}:{self.max_frame_dimension}:force_original_aspect_ratio=decrease",
+                    _scale_even_filter(self.max_frame_dimension),
                 ]
             cmd.append(out_path)
             try:
@@ -854,7 +888,7 @@ class VideoFrameTools:
         vf_parts = [f"fps={effective_fps}"]
         if self.max_frame_dimension is not None:
             vf_parts.append(
-                f"scale={self.max_frame_dimension}:{self.max_frame_dimension}:force_original_aspect_ratio=decrease"
+                _scale_even_filter(self.max_frame_dimension)
             )
         cmd += ["-vf", ",".join(vf_parts)]
         cmd.append(output_pattern)
@@ -937,7 +971,7 @@ class VideoFrameTools:
         vf_parts = []
         if self.max_frame_dimension is not None:
             vf_parts.append(
-                f"scale={self.max_frame_dimension}:{self.max_frame_dimension}:force_original_aspect_ratio=decrease"
+                _scale_even_filter(self.max_frame_dimension)
             )
         if fps is not None:
             vf_parts.append(f"fps={fps}")
@@ -1070,20 +1104,43 @@ def _canonicalize_youtube_file(video_id: str, work_dir: str) -> str:
     return canonical
 
 
-def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
+def _youtube_format_selector(max_height: int) -> str:
+    """Build the yt-dlp -f selector, optionally capping height.
+
+    Downstream never uses more than 768px (tiles, description frames, provider
+    quality), so a 720p proxy downloads 3-10x less while losing nothing. Prefers
+    H.264 (avc1) over AV1/VP9 (YouTube's AV1 is SABR-gated and 403s mid-download,
+    and H.264 decodes faster downstream). The final "/b" stays unfiltered so odd
+    videos with no height-capped format still import. max_height <= 0 = uncapped.
+    """
+    h = f"[height<={max_height}]" if max_height > 0 else ""
+    return (
+        f"bv*[vcodec^=avc1]{h}[ext=mp4]+ba[ext=m4a]"
+        f"/bv*{h}[ext=mp4]+ba[ext=m4a]"
+        f"/b{h}[ext=mp4]"
+        f"/bv*{h}+ba"
+        "/b"
+    )
+
+
+def _probe_youtube_info(url: str) -> dict[str, Any]:
+    """Fetch yt-dlp metadata (no download) and enforce the duration limit."""
     if not _is_youtube_url(url):
         raise ValueError("url must be a YouTube URL")
     if shutil.which("yt-dlp") is None:
         raise RuntimeError("yt-dlp is not installed in the sandbox template")
-
-    meta_cmd = ["yt-dlp", "--dump-single-json", "--no-playlist", url]
-    info = _run_json(meta_cmd, timeout=120)
+    info = _run_json(["yt-dlp", "--dump-single-json", "--no-playlist", url], timeout=120)
     duration = info.get("duration")
     if duration is not None and float(duration) > YOUTUBE_MAX_DURATION_SECONDS:
         raise ValueError(
             f"YouTube video duration {duration}s exceeds limit "
             f"{YOUTUBE_MAX_DURATION_SECONDS}s"
         )
+    return info
+
+
+def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
+    info = _probe_youtube_info(url)
 
     work_dir = os.path.join(VIDEO_FOLDER, video_id)
     os.makedirs(work_dir, exist_ok=True)
@@ -1094,13 +1151,14 @@ def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
             except OSError:
                 pass
 
+    fmt = _youtube_format_selector(YOUTUBE_MAX_HEIGHT)
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--restrict-filenames",
         # Prefer H.264 (avc1) over AV1/VP9: the AV1 formats YouTube serves are
         # SABR-gated and 403 mid-download, and H.264 also decodes faster downstream.
-        "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "-f", fmt,
         # Survive transient 403s / format drops within this one invocation instead
         # of relying on the job-level retry (which re-boots an entire sandbox).
         "--retries", "10",
@@ -1138,6 +1196,50 @@ def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
         _normalize_faststart(local_path)
 
     return local_path, info
+
+
+def cmd_probe_youtube(args: argparse.Namespace) -> None:
+    """Metadata-only probe (no download): title/duration/dimensions, in ~seconds.
+
+    Lets the host seed a session with title + duration immediately while the full
+    download proceeds in the background (see docs/session-startup-latency-plan.md).
+    """
+    start = time.time()
+    info = _probe_youtube_info(args.url)
+    print(f"[youtube] probe-youtube time: {time.time() - start} seconds", file=sys.stderr)
+    emit(data=ProbeYoutubeResult(
+        video_id=args.video_id,
+        title=info.get("title"),
+        duration=info.get("duration"),
+        width=info.get("width"),
+        height=info.get("height"),
+        webpage_url=info.get("webpage_url") or args.url,
+        extractor=info.get("extractor"),
+    ))
+
+
+def cmd_upload_source(args: argparse.Namespace) -> None:
+    """Upload the already-downloaded local source MP4 to S3.
+
+    Split out of prepare-youtube so the (slow) S3 upload runs concurrently with
+    description + tiling instead of gating them. Resolves the local file the same
+    way the tiling path does.
+    """
+    start = time.time()
+    s3 = _make_s3_client()
+    if s3 is None:
+        emit(error=ResultError(code="S3NotConfigured", message="S3 is required for upload-source"))
+        return
+    local_path = _download_source_local(s3, args.video_id)  # local cache hit (no re-download)
+    r2_key = f"{S3_VIDEO_BASE_KEY}/{args.video_id}.mp4"
+    s3_uri = s3.upload_file(local_path, r2_key, "video/mp4")
+    print(f"[s3] uploaded source {s3_uri} in {time.time() - start:.1f}s", file=sys.stderr)
+    emit(data=UploadSourceResult(
+        video_id=args.video_id,
+        r2_key=r2_key,
+        s3_uri=s3_uri,
+        size_bytes=os.path.getsize(local_path),
+    ))
 
 
 def cmd_prepare_youtube(args: argparse.Namespace) -> None:
@@ -1340,7 +1442,7 @@ def cmd_transcode_tiles(args: argparse.Namespace) -> None:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-ss", str(r_start), "-t", str(r_len), "-i", src,
-            "-vf", f"scale={args.max_dim}:{args.max_dim}:force_original_aspect_ratio=decrease,fps={args.fps}",
+            "-vf", f"{_scale_even_filter(args.max_dim)},fps={args.fps}",
             "-c:v", "libx264", "-preset", "veryfast",
             # Force a keyframe at every tile boundary so tiles are independently
             # decodable AND concat-able with `-c copy` later.
@@ -1489,6 +1591,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_yt.add_argument("--url", required=True, help="YouTube URL to download")
     p_yt.add_argument("--upload-s3", action="store_true", help="Upload the prepared source MP4 to S3/R2")
     p_yt.set_defaults(func=cmd_prepare_youtube)
+
+    # ── probe-youtube ─────────────────────────────────────────────────────────
+    p_py = sub.add_parser("probe-youtube", help="Fetch YouTube metadata only (title/duration), no download")
+    p_py.add_argument("--video-id", required=True, help="Video ID the metadata belongs to")
+    p_py.add_argument("--url", required=True, help="YouTube URL to probe")
+    p_py.set_defaults(func=cmd_probe_youtube)
+
+    # ── upload-source ─────────────────────────────────────────────────────────
+    p_us = sub.add_parser("upload-source", help="Upload the already-downloaded local source MP4 to S3")
+    p_us.add_argument("--video-id", required=True, help="Video ID whose local source to upload")
+    p_us.set_defaults(func=cmd_upload_source)
 
     # ── transcode-tiles ──────────────────────────────────────────────────────
     p_tt = sub.add_parser("transcode-tiles", help="Transcode the whole video into fixed target-quality tiles + manifest (ingestion)")
