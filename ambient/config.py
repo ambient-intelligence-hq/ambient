@@ -2,7 +2,9 @@ from functools import lru_cache
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dataclasses import dataclass
-
+import os
+import json
+from enum import Enum
 class Settings(BaseSettings):
     """
     Settings for the application. Environment variables are loaded from the .env file and overrides the default values.
@@ -34,6 +36,13 @@ class Settings(BaseSettings):
     # first calling agents.create / environments.create.
     default_agent_name: str = "Video Analyst"
     default_agent_system: str = "Analyze videos and answer with citations."
+
+    # Surface the main agent's extended-thinking/reasoning as `agent.thinking`
+    # session events (with the reasoning text attached) so clients can display it.
+    expose_thinking: bool = True
+    # Accumulate token usage + cost (main agent LLM calls and tool LLM calls) and
+    # expose it on the session resource / run.completed and per-request span events.
+    track_usage: bool = True
 
     redis_url: str = "redis://localhost:6379/0"
     database_url: str = "postgresql://ambient:ambient@localhost:5432/ambient"

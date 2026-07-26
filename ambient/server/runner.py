@@ -21,19 +21,50 @@ import uuid
 from typing import Any, Optional
 
 from ambient.config import settings
-from ambient.prompt import SYSTEM_PROMPT, SYSTEM_PROMPT_PARALLEL
+from ambient.llm import normalize_usage
+from ambient.prompt import get_system_prompt
 from ambient.server.broker import Broker
 from ambient.server.llm_client import assemble_assistant_message, stream_chat_completion
+from ambient.server.pricing import estimate_cost
 from ambient.server.sandbox import SandboxLimits, ToolDispatcher
 from ambient.server.store import Store
 from ambient.tools import TOOLS
 from ambient.server.ingest import ensure_description
+from ambient.config import get_model_modalities
 import logging
 
 log = logging.getLogger(__name__)
 
 MAX_CLIPS = 5
 MAX_FRAMES = 30
+
+_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_tokens",
+)
+
+
+def _empty_usage() -> dict:
+    """Zeroed session usage aggregate (ATIF-style token fields + cost + rollups)."""
+    return {
+        **{f: 0 for f in _TOKEN_FIELDS},
+        "cost": 0.0,
+        "turns": 0,
+        "runs": 0,
+        "requests": 0,
+        "by_source": {},   # "agent" / "tool:<name>" -> {tokens..., cost, requests}
+        "by_model": {},    # model id -> {tokens..., cost, requests}
+    }
+
+
+def _add_usage_bucket(bucket: dict, usage_norm: dict, cost: float) -> None:
+    for f in _TOKEN_FIELDS:
+        bucket[f] = int(bucket.get(f, 0)) + int(usage_norm.get(f, 0))
+    bucket["cost"] = round(float(bucket.get("cost", 0.0)) + cost, 6)
+    bucket["requests"] = int(bucket.get("requests", 0)) + 1
 
 
 class SandboxNotReady(Exception):
@@ -140,11 +171,12 @@ class SessionRunner:
         self._dispatcher = ToolDispatcher()
         self._media_box: Optional[object] = None
         self.sandbox_id: Optional[str] = None
+        model_modalities = get_model_modalities(self.model)
 
         # On a fresh session `messages` is None -> empty list; seed is built in
         # start_sandbox() after the description is ready. On rehydration the
         # caller passes the persisted list (already includes the seeded turns).
-        self.messages: list[dict] = messages or self._get_seed_messages()
+        self.messages: list[dict] = messages or self._get_seed_messages(model_modalities)
         self._run_task: Optional[asyncio.Task] = None
         self._run_lock = asyncio.Lock()
         self._status = "created"
@@ -155,12 +187,19 @@ class SessionRunner:
         # Set once the youtube source MP4 is confirmed on S3, so media tools don't
         # fetch a not-yet-uploaded clip. Non-youtube sources are ready immediately.
         self._source_ready = False
+        # Running token/cost totals for the session. Seeded from the persisted
+        # session record on the first run (survives rehydration), then kept in
+        # memory and written back after each turn.
+        self.usage: dict = _empty_usage()
+        self._usage_seeded = False
 
     # --- lifecycle --------------------------------------------------------
 
-    def _get_seed_messages(self) -> None:
+
+
+    def _get_seed_messages(self, model_modalities: list[str]) -> None:
         return [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": get_system_prompt(model_modalities)}
         ]
         
 
@@ -336,6 +375,10 @@ class SessionRunner:
         await self._emit("run.started", {"run_id": run_id, "model": model})
         stop_reason = "end_turn"
         final_answer = ""
+        last_assistant_text = ""
+
+        await self._seed_usage_once()
+        self.usage["runs"] = int(self.usage.get("runs", 0)) + 1
 
         # Ground the first answer in the description: wait (bounded) for it before
         # the first LLM call. Session readiness is unaffected; only this run waits,
@@ -381,8 +424,28 @@ class SessionRunner:
                     stop_reason = "error"
                     break
 
-                assistant_msg, finish_reason, tool_uses = assemble_assistant_message(chunks)
+                assistant_msg, finish_reason, tool_uses, reasoning, agent_usage = (
+                    assemble_assistant_message(chunks)
+                )
                 self.messages.append(assistant_msg)
+
+                self.usage["turns"] = int(self.usage.get("turns", 0)) + 1
+                await self._record_usage(run_id, turn, model, agent_usage, "agent")
+
+                # Surface the agent's extended thinking as its own event (a text
+                # carrier via the SDK-visible agent.thinking event) so clients can
+                # display it. Emitted before tool dispatch, mirroring turn order.
+                if settings.expose_thinking and reasoning:
+                    await self._emit("agent.reasoning", {
+                        "run_id": run_id,
+                        "turn": turn,
+                        "reasoning": reasoning,
+                    })
+
+                text = self._extract_answer_text(assistant_msg)
+                if text:
+                    last_assistant_text = text
+
                 await self._emit("turn.end", {
                     "run_id": run_id,
                     "turn": turn,
@@ -390,7 +453,7 @@ class SessionRunner:
                 })
 
                 if finish_reason in (None, "stop", "length"):
-                    final_answer = self._extract_answer_text(assistant_msg)
+                    final_answer = text
                     stop_reason = "end_turn"
                     break
 
@@ -399,16 +462,23 @@ class SessionRunner:
                     # Persist the grown context so another worker can rehydrate it
                     # mid-conversation.
                     await self.store.save_messages(self.session_id, self.messages)
+                    await self._persist_usage()
                 else:
+                    final_answer = text
                     stop_reason = "end_turn"
                     break
             else:
                 stop_reason = "max_turns"
+                # The loop hit the turn cap mid tool-use. Fall back to the last
+                # non-empty assistant text so the client still gets something
+                # rather than an empty "no response".
+                final_answer = final_answer or last_assistant_text
 
             await self._emit("run.completed", {
                 "run_id": run_id,
                 "stop_reason": stop_reason,
                 "answer": final_answer,
+                "usage": self.usage,
             })
         except asyncio.CancelledError:
             await self._emit("run.completed", {
@@ -418,6 +488,7 @@ class SessionRunner:
             })
         finally:
             await self.store.save_messages(self.session_id, self.messages)
+            await self._persist_usage()
             await self._set_status("ready")
             # Release the run-ownership lease so any worker can serve the next turn.
             await self.broker.release(self.session_id)
@@ -434,6 +505,8 @@ class SessionRunner:
             })
 
         await self._await_source_ready(on_wait=_on_wait)
+
+        tool_uses_by_id = {b["id"]: b["name"] for b in tool_uses}
 
         async def _run_one(block: dict) -> tuple[str, dict | None, dict | None]:
             tool_use_id = block["id"]
@@ -492,6 +565,14 @@ class SessionRunner:
             analysis = data.get("analysis", "")
             attachments = data.get("attachments") or []
             user_message_contents = data.get("user_message_contents") or []
+
+            # Attribute any LLM usage this tool incurred (e.g. clip/frame analysis)
+            # to the session totals, keyed by tool name.
+            for rec in data.get("usage") or []:
+                await self._record_usage(
+                    run_id, turn, rec.get("model"), rec.get("usage"),
+                    f"tool:{tool_uses_by_id.get(tool_use_id, 'tool')}",
+                )
 
             await self._emit("tool.result", {
                 "run_id": run_id,
@@ -609,6 +690,64 @@ class SessionRunner:
                 if t and not t.startswith("<think>"):
                     parts.append(t)
         return "\n".join(parts).strip()
+
+    async def _seed_usage_once(self) -> None:
+        """Load the persisted usage aggregate on the first run so accumulation
+        survives rehydration on another worker."""
+        if self._usage_seeded:
+            return
+        self._usage_seeded = True
+        try:
+            record = await self.store.get_session(self.session_id)
+        except Exception:  # noqa: BLE001
+            record = None
+        persisted = (record or {}).get("usage")
+        if isinstance(persisted, dict) and persisted.get("requests") is not None:
+            # Merge onto the empty template so any newly added fields exist.
+            merged = _empty_usage()
+            merged.update(persisted)
+            self.usage = merged
+
+    async def _record_usage(
+        self, run_id: str, turn: int, model: str, raw_usage: Optional[dict], source: str
+    ) -> None:
+        """Attribute one LLM request's usage to the session totals and emit a
+        `span.model_request_end` event carrying its per-request token usage."""
+        if not settings.track_usage or not raw_usage:
+            return
+        norm = normalize_usage(raw_usage)
+        # Prefer the provider-reported cost (OpenRouter returns actual USD in the
+        # usage block); fall back to the catalog estimate when it's absent.
+        cost = norm.pop("cost", None)
+        if cost is None:
+            cost = estimate_cost(model, norm)
+        # Totals.
+        _add_usage_bucket(self.usage, norm, cost)
+        # Rollups by source (agent / tool:<name>) and by model.
+        by_source = self.usage.setdefault("by_source", {})
+        _add_usage_bucket(by_source.setdefault(source, {}), norm, cost)
+        by_model = self.usage.setdefault("by_model", {})
+        _add_usage_bucket(by_model.setdefault(model or "unknown", {}), norm, cost)
+
+        await self._emit("span.model_request_end", {
+            "run_id": run_id,
+            "turn": turn,
+            "source": source,
+            "model": model,
+            "usage": norm,
+            "cost": cost,
+        })
+
+    async def _persist_usage(self) -> None:
+        if not settings.track_usage:
+            return
+        snapshot = dict(self.usage)
+        try:
+            await self.store.update_session(
+                self.session_id, lambda r: {**r, "usage": snapshot}
+            )
+        except KeyError:
+            pass
 
     async def _set_status(self, status: str) -> None:
         prev = self._status

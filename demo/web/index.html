@@ -253,6 +253,21 @@
   .tool[open] .chev { transform: rotate(90deg); }
   .tool .body { padding: 0 13px 13px; }
   .tool pre { margin: 0; background: var(--shell); border: 1px solid var(--border); border-radius: 9px; padding: 11px; overflow-x: auto; font-family: "JetBrains Mono", monospace; font-size: 11.5px; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
+  .tool .body.reasoning { font-size: 12.5px; line-height: 1.55; color: var(--text-dim); }
+  .tool .body.reasoning :is(p, ul, ol) { margin: 0 0 8px; }
+  .tool .body.reasoning :is(p, ul, ol):last-child { margin-bottom: 0; }
+
+  /* usage card */
+  .tool.usage .usage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 10px; }
+  .tool.usage .usage-grid > div { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 7px 10px; background: var(--shell); border: 1px solid var(--border); border-radius: 8px; }
+  .tool.usage .usage-grid span { font-size: 11.5px; color: var(--text-faint); }
+  .tool.usage .usage-grid b { font-size: 13px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .tool.usage .usage-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .tool.usage .usage-table th { text-align: left; color: var(--text-faint); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+  .tool.usage .usage-table td { padding: 5px 6px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .tool.usage .usage-table td:first-child { color: var(--text); }
+  .tool.usage .usage-table tr:last-child td { border-bottom: none; }
+  .tool.usage .usage-table code { font-size: 10.5px; }
 
   .thinking { display: flex; gap: 9px; align-items: center; color: var(--text-faint); font-size: 13px; margin-left: 40px; }
   .thinking .d { display: inline-flex; gap: 4px; }
@@ -661,6 +676,40 @@ function addToolResult(text, isErr) {
   el.querySelector("pre").textContent = text || "(no output)";
   chatInner.appendChild(el); scrollDown();
 }
+function addThinkingCard(text) {
+  if (!text) return;
+  const el = document.createElement("details");
+  el.className = "tool"; el.open = false;
+  el.innerHTML = `<summary>💭 Thinking <span class="tag">reasoning</span><span class="chev">▸</span></summary>
+    <div class="body reasoning"></div>`;
+  el.querySelector(".body").innerHTML = md(text);
+  chatInner.appendChild(el); scrollDown();
+}
+const fmtNum = (n) => Number(n || 0).toLocaleString();
+const fmtUsd = (n) => "$" + Number(n || 0).toFixed(4);
+function addUsageCard(usage) {
+  if (!usage || !usage.requests) return;
+  const bySrc = usage.by_source || {};
+  const srcRows = Object.keys(bySrc).map(k => {
+    const b = bySrc[k] || {};
+    return `<tr><td><code>${k}</code></td><td>${fmtNum(b.total_tokens)}</td><td>${fmtUsd(b.cost)}</td><td>${fmtNum(b.requests)}</td></tr>`;
+  }).join("");
+  const el = document.createElement("details");
+  el.className = "tool usage"; el.open = false;
+  el.innerHTML = `<summary>📊 Usage &amp; cost <span class="tag ok">${fmtUsd(usage.cost)}</span><span class="chev">▸</span></summary>
+    <div class="body">
+      <div class="usage-grid">
+        <div><span>Total tokens</span><b>${fmtNum(usage.total_tokens)}</b></div>
+        <div><span>Est. cost</span><b>${fmtUsd(usage.cost)}</b></div>
+        <div><span>Input</span><b>${fmtNum(usage.input_tokens)}</b></div>
+        <div><span>Output</span><b>${fmtNum(usage.output_tokens)}</b></div>
+        <div><span>Cache read</span><b>${fmtNum(usage.cache_read_input_tokens)}</b></div>
+        <div><span>LLM requests</span><b>${fmtNum(usage.requests)}</b></div>
+      </div>
+      ${srcRows ? `<table class="usage-table"><thead><tr><th>Source</th><th>Tokens</th><th>Cost</th><th>Req</th></tr></thead><tbody>${srcRows}</tbody></table>` : ""}
+    </div>`;
+  chatInner.appendChild(el); scrollDown();
+}
 let thinkingEl = null;
 function showThinking(label) {
   hideThinking();
@@ -688,11 +737,19 @@ async function sendMessage(text) {
   setStatus("run", "Running");
 
   let answered = false;
+  let stopReason = null;
   try {
     await api("POST", `/v1/sessions/${state.sessionId}/events`, { events: [{ type: "user.message", content: text }] });
     await streamSession(state.sessionId, (data) => {
       switch (data.type) {
         case "session.status_running": setThinking("Analyzing the video…"); break;
+        case "agent.thinking": {
+          // The server attaches the reasoning text as `content` on the otherwise
+          // content-less agent.thinking event.
+          const think = eventText(data.content);
+          if (think) { hideThinking(); addThinkingCard(think); showThinking("Working…"); }
+          break;
+        }
         case "agent.tool_use": hideThinking(); addToolUse(data.name, data.input); showThinking("Running tools…"); break;
         case "agent.tool_result": addToolResult(eventText(data.content), data.is_error); break;
         case "agent.message": {
@@ -700,7 +757,17 @@ async function sendMessage(text) {
           if (ans) { hideThinking(); addBot(md(ans)); answered = true; }
           break;
         }
-        case "session.status_idle": return true; // stop
+        case "session.error": {
+          hideThinking();
+          const emsg = (data.error && (data.error.message || data.error.type)) || "error";
+          addBot(`<span style="color:var(--bad)">❌ ${emsg}</span>`);
+          break;
+        }
+        case "session.status_idle":
+          stopReason = data.stop_reason || null;
+          hideThinking();
+          addUsageCard(data.usage);
+          return true; // stop
       }
       return false;
     });
@@ -709,7 +776,13 @@ async function sendMessage(text) {
     addBot(`<span style="color:var(--bad)">❌ ${err.message || err}</span>`);
   } finally {
     hideThinking();
-    if (!answered) addBot(`<span style="color:var(--text-faint)">The run produced no final answer.</span>`);
+    if (!answered) {
+      // Be specific about *why* there's no answer (e.g. hit the turn cap).
+      const why = stopReason && stopReason !== "end_turn"
+        ? `The run stopped without a final answer (<code>${stopReason}</code>).`
+        : "The run produced no final answer.";
+      addBot(`<span style="color:var(--text-faint)">${why}</span>`);
+    }
     setStatus("idle", "Ready");
     state.busy = false;
     $("sendBtn").disabled = false; $("msg").disabled = false; $("msg").focus();

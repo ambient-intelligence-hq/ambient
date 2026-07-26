@@ -43,7 +43,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from ambient.config import settings
 from ambient.server.auth import require_api_key
 from ambient.server.errors import bad_request, conflict, not_found
-from ambient.server.runner import SandboxNotReady, SessionRunner
+from ambient.server.runner import SandboxNotReady, SessionRunner, _empty_usage
 from ambient.server.sandbox import SandboxLimits
 from ambient.server.store import _new_id, _now
 from ambient.server.video_store import create_youtube_video, store_video
@@ -417,7 +417,7 @@ async def build_session_record(body: dict, store) -> dict:
         "sandbox": {"backend": backend, "id": None, "status": "starting",
                     "boot_ms": None, "limits": limits_dict, "region": None},
         "quota": {},
-        "usage": {"input_tokens": 0, "output_tokens": 0, "turns": 0, "runs": 0},
+        "usage": _empty_usage(),
         "max_turns_per_run": max_turns,
         "subtitle_path": None,
         # Managed-Agents echo-back fields:
@@ -577,12 +577,15 @@ def _to_managed_events(ev: dict) -> list[dict]:
     data `type` discriminator) is in its allowlist, and constructs each into a
     member of BetaManagedAgentsStreamSessionEvents. So we emit exactly those
     shapes:
-        run.started   -> session.status_running
-        tool.scheduled-> agent.tool_use
-        tool.result   -> agent.tool_result
-        tool.failed   -> agent.tool_result (is_error)
-        run.completed -> agent.message (the answer) + session.status_idle
-        user.message  -> user.message
+        run.started            -> session.status_running
+        agent.reasoning        -> agent.thinking (reasoning text attached)
+        tool.scheduled         -> agent.tool_use
+        tool.result            -> agent.tool_result
+        tool.failed            -> agent.tool_result (is_error)
+        span.model_request_end -> span.model_request_end (per-request token usage)
+        error                  -> session.error
+        run.completed          -> agent.message (the answer) + session.status_idle
+        user.message           -> user.message
     Everything else (turn.*, tool.started/progress, per-token chunks,
     status_changed) is dropped — it has no SDK-visible counterpart.
     """
@@ -592,6 +595,52 @@ def _to_managed_events(ev: dict) -> list[dict]:
 
     if etype == "run.started":
         return [{"type": "session.status_running", "id": _new_id("evt"), "processed_at": ts}]
+
+    if etype == "agent.reasoning":
+        # `agent.thinking` is a progress signal in the SDK schema (no content
+        # field), but the SDK's models allow extra fields, so we attach the
+        # reasoning text as `content` for clients that want to render it.
+        text = str(p.get("reasoning") or "")
+        if not text:
+            return []
+        return [{
+            "type": "agent.thinking",
+            "id": _new_id("evt"),
+            "content": [{"type": "text", "text": text}],
+            "processed_at": ts,
+        }]
+
+    if etype == "span.model_request_end":
+        usage = p.get("usage") or {}
+        return [{
+            "type": "span.model_request_end",
+            "id": _new_id("evt"),
+            "model_request_start_id": p.get("run_id") or _new_id("evt"),
+            "is_error": False,
+            "model_usage": {
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+            },
+            # Extra (non-schema) fields for richer clients.
+            "source": p.get("source"),
+            "model": p.get("model"),
+            "cost": p.get("cost"),
+            "processed_at": ts,
+        }]
+
+    if etype == "error":
+        return [{
+            "type": "session.error",
+            "id": _new_id("evt"),
+            "error": {
+                "type": "unknown_error",
+                "message": str(p.get("message") or p.get("code") or "error"),
+                "retry_status": {"type": "terminal"},
+            },
+            "processed_at": ts,
+        }]
 
     if etype == "tool.scheduled":
         return [{
@@ -637,6 +686,9 @@ def _to_managed_events(ev: dict) -> list[dict]:
             "type": "session.status_idle",
             "id": _new_id("evt"),
             "stop_reason": "end_turn" if stop in (None, "end_turn") else stop,
+            # Extra (non-schema) field: cumulative session usage snapshot so the
+            # client can render totals without a separate session fetch.
+            "usage": p.get("usage") or {},
             "processed_at": ts,
         })
         return out
@@ -676,10 +728,20 @@ async def stream_events(
         # When the SDK opens a fresh stream (no cursor), scope the replay to the
         # latest run only — otherwise the replay loop hits an earlier run's
         # run.completed and returns before ever reaching the current run's events.
+        #
+        # Anchor on the latest `user.message` as well as `run.started`. The client
+        # sends its message (persisted synchronously) and *then* opens the stream,
+        # but the run task that emits `run.started` may not have run yet. Anchoring
+        # only on run.started would race: we'd pick the *previous* run's start,
+        # replay that whole run (and stop at its run.completed) instead of the new
+        # one — surfacing prior tool calls/results again. The current run's
+        # user.message always has the highest seq at stream-open, so it's the
+        # reliable boundary.
         if not last_event_id and after_seq == 0:
             all_events = await store.list_events(session_id, after_seq=0, limit=10000)
             last_start = max(
-                (e["seq"] for e in all_events if e["type"] == "run.started"),
+                (e["seq"] for e in all_events
+                 if e["type"] in ("run.started", "user.message")),
                 default=0,
             )
             replay_after = max(replay_after, last_start - 1)

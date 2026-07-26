@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Optional
 
 from ambient.server.sandbox.interface import ToolEvent
 from ambient.tools.video_backend import current_media_box
+from ambient.llm import usage_sink
 
 
 def _run_tool_blocking(func, tool_input: dict[str, Any]) -> Any:
@@ -90,6 +91,10 @@ class ToolDispatcher:
 
         # Publish the media box for the worker thread (to_thread copies this context).
         token = current_media_box.set(self.media_box)
+        # Collect any LLM usage this tool incurs. `to_thread` copies the context,
+        # so llm_call (running off-thread) appends into this same list object.
+        usage_records: list = []
+        usage_token = usage_sink.set(usage_records)
         try:
             tool_input = dict(input or {})
             video_id = tool_input.get("video_id")
@@ -113,11 +118,16 @@ class ToolDispatcher:
                 if video_id and description:
                     self._video_description[video_id] = description
 
+            result = _normalize_tool_result(raw)
+            # Attach the LLM usage this tool incurred so the runner can attribute
+            # tool-side token/cost to the session totals.
+            if usage_records:
+                result["usage"] = list(usage_records)
             yield ToolEvent(
                 type="result",
                 tool_use_id=tool_use_id,
                 name=name,
-                data=_normalize_tool_result(raw),
+                data=result,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the runner as tool.failed
             yield ToolEvent(
@@ -132,3 +142,4 @@ class ToolDispatcher:
             )
         finally:
             current_media_box.reset(token)
+            usage_sink.reset(usage_token)
