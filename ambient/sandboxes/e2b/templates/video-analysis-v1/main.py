@@ -425,6 +425,18 @@ class ClipResult(BaseModel):
     clip: ClipOut
 
 
+class AnnotatedFrameResult(BaseModel):
+    video_id: str
+    timestamp: float
+    annotated_file_path: str
+    annotated_url: Optional[str] = None
+    width: int
+    height: int
+    # The annotations as drawn, with boxes converted to absolute pixel xyxy so the
+    # host doesn't have to re-derive them.
+    annotations: List[dict]
+
+
 class TileEntry(BaseModel):
     index: int
     start: float
@@ -988,6 +1000,29 @@ class VideoFrameTools:
             id=f"{self.video_id}_clip_{start_time}_{duration_sec}secs",
         )
 
+    def extract_frame_at(self, timestamp: float, out_path: str) -> str:
+        """Decode a single frame at ``timestamp`` seconds to ``out_path`` (PNG).
+
+        A one-shot ``-ss`` seek (input seek + ``-frames:v 1``) — the nearest frame
+        to the requested time, at the source resolution unless ``max_frame_dimension``
+        is set. Used by the annotate-frame path, where we want a full-res still to
+        draw boxes on (the model's normalized coords apply at any resolution).
+        """
+        self._ensure_backend()  # resolves is_url / reconnect flags
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", str(timestamp), *self._reconnect_flags(),
+            "-i", self.video_path, "-frames:v", "1",
+        ]
+        if self.max_frame_dimension is not None:
+            cmd += ["-vf", _scale_even_filter(self.max_frame_dimension)]
+        cmd.append(out_path)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if not os.path.isfile(out_path):
+            raise RuntimeError(f"no frame decoded at {timestamp}s for {self.video_id}")
+        return out_path
+
 
 # ---------------------------------------------------------------------------
 # CLI sub-commands
@@ -1325,6 +1360,147 @@ def cmd_fetch_clip(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Frame annotation (draw model bounding boxes onto a still)
+# ---------------------------------------------------------------------------
+
+# Colors cycled per-annotation so overlapping boxes stay distinguishable.
+_ANNOTATION_COLORS = [
+    (255, 59, 48), (52, 199, 89), (0, 122, 255), (255, 149, 0),
+    (175, 82, 222), (255, 214, 10), (255, 45, 146), (48, 209, 209),
+]
+
+
+def _denorm_box(box: List[float], coord_scale: float, width: int, height: int) -> Tuple[int, int, int, int]:
+    """Convert a model box ``[y_min, x_min, y_max, x_max]`` to pixel ``(x0, y0, x1, y1)``.
+
+    The grab-frames model (Gemini convention) emits ``[y_min, x_min, y_max, x_max]``
+    normalized to a ``0..coord_scale`` grid (default 1000), independent of the frame's
+    pixel size. When ``coord_scale <= 0`` the values are treated as absolute pixels.
+    Note the y/x order is swapped relative to the ``(x, y)`` most draw APIs expect.
+    """
+    y_min, x_min, y_max, x_max = box
+    if coord_scale and coord_scale > 0:
+        x0 = x_min / coord_scale * width
+        y0 = y_min / coord_scale * height
+        x1 = x_max / coord_scale * width
+        y1 = y_max / coord_scale * height
+    else:
+        x0, y0, x1, y1 = x_min, y_min, x_max, y_max
+    # Model may emit min/max out of order; normalize and clamp to the frame.
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    x0 = max(0, min(int(round(x0)), width))
+    x1 = max(0, min(int(round(x1)), width))
+    y0 = max(0, min(int(round(y0)), height))
+    y1 = max(0, min(int(round(y1)), height))
+    return x0, y0, x1, y1
+
+
+def _draw_annotations(
+    image_path: str, annotations: List[dict], coord_scale: float, out_path: str
+) -> Tuple[int, int, List[dict]]:
+    """Draw each annotation's box + label onto the still; return (w, h, drawn).
+
+    ``drawn`` echoes back each annotation with a ``pixel_box`` (absolute xyxy) added,
+    so the host has the resolved coordinates without redoing the math.
+    """
+    PIL_Image = importlib.import_module("PIL.Image")
+    PIL_ImageDraw = importlib.import_module("PIL.ImageDraw")
+    PIL_ImageFont = importlib.import_module("PIL.ImageFont")
+
+    img = PIL_Image.open(image_path).convert("RGB")
+    width, height = img.size
+    draw = PIL_ImageDraw.Draw(img)
+
+    # Scale line/text to the frame so boxes read on both 480p and 1080p stills.
+    line_w = max(2, round(min(width, height) / 300))
+    font_size = max(12, round(min(width, height) / 40))
+    try:
+        font = PIL_ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:  # font file not in the base image → bitmap default
+        font = PIL_ImageFont.load_default()
+
+    def _text_size(text: str) -> Tuple[int, int]:
+        if hasattr(draw, "textbbox"):
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            return right - left, bottom - top
+        return draw.textsize(text, font=font)  # Pillow < 8
+
+    drawn: List[dict] = []
+    for i, ann in enumerate(annotations):
+        box = ann.get("bounding_box")
+        label = ann.get("label")
+        if not box or len(box) != 4:
+            continue
+        color = _ANNOTATION_COLORS[i % len(_ANNOTATION_COLORS)]
+        x0, y0, x1, y1 = _denorm_box(box, coord_scale, width, height)
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=line_w)
+
+        if label:
+            tw, th = _text_size(label)
+            pad = max(2, line_w)
+            # Sit the label bar above the box; drop it inside if it'd clip the top.
+            ty1 = y0
+            ty0 = ty1 - th - 2 * pad
+            if ty0 < 0:
+                ty0, ty1 = y0, y0 + th + 2 * pad
+            draw.rectangle([x0, ty0, x0 + tw + 2 * pad, ty1], fill=color)
+            draw.text((x0 + pad, ty0 + pad), label, fill=(255, 255, 255), font=font)
+
+        entry = dict(ann)
+        entry["pixel_box"] = [x0, y0, x1, y1]
+        drawn.append(entry)
+
+    img.save(out_path, format="PNG")
+    return width, height, drawn
+
+
+def cmd_annotate_frame(args: argparse.Namespace) -> None:
+    """Extract the frame at a timestamp, draw model bounding boxes, upload the PNG.
+
+    ``--annotations`` is a JSON list like the grab-frames tool produces:
+        [{"bounding_box": [y_min, x_min, y_max, x_max], "label": "..."}, ...]
+    Boxes are normalized to ``--coord-scale`` (default 1000, Gemini convention);
+    pass ``--coord-scale 0`` for absolute-pixel boxes.
+    """
+    start = time.time()
+    try:
+        annotations = json.loads(args.annotations)
+    except json.JSONDecodeError as exc:
+        emit(error=ResultError(code="BadAnnotations", message=f"--annotations is not valid JSON: {exc}"))
+        return
+    if not isinstance(annotations, list):
+        emit(error=ResultError(code="BadAnnotations", message="--annotations must be a JSON list of {bounding_box,label}"))
+        return
+
+    tools = VideoFrameTools(args.video_id, max_frame_dimension=args.max_dim)
+    out_dir = os.path.join(VIDEO_FOLDER, args.video_id, "annotated")
+    raw_path = os.path.join(out_dir, f"frame_{args.timestamp}.png")
+    tools.extract_frame_at(args.timestamp, raw_path)
+
+    annotated_path = os.path.join(out_dir, f"annotated_{args.timestamp}.png")
+    width, height, drawn = _draw_annotations(raw_path, annotations, args.coord_scale, annotated_path)
+    print(f"[annotate-frame] drew {len(drawn)} boxes in {time.time() - start:.2f}s", file=sys.stderr)
+
+    annotated_url: Optional[str] = None
+    if args.upload_s3:
+        s3 = S3Client()
+        key = f"{args.video_id}/annotated/frame_{args.timestamp}.png"
+        _, annotated_url = s3.upload_and_presign(annotated_path, key, "image/png", args.s3_presigned_expires)
+        print(f"[annotate-frame] [s3] uploaded → {annotated_url}", file=sys.stderr)
+
+    emit(data=AnnotatedFrameResult(
+        video_id=args.video_id,
+        timestamp=args.timestamp,
+        annotated_file_path=annotated_path,
+        annotated_url=annotated_url,
+        width=width,
+        height=height,
+        annotations=drawn,
+    ))
+
+
+# ---------------------------------------------------------------------------
 # Tile transcoding (ingestion-time) + concat assembly (fetch_clip fast path)
 # ---------------------------------------------------------------------------
 
@@ -1584,6 +1760,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fc.add_argument("--upload-s3", action="store_true", help="Upload the clip to S3 and include a presigned URL in output")
     p_fc.add_argument("--s3-presigned-expires", type=int, default=3600, metavar="SECS", help="Presigned URL TTL in seconds (default: 3600)")
     p_fc.set_defaults(func=cmd_fetch_clip)
+
+    # ── annotate-frame ────────────────────────────────────────────────────────
+    p_af = sub.add_parser("annotate-frame", help="Draw model bounding boxes on the frame at a timestamp and upload the PNG")
+    p_af.add_argument("--video-id", required=True, help="Video ID; resolved from VIDEO_FOLDER or downloaded from S3")
+    p_af.add_argument("--timestamp", type=float, required=True, help="Frame time in seconds (global video time)")
+    p_af.add_argument("--annotations", required=True, help='JSON list: [{"bounding_box":[y_min,x_min,y_max,x_max],"label":"..."}]')
+    p_af.add_argument("--coord-scale", type=float, default=1000.0, help="Normalization grid of the boxes (default: 1000; 0 = absolute pixels)")
+    p_af.add_argument("--max-dim", type=int, default=None, help="Resize the still so longest edge ≤ this value (default: source resolution)")
+    p_af.add_argument("--upload-s3", action="store_true", help="Upload the annotated PNG to S3/R2 and include a presigned URL")
+    p_af.add_argument("--s3-presigned-expires", type=int, default=3600, metavar="SECS", help="Presigned URL TTL in seconds (default: 3600)")
+    p_af.set_defaults(func=cmd_annotate_frame)
 
     # ── prepare-youtube ──────────────────────────────────────────────────────
     p_yt = sub.add_parser("prepare-youtube", help="Download a YouTube URL into the sandbox video cache")

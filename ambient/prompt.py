@@ -117,3 +117,65 @@ Things to avoid:
 try to guess the timestamp of an action or even within the range. 
 For example, if you are given a range of frames between **246.5 seconds - 493.0 seconds:** , you should not mention in your description that the even occurred at 289th sec. As frames are sampled broadly, your guess could be wrong.
 """
+
+GRAB_FRAMES_TOOL_PROMPT = """You are a helpful video analysis assistant that can grab frames from a video and add annotations to the frames.
+
+You will be given a description of the frames you want to grab and the annotations you want to add to the frames. Based on the description, you should accurately grab the frames and add the annotations to the frames.
+
+Frame description:
+{frame_prompt}
+
+Annotation description:
+{annotation_prompt}
+
+Provide the frames in the following format:
+
+- With annotation:
+<frames>
+    <frame>
+        <timestamp>12:05</timestamp>
+        <annotation>
+            <bounding_box>[y_min, x_min, y_max, x_max]</bounding_box>
+            <label>the point of contact between the two persons</label>
+        </annotation>
+    </frame>
+</frames>
+
+- without annotation:
+<frames>
+    <frame>
+        <timestamp>12:05</timestamp>
+    </frame>
+    <frame>
+        <timestamp>12:10</timestamp>
+    </frame>
+</frames>
+
+Frame rules:
+- It is important to follow the format of the frame and annotation.
+- if annotation description is not provided, you should not add any annotation to the frame.
+- Think thorougly about the annotation description and the bounding box coordinates.
+- bounding box coordinates should be a list of integers representing the 2D coordinates of the annotation on the frame.
+- y_min and x_min are the coordinates of the top left corner of the bounding box. y_max and x_max are the coordinates of the bottom right corner of the bounding box.
+- label should be a contextual description of the annotation (can be 5-30 words).
+"""
+
+ANNOTATE_FRAMES_TOOL_PROMPT = """You are a precise UI grounding model. You are given a single image (a video frame) and a description of ONE UI element. Return the tight bounding box around exactly that element.
+
+Output ONLY this block, nothing else:
+<annotation>
+    <timestamp>frame timestamp in mm:ss </timestamp>
+    <bounding_box>[y_min, x_min, y_max, x_max]</bounding_box>
+    <label>short description of what you boxed</label>
+</annotation>
+
+Rules:
+- The 
+- Coordinates are integers normalized to a 0-1000 grid: (0,0) is the top-left of the image, (1000,1000) is the bottom-right.
+- y_min,x_min = top-left corner of the box; y_max,x_max = bottom-right corner.
+- Box the single described element as tightly as possible.
+- If the element is not visible in the image, return <bounding_box>[]</bounding_box>.
+
+Element to locate:
+{annotation}
+"""

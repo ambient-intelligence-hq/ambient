@@ -101,6 +101,40 @@ class SandboxVideoFrameTools:
     def get_overview_frames(self) -> List[Frame]:
         return self._extract_frames(self.OVERVIEW_FPS, max_frames=self.OVERVIEW_MAX_FRAMES)
 
+    # --------------------------------------------------------------- annotation
+    def annotate_frame(
+        self,
+        timestamp: float,
+        annotations: List[dict],
+        coord_scale: float = 1000.0,
+        max_dim: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Draw the model's bounding boxes on the frame at ``timestamp`` and upload it.
+
+        ``annotations`` is the grab-frames shape: ``[{"bounding_box": [y_min, x_min,
+        y_max, x_max], "label": "..."}]``, normalized to ``coord_scale`` (1000 =
+        Gemini convention). Returns the annotate-frame envelope (incl. ``annotated_url``),
+        or None if there's nothing with a box to draw. ``max_dim`` defaults to the
+        source resolution — the normalized boxes apply at any resolution, so we draw
+        on the full-res still rather than the 768px analysis frame.
+        """
+        import json
+
+        boxed = [a for a in (annotations or []) if a.get("bounding_box")]
+        if not boxed:
+            return None
+        argv = [
+            "annotate-frame", "--video-id", self.video_id,
+            "--timestamp", str(timestamp),
+            "--annotations", json.dumps(boxed),
+            "--coord-scale", str(coord_scale),
+            "--upload-s3",
+        ]
+        if max_dim is not None:
+            argv += ["--max-dim", str(int(max_dim))]
+        # Blocking box call; we run on a dedicated worker thread (see fetch_clip).
+        return self._box.run(argv)
+
     # -------------------------------------------------------------------- clip
     async def fetch_clip(
         self,

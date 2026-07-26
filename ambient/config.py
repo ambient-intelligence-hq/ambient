@@ -150,6 +150,7 @@ class Settings(BaseSettings):
     # time; the Redis ownership lease is keyed by session and stamped with it.
     worker_id: str = ""
     server_workers: int = 1
+    model_definitions_file: str = os.path.join(os.path.dirname(__file__),"artifacts","models.json")
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -162,6 +163,12 @@ class provider_quality_settings:
     max_dimentions: Optional[int] = 768
     max_size_mb: Optional[int] = None
 
+class model_modalities(Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+
 
 def get_provider_quality_settings(model: str) -> provider_quality_settings:
     if "gemini" in model:
@@ -172,6 +179,32 @@ def get_provider_quality_settings(model: str) -> provider_quality_settings:
             max_dimentions=settings.analysis_max_dim,
             max_size_mb=settings.analysis_max_size_mb,
         )
+
+# TODO: if no match with existing models file, fetch from https://openrouter.ai/api/v1/models
+@lru_cache(maxsize=1)
+def get_model_modalities(model: str) -> list[str]:
+    """ 
+    Get the input modalities for a given model.
+    """
+
+    def match_model(model:str, model_id:str) -> bool:
+        if model == model_id:
+            return True
+        # check if model_id ends with model
+        if model_id.endswith(model):
+            return True
+        return False
+
+    model_definitions = {}
+    try:
+        with open(settings.model_definitions_file, "r") as f:
+            model_definitions = json.load(f)
+    except Exception as e:
+        raise Exception(f"Error loading model definitions file: {e}")
+    
+    modalities = [model_json.get("architecture",{}).get("input_modalities", []) for model_json in model_definitions.get("data", []) if match_model(model, model_json.get("id"))]
+    modalities = modalities[0] if modalities and isinstance(modalities[0], list) else modalities
+    return [model_modalities(modality) for modality in modalities if modality in model_modalities]
 
 
 settings = get_settings()
