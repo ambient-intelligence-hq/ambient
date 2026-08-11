@@ -929,14 +929,19 @@ class VideoFrameTools:
         frame_items = self._ensure_frames_cache(fps, start_time_sec, duration_sec, max_frames)
         if not frame_items:
             return []
+        # Key the id (and thus the S3 upload key `<video_id>/frames/<id>.png`) on the
+        # frame's true timestamp, NOT a within-window index. Different grab_frames
+        # windows produce frame_0, frame_1, ... with identical indices, so an
+        # index-based id gave colliding S3 keys — concurrent windows overwrote each
+        # other and every result resolved to the last-uploaded window's frames.
         frames = [
             Frame(
                 frame_file_path=p,
                 timestamp=timestamp,
                 video_id=self.video_id,
-                id=f"{self.video_id}_fps{fps}_frame_{idx}",
+                id=f"{self.video_id}_fps{fps}_t{timestamp:.3f}",
             )
-            for idx, (p, timestamp) in enumerate(frame_items)
+            for (p, timestamp) in frame_items
         ]
         return frames
 

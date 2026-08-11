@@ -52,14 +52,21 @@ async def grab_frames(
 
     agent_modalities = get_model_modalities(settings.agent_model)
 
+    result_prompt = (f"The following are the frames between the {start_time} and {end_time} seconds."
+                     "You should carefully inspect the frames. If you are using the frames to predict coordinates,"
+                     "You must verify your prediction with an appropriate verification tool (draw_bounding_box or draw_point) before committing to your predictions.")
+
     if agent_modalities and model_modalities.IMAGE in agent_modalities:
         for frame in frames:
-            if not frame.frame_url or not frame.frame_file_path:
+            # Need at least one source for the image: the uploaded URL (e2b) or a
+            # local file to inline as a data URL (inprocess). Skip only if both are
+            # missing — the previous `or` guard dropped every frame lacking a URL.
+            if not frame.frame_url and not frame.frame_file_path:
                 continue
             frame_url = frame.frame_url or video_to_data_url(frame.frame_file_path, "image/jpeg")
             user_message_contents.append({"type": "image_url", "image_url": {"url": frame_url }})
         # print(f"[search_clip] LLM Response: {llm_response}")
-    return "Successfully grabbed the frames", user_message_contents
+    return result_prompt, user_message_contents
 
 
 if __name__ == "__main__":

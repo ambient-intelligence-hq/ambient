@@ -431,13 +431,17 @@ class VideoFrameTools:
             return []
 
         frames: List[Frame] = []
-        for idx, (frame_path, timestamp) in enumerate(frame_items):
+        # Key the id on the frame's true timestamp, not a within-window index:
+        # different windows all number frames 0,1,2,... so an index-based id gave
+        # colliding S3 keys (<video_id>/frames/<id>.png) and concurrent grab_frames
+        # windows overwrote each other's uploads.
+        for (frame_path, timestamp) in frame_items:
             frames.append(
                 Frame(
                     frame_file_path=frame_path,
                     timestamp=timestamp,
                     video_id=self.video_id,
-                    id=f"{self.video_id}_fps{fps}_frame_{idx}",
+                    id=f"{self.video_id}_fps{fps}_t{timestamp:.3f}",
                 )
             )
 

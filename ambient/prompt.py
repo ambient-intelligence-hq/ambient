@@ -31,7 +31,7 @@ check a point coordinate prediction before you rely on it.
         """
         escalation_ladder += """
 Escalation ladder: overview → search_clip (locate) → focus_clip (understand) →
-grab_frames / annotate_frames (verify at frame level). Only descend as far as the
+grab_frames (verify at frame level) / draw_bounding_box or draw_point . Only descend as far as the
 question actually requires.
 
 Important: For tasks, that require you to predict point coordinates / bounding boxes. 
@@ -98,7 +98,7 @@ a tool before you commit to it.
   report the uncertainty instead of guessing.
 - Support every factual claim with the video timestamp(s) that back it — the
   start–end of the clip or the specific frame time where you saw it.
-- Your FINAL message must be a single JSON object that strictly conforms to the
+- If you are given a response json schema to follow,Your FINAL message must be a single JSON object that strictly conforms to the
   provided schema (correct fields and types, nothing extra). Put the supporting
   timestamps in the schema's citation field(s). Do not add prose outside the
   JSON.""")

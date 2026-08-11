@@ -10,11 +10,11 @@ identifier is `video_id` (used verbatim as the Files API file id too).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import mimetypes
 import os
-from urllib.parse import urlparse
-import uuid
+from urllib.parse import parse_qs, urlparse
 
 from ambient.config import settings
 from ambient.utils.s3 import get_s3_client
@@ -24,6 +24,51 @@ log = logging.getLogger(__name__)
 VIDEO_FOLDER = settings.video_folder
 _VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg"}
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+
+
+def content_video_id(data: bytes) -> str:
+    """Content-addressed id for an uploaded video.
+
+    Deriving the id from the bytes means identical content always maps to the
+    same `video_id` — and therefore the same `files` row, cached description,
+    R2 object, and local file — so re-uploads reuse the ingested description
+    instead of regenerating it. The description depends only on the video
+    content (frames + transcript), never the filename, so sharing is safe.
+    """
+    return f"vid_{hashlib.sha256(data).hexdigest()[:16]}"
+
+
+def _youtube_source_key(url: str) -> str:
+    """Stable key for a YouTube URL, used to content-address the id.
+
+    Normalizes to the 11-char video id when we can recognize the URL shape
+    (`youtu.be/<id>`, `watch?v=<id>`, `/shorts/<id>`, `/embed/<id>`) so that
+    differing query params / hosts for the same video collapse to one id.
+    Falls back to the lowercased URL when the shape is unfamiliar.
+    """
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    if host == "youtu.be":
+        vid = path.lstrip("/").split("/")[0]
+        if vid:
+            return vid
+    if host in _YOUTUBE_HOSTS:
+        qs = parse_qs(parsed.query or "")
+        if qs.get("v"):
+            return qs["v"][0]
+        for prefix in ("/shorts/", "/embed/", "/v/"):
+            if path.startswith(prefix):
+                vid = path[len(prefix):].split("/")[0]
+                if vid:
+                    return vid
+    return (url or "").strip().lower()
+
+
+def _youtube_video_id(url: str) -> str:
+    """Content-addressed id for a YouTube-backed video (keyed on the URL)."""
+    key = _youtube_source_key(url)
+    return f"vid_{hashlib.sha256(key.encode()).hexdigest()[:16]}"
 
 
 def _pick_extension(filename: str | None, mime_type: str | None) -> str:
@@ -43,7 +88,7 @@ def store_video(data: bytes, filename: str | None, mime_type: str | None) -> dic
     Returns a metadata dict: video_id, filename, mime_type, size_bytes,
     local_path, r2_key (None if the R2 upload was skipped/failed), created_at.
     """
-    video_id = f"vid_{uuid.uuid4().hex[:16]}"
+    video_id = content_video_id(data)
     ext = _pick_extension(filename, mime_type)
     os.makedirs(VIDEO_FOLDER, exist_ok=True)
     local_path = os.path.join(VIDEO_FOLDER, f"{video_id}{ext}")
@@ -103,7 +148,7 @@ def create_youtube_video(url: str, filename: str | None = None) -> dict:
     from ambient.server.store import _now
 
     now = _now()
-    video_id = f"vid_{uuid.uuid4().hex[:16]}"
+    video_id = _youtube_video_id(url)
     return {
         "video_id": video_id,
         "filename": filename or f"{video_id}.mp4",

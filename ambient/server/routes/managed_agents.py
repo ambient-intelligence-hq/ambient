@@ -46,7 +46,7 @@ from ambient.server.errors import bad_request, conflict, not_found
 from ambient.server.runner import SandboxNotReady, SessionRunner, _empty_usage
 from ambient.server.sandbox import SandboxLimits
 from ambient.server.store import _new_id, _now
-from ambient.server.video_store import create_youtube_video, store_video
+from ambient.server.video_store import content_video_id, create_youtube_video, store_video
 import logging
 
 log = logging.getLogger(__name__)
@@ -235,6 +235,13 @@ async def upload_file(request: Request) -> dict:
     data = await upload.read()
     if not data:
         raise bad_request("uploaded file is empty")
+    # Content-addressed video_id: if the same bytes were ingested before, reuse
+    # that row (and its ready/in-flight description) instead of re-writing the
+    # file, re-uploading to R2, resetting status, or re-enqueueing ingestion.
+    existing = await request.app.state.store.get_file(content_video_id(data))
+    if existing is not None:
+        log.info("Reusing existing file %s for duplicate upload", existing["video_id"])
+        return _file_metadata(existing)
     meta = store_video(data, upload.filename, upload.content_type)
     # Kick off background description ingestion only when the video reached R2 —
     # the ephemeral ingest sandbox fetches it from there. Without an R2 copy
@@ -272,6 +279,13 @@ async def import_file(request: Request, body: dict[str, Any] = Body(...)) -> dic
         meta = create_youtube_video(url.strip(), filename=body.get("filename"))
     except ValueError as exc:
         raise bad_request(str(exc))
+
+    # Content-addressed video_id (keyed on the YouTube URL): reuse a prior import
+    # of the same video rather than re-preparing the source and description.
+    existing = await request.app.state.store.get_file(meta["video_id"])
+    if existing is not None:
+        log.info("Reusing existing file %s for duplicate YouTube import", meta["video_id"])
+        return _file_metadata(existing)
 
     metadata = body.get("metadata") or {}
     if metadata and isinstance(metadata, dict):

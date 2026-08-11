@@ -249,6 +249,9 @@
   .tool .tag { font-family: "JetBrains Mono", monospace; font-size: 10.5px; padding: 2px 8px; border-radius: 6px; background: var(--surface-3); color: var(--accent-deep); }
   .tool .tag.err { color: var(--bad); }
   .tool .tag.ok { color: var(--good); }
+  .tool .tag.run { color: var(--warn); }
+  .tool .tool-out { margin-top: 10px; }
+  .tool .tool-out-label { font-size: 11px; font-weight: 700; color: var(--text-faint); margin-bottom: 5px; text-transform: uppercase; letter-spacing: .3px; }
   .tool .chev { margin-left: auto; color: var(--text-faint); transition: .15s; }
   .tool[open] .chev { transform: rotate(90deg); }
   .tool .body { padding: 0 13px 13px; }
@@ -660,21 +663,41 @@ function addBot(html) {
   el.querySelector(".bubble").innerHTML = html;
   chatInner.appendChild(el); scrollDown();
 }
-function addToolUse(name, input) {
+// One card per tool call, keyed by tool_use_id, so its result fills into the
+// SAME card instead of appending a separate result card. This keeps the count
+// honest (N calls = N cards) and pairs each result with its call.
+let toolCards = {};
+function addToolUse(id, name, input) {
   const el = document.createElement("details");
   el.className = "tool"; el.open = false;
-  el.innerHTML = `<summary>🔧 Tool call <span class="tag">${name || "tool"}</span><span class="chev">▸</span></summary>
-    <div class="body"><pre></pre></div>`;
-  el.querySelector("pre").textContent = JSON.stringify(input || {}, null, 2);
+  el.innerHTML = `<summary>🔧 Tool call <span class="tag">${name || "tool"}</span>` +
+    `<span class="tag run" data-status>running…</span><span class="chev">▸</span></summary>
+    <div class="body">
+      <div class="tool-args"><pre></pre></div>
+      <div class="tool-out" data-out hidden></div>
+    </div>`;
+  el.querySelector(".tool-args pre").textContent = JSON.stringify(input || {}, null, 2);
+  if (id) toolCards[id] = el;
   chatInner.appendChild(el); scrollDown();
+  return el;
 }
-function addToolResult(text, isErr) {
-  const el = document.createElement("details");
-  el.className = "tool"; el.open = false;
-  el.innerHTML = `<summary>${isErr ? "⚠️ Tool error" : "📄 Tool result"} <span class="tag ${isErr ? "err" : "ok"}">${isErr ? "error" : "ok"}</span><span class="chev">▸</span></summary>
-    <div class="body"><pre></pre></div>`;
-  el.querySelector("pre").textContent = text || "(no output)";
-  chatInner.appendChild(el); scrollDown();
+function fillToolResult(id, text, isErr) {
+  const el = id && toolCards[id];
+  if (!el) {  // fallback: result with no matching call card (shouldn't happen)
+    const card = addToolUse(null, "tool", {});
+    return fillCard(card, text, isErr);
+  }
+  return fillCard(el, text, isErr);
+}
+function fillCard(el, text, isErr) {
+  const status = el.querySelector("[data-status]");
+  status.textContent = isErr ? "error" : "ok";
+  status.className = "tag " + (isErr ? "err" : "ok");
+  const out = el.querySelector("[data-out]");
+  out.hidden = false;
+  out.innerHTML = `<div class="tool-out-label">${isErr ? "⚠️ Error" : "📄 Result"}</div><pre></pre>`;
+  out.querySelector("pre").textContent = text || "(no output)";
+  scrollDown();
 }
 function addThinkingCard(text) {
   if (!text) return;
@@ -731,6 +754,7 @@ async function sendMessage(text) {
   if (!state.sessionId || state.busy) return;
   text = text.trim(); if (!text) return;
   state.busy = true;
+  toolCards = {};
   $("sendBtn").disabled = true; $("msg").disabled = true;
   addUser(text);
   showThinking("Thinking…");
@@ -750,8 +774,8 @@ async function sendMessage(text) {
           if (think) { hideThinking(); addThinkingCard(think); showThinking("Working…"); }
           break;
         }
-        case "agent.tool_use": hideThinking(); addToolUse(data.name, data.input); showThinking("Running tools…"); break;
-        case "agent.tool_result": addToolResult(eventText(data.content), data.is_error); break;
+        case "agent.tool_use": hideThinking(); addToolUse(data.id, data.name, data.input); showThinking("Running tools…"); break;
+        case "agent.tool_result": fillToolResult(data.tool_use_id, eventText(data.content), data.is_error); break;
         case "agent.message": {
           const ans = eventText(data.content);
           if (ans) { hideThinking(); addBot(md(ans)); answered = true; }
