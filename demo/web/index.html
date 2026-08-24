@@ -58,7 +58,7 @@
 
   .app {
     display: grid;
-    grid-template-columns: 74px minmax(440px, 1fr) clamp(360px, 30vw, 430px);
+    grid-template-columns: 74px minmax(340px, 1fr) 7px var(--chat-w, clamp(360px, 30vw, 430px));
     height: calc(100vh - 32px);
     background: var(--shell);
     border: 1px solid var(--border);
@@ -300,6 +300,51 @@
   .toast { background: var(--surface); border: 1px solid var(--border-strong); border-left: 3px solid var(--bad); border-radius: 11px; padding: 12px 16px; font-size: 13px; box-shadow: var(--shadow); max-width: 340px; animation: rise .2s ease; }
   .toast.ok { border-left-color: var(--good); }
 
+  /* ---------- Session history overlay ---------- */
+  .hist-overlay {
+    position: fixed; inset: 0; z-index: 60; background: rgba(20,24,44,.34);
+    backdrop-filter: blur(3px); display: grid; place-items: center; animation: rise .16s ease;
+  }
+  .hist-panel {
+    width: min(520px, 92vw); max-height: 78vh; display: flex; flex-direction: column;
+    background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r-md);
+    box-shadow: var(--shadow-lg); overflow: hidden;
+  }
+  .hist-head { display: flex; align-items: center; padding: 16px 18px; border-bottom: 1px solid var(--border); }
+  .hist-head h3 { margin: 0; font-size: 15px; font-weight: 700; }
+  .hist-close { margin-left: auto; border: none; background: transparent; cursor: pointer; color: var(--text-faint); font-size: 15px; width: 30px; height: 30px; border-radius: 8px; }
+  .hist-close:hover { background: var(--surface-3); color: var(--text); }
+  .hist-list { overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .hist-empty { text-align: center; color: var(--text-faint); font-size: 13px; padding: 28px 12px; }
+  .hist-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); transition: .14s; }
+  .hist-row:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .hist-row.current { border-color: var(--accent); }
+  .hist-main { flex: 1; min-width: 0; cursor: pointer; }
+  .hist-title { font-size: 13.5px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hist-meta { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+  .hist-src { font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px; background: var(--surface-3); color: var(--text-dim); }
+  .hist-src.youtube { background: rgba(242,87,103,.12); color: #d64457; }
+  .hist-src.upload { background: var(--accent-soft); color: var(--accent-deep); }
+  .hist-time { font-size: 11.5px; color: var(--text-faint); }
+  .hist-del { border: none; background: transparent; cursor: pointer; color: var(--text-faint); width: 26px; height: 26px; border-radius: 7px; flex: none; }
+  .hist-del:hover { background: rgba(242,87,103,.14); color: var(--bad); }
+  .hist-foot { display: flex; align-items: center; gap: 10px; padding: 11px 18px; border-top: 1px solid var(--border); }
+  .hist-clear { border: none; background: transparent; cursor: pointer; color: var(--text-dim); font-family: inherit; font-size: 12.5px; font-weight: 600; padding: 4px 0; }
+  .hist-clear:hover { color: var(--bad); }
+  .hist-note { margin-left: auto; font-size: 11.5px; color: var(--text-faint); }
+
+  /* ---------- Draggable stage/chat splitter ---------- */
+  .splitter {
+    width: 7px; cursor: col-resize; flex: none; position: relative; z-index: 8;
+    background: transparent; transition: background .15s;
+  }
+  .splitter::before {
+    content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px;
+    transform: translateX(-50%); background: var(--border);
+  }
+  .splitter:hover::before, .splitter.dragging::before { background: var(--accent); width: 2px; }
+  body.col-resizing { cursor: col-resize; user-select: none; }
+
   .hidden { display: none !important; }
 </style>
 </head>
@@ -309,7 +354,7 @@
   <aside class="rail">
     <div class="rail-logo"><img src="logo.jpg" alt="Ambient" /></div>
     <nav class="rail-nav">
-      <button class="nav-btn" title="History"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2" stroke-linecap="round"/></svg></button>
+      <button class="nav-btn" id="navHistory" title="Session history"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2" stroke-linecap="round"/></svg></button>
       <button class="nav-btn" title="Library"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M4 9h16M9 4v16" stroke-linecap="round"/></svg></button>
       <button class="nav-btn active" title="Video agent"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7a3 3 0 0 1 3-3h7a3 3 0 0 1 3 3v1.5l3.2-2.1a.8.8 0 0 1 1.3.7v8.4a.8.8 0 0 1-1.3.7L17 15.5V17a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V7Z" fill="currentColor"/></svg></button>
       <button class="nav-btn" title="Analytics"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 19V9M12 19V5M19 19v-6"/></svg></button>
@@ -373,6 +418,9 @@
     </div>
   </section>
 
+  <!-- Draggable splitter between stage and chat -->
+  <div class="splitter" id="splitter" title="Drag to resize"></div>
+
   <!-- Right chat panel -->
   <section class="chatpanel">
     <div class="cp-head">
@@ -435,6 +483,22 @@
     </div>
   </section>
 </div>
+
+<!-- Session history overlay (per-browser) -->
+<div class="hist-overlay hidden" id="histOverlay">
+  <div class="hist-panel">
+    <div class="hist-head">
+      <h3>Recent sessions</h3>
+      <button class="hist-close" id="histClose" title="Close">✕</button>
+    </div>
+    <div class="hist-list" id="histList"></div>
+    <div class="hist-foot">
+      <button class="hist-clear" id="histClear">Clear all</button>
+      <span class="hist-note">Saved in this browser only</span>
+    </div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
 
 <script>
@@ -572,7 +636,7 @@ function setStatus(kind, text) {
 
 // ---- start session ----
 $("startBtn").addEventListener("click", startSession);
-$("newBtn").addEventListener("click", () => location.reload());
+$("newBtn").addEventListener("click", () => { allowUnload = true; location.reload(); });
 
 async function startSession() {
   if (state.busy) return;
@@ -620,6 +684,13 @@ async function startSession() {
 
     state.sessionId = session.id; state.videoId = videoId;
     onSessionReady(session.id, videoId);
+    putSession({
+      id: session.id, videoId,
+      source: useYoutube ? "youtube" : "upload",
+      title: useYoutube ? youtubeUrl : (state.file ? state.file.name : "Upload"),
+      model: $("model").value.trim() || DEFAULTS.model,
+      baseUrl: apiBase(), createdAt: Date.now(),
+    });
     toast("Session ready — ask away!", true);
   } catch (err) {
     toast(err.message || String(err));
@@ -749,6 +820,46 @@ function eventText(content) {
   return (content || []).map(b => b.text || "").join("");
 }
 
+// ---- unified event rendering (shared by live streaming + history replay) ----
+// `replay` is true when rebuilding a past session from GET /events: there we
+// render the user turns from `user.message` events, whereas live we already
+// echoed the user bubble locally (the stream also replays the current run's
+// user.message, so rendering it live would double it).
+let lastRunAnswered = false;
+let lastStopReason = null;
+function renderEvent(data, replay) {
+  switch (data.type) {
+    case "user.message": if (replay) addUser(eventText(data.content)); break;
+    case "session.status_running": setThinking("Analyzing the video…"); break;
+    case "agent.thinking": {
+      // The server attaches the reasoning text as `content` on the otherwise
+      // content-less agent.thinking event.
+      const think = eventText(data.content);
+      if (think) { hideThinking(); addThinkingCard(think); showThinking("Working…"); }
+      break;
+    }
+    case "agent.tool_use": hideThinking(); addToolUse(data.id, data.name, data.input); showThinking("Running tools…"); break;
+    case "agent.tool_result": fillToolResult(data.tool_use_id, eventText(data.content), data.is_error); break;
+    case "agent.message": {
+      const ans = eventText(data.content);
+      if (ans) { hideThinking(); addBot(md(ans)); lastRunAnswered = true; }
+      break;
+    }
+    case "session.error": {
+      hideThinking();
+      const emsg = (data.error && (data.error.message || data.error.type)) || "error";
+      addBot(`<span style="color:var(--bad)">❌ ${emsg}</span>`);
+      break;
+    }
+    case "session.status_idle":
+      lastStopReason = data.stop_reason || null;
+      hideThinking();
+      addUsageCard(data.usage);
+      return true; // stop live streaming (ignored during replay)
+  }
+  return false;
+}
+
 // ---- send + stream ----
 async function sendMessage(text) {
   if (!state.sessionId || state.busy) return;
@@ -760,50 +871,20 @@ async function sendMessage(text) {
   showThinking("Thinking…");
   setStatus("run", "Running");
 
-  let answered = false;
-  let stopReason = null;
+  lastRunAnswered = false;
+  lastStopReason = null;
   try {
     await api("POST", `/v1/sessions/${state.sessionId}/events`, { events: [{ type: "user.message", content: text }] });
-    await streamSession(state.sessionId, (data) => {
-      switch (data.type) {
-        case "session.status_running": setThinking("Analyzing the video…"); break;
-        case "agent.thinking": {
-          // The server attaches the reasoning text as `content` on the otherwise
-          // content-less agent.thinking event.
-          const think = eventText(data.content);
-          if (think) { hideThinking(); addThinkingCard(think); showThinking("Working…"); }
-          break;
-        }
-        case "agent.tool_use": hideThinking(); addToolUse(data.id, data.name, data.input); showThinking("Running tools…"); break;
-        case "agent.tool_result": fillToolResult(data.tool_use_id, eventText(data.content), data.is_error); break;
-        case "agent.message": {
-          const ans = eventText(data.content);
-          if (ans) { hideThinking(); addBot(md(ans)); answered = true; }
-          break;
-        }
-        case "session.error": {
-          hideThinking();
-          const emsg = (data.error && (data.error.message || data.error.type)) || "error";
-          addBot(`<span style="color:var(--bad)">❌ ${emsg}</span>`);
-          break;
-        }
-        case "session.status_idle":
-          stopReason = data.stop_reason || null;
-          hideThinking();
-          addUsageCard(data.usage);
-          return true; // stop
-      }
-      return false;
-    });
+    await streamSession(state.sessionId, (data) => renderEvent(data, false));
   } catch (err) {
     hideThinking();
     addBot(`<span style="color:var(--bad)">❌ ${err.message || err}</span>`);
   } finally {
     hideThinking();
-    if (!answered) {
+    if (!lastRunAnswered) {
       // Be specific about *why* there's no answer (e.g. hit the turn cap).
-      const why = stopReason && stopReason !== "end_turn"
-        ? `The run stopped without a final answer (<code>${stopReason}</code>).`
+      const why = lastStopReason && lastStopReason !== "end_turn"
+        ? `The run stopped without a final answer (<code>${lastStopReason}</code>).`
         : "The run produced no final answer.";
       addBot(`<span style="color:var(--text-faint)">${why}</span>`);
     }
@@ -849,6 +930,181 @@ $("chips").addEventListener("click", (e) => {
   if (!e.target.classList.contains("chip")) return;
   if (!state.sessionId) { toast("Start a session first."); return; }
   sendMessage(e.target.textContent);
+});
+
+// ---- session history (per-browser, localStorage) ----
+// The server has no "list sessions" endpoint, so we track the sessions started
+// from this browser locally. Resuming replays the persisted event log
+// (GET /sessions/{id}/events) through the same renderer, and reattaches the live
+// stream if a run is still in flight.
+const SESSIONS_KEY = "ambient.sessions";
+function getSessions() {
+  try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]"); } catch { return []; }
+}
+function putSession(rec) {
+  const all = getSessions().filter(s => s.id !== rec.id);
+  all.unshift(rec);
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify(all.slice(0, 40)));
+}
+function removeSession(id) {
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify(getSessions().filter(s => s.id !== id)));
+  renderSessionList();
+}
+function relTime(ts) {
+  if (!ts) return "";
+  const d = (Date.now() - ts) / 1000;
+  if (d < 60) return "just now";
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  return `${Math.floor(d / 86400)}d ago`;
+}
+
+function renderSessionList() {
+  const list = $("histList");
+  const items = getSessions();
+  if (!items.length) {
+    list.innerHTML = `<div class="hist-empty">No sessions yet.<br>Start one and it'll show up here.</div>`;
+    return;
+  }
+  list.innerHTML = "";
+  for (const s of items) {
+    const row = document.createElement("div");
+    row.className = "hist-row" + (s.id === state.sessionId ? " current" : "");
+    row.innerHTML =
+      `<div class="hist-main">
+         <div class="hist-title"></div>
+         <div class="hist-meta"><span class="hist-src ${s.source === "youtube" ? "youtube" : "upload"}">${s.source === "youtube" ? "YouTube" : "Upload"}</span><span class="hist-time"></span></div>
+       </div>
+       <button class="hist-del" title="Remove from history">✕</button>`;
+    row.querySelector(".hist-title").textContent = s.title || s.videoId || s.id;
+    row.querySelector(".hist-time").textContent = relTime(s.createdAt);
+    row.querySelector(".hist-main").addEventListener("click", () => resumeSession(s.id));
+    row.querySelector(".hist-del").addEventListener("click", (e) => { e.stopPropagation(); removeSession(s.id); });
+    list.appendChild(row);
+  }
+}
+
+function openHistory() { renderSessionList(); $("histOverlay").classList.remove("hidden"); }
+function closeHistory() { $("histOverlay").classList.add("hidden"); }
+$("navHistory").addEventListener("click", openHistory);
+$("histClose").addEventListener("click", closeHistory);
+$("histOverlay").addEventListener("click", (e) => { if (e.target.id === "histOverlay") closeHistory(); });
+$("histClear").addEventListener("click", () => { localStorage.removeItem(SESSIONS_KEY); renderSessionList(); });
+
+function resetChatPane() {
+  chatInner.innerHTML = "";
+  thinkingEl = null;
+  toolCards = {};
+}
+
+async function resumeSession(id) {
+  if (state.busy) { toast("Finish the current run first."); return; }
+  const rec = getSessions().find(s => s.id === id);
+  if (!rec) return;
+  if (rec.baseUrl && rec.baseUrl !== apiBase()) {
+    toast("Heads up: this session was started against a different server URL.");
+  }
+  closeHistory();
+  state.busy = true;
+  setStatus("boot", "Loading");
+  try {
+    const sess = await api("GET", `/v1/sessions/${id}`);  // throws 404 if the server no longer has it
+    state.sessionId = id;
+    state.videoId = rec.videoId;
+    state.sourceTab = rec.source === "youtube" ? "youtube" : "upload";
+    resetChatPane();
+    onSessionReady(id, rec.videoId);
+
+    // Rebuild the transcript from the durable event log.
+    const evs = await api("GET", `/v1/sessions/${id}/events`);
+    for (const ev of (evs.data || [])) renderEvent(ev, true);
+    hideThinking();
+    scrollDown();
+
+    // If a run is still going, reattach the live stream to keep receiving events.
+    const running = sess.status === "running" || sess.status === "starting";
+    if (running) {
+      setStatus("run", "Running");
+      $("sendBtn").disabled = true; $("msg").disabled = true;
+      lastRunAnswered = false; lastStopReason = null;
+      streamSession(id, (d) => renderEvent(d, false))
+        .catch(() => {})
+        .finally(() => { hideThinking(); setStatus("idle", "Ready"); $("sendBtn").disabled = false; $("msg").disabled = false; });
+    } else {
+      setStatus("idle", "Ready");
+    }
+    toast("Session restored.", true);
+  } catch (err) {
+    const msg = err.message || String(err);
+    if (msg.startsWith("404")) {
+      toast("That session no longer exists on the server — removing it.");
+      removeSession(id);
+    } else {
+      toast(`Could not resume: ${msg}`);
+    }
+    setStatus("dead", "Failed");
+  } finally {
+    state.busy = false;
+  }
+}
+
+// ---- adjustable stage / chat split (draggable splitter) ----
+const CHAT_W_KEY = "ambient.chatWidth";
+const MIN_CHAT_W = 320;
+function applyChatWidth(px) {
+  const maxW = Math.max(MIN_CHAT_W, window.innerWidth - 74 - 340 - 40); // keep the stage usable
+  const w = Math.min(Math.max(px, MIN_CHAT_W), maxW);
+  document.querySelector(".app").style.setProperty("--chat-w", `${w}px`);
+  return w;
+}
+(function initSplitter() {
+  const saved = parseInt(localStorage.getItem(CHAT_W_KEY) || "", 10);
+  if (!Number.isNaN(saved)) applyChatWidth(saved);
+  const splitter = $("splitter");
+  let dragging = false;
+  const onMove = (e) => {
+    if (!dragging) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    // Chat panel hugs the right edge; its width is (window right - cursor).
+    applyChatWidth(window.innerWidth - clientX - 16); // 16 = body padding
+  };
+  const stop = () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove("dragging");
+    document.body.classList.remove("col-resizing");
+    const cur = getComputedStyle(document.querySelector(".app")).getPropertyValue("--chat-w").trim();
+    const px = parseInt(cur, 10);
+    if (!Number.isNaN(px)) localStorage.setItem(CHAT_W_KEY, String(px));
+  };
+  const start = (e) => {
+    dragging = true;
+    splitter.classList.add("dragging");
+    document.body.classList.add("col-resizing");
+    e.preventDefault();
+  };
+  splitter.addEventListener("mousedown", start);
+  splitter.addEventListener("touchstart", start, { passive: false });
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("touchmove", onMove, { passive: false });
+  window.addEventListener("mouseup", stop);
+  window.addEventListener("touchend", stop);
+  // Double-click resets to the default responsive width.
+  splitter.addEventListener("dblclick", () => {
+    document.querySelector(".app").style.removeProperty("--chat-w");
+    localStorage.removeItem(CHAT_W_KEY);
+  });
+  window.addEventListener("resize", () => {
+    const px = parseInt(getComputedStyle(document.querySelector(".app")).getPropertyValue("--chat-w"), 10);
+    if (!Number.isNaN(px)) applyChatWidth(px);
+  });
+})();
+
+// ---- guard against losing an in-flight run on refresh / navigation ----
+let allowUnload = false;
+window.addEventListener("beforeunload", (e) => {
+  if (allowUnload) return;
+  if (state.busy) { e.preventDefault(); e.returnValue = ""; }  // browser shows a generic confirm
 });
 
 loadSettings();
