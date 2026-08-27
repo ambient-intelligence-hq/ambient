@@ -131,6 +131,11 @@
     font-size: 13px; font-weight: 600; color: var(--text-dim); padding: 7px 16px; border-radius: 8px; transition: .15s;
   }
   .tab.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow-sm); }
+  .mtab {
+    border: none; background: transparent; cursor: pointer; font-family: inherit;
+    font-size: 13px; font-weight: 600; color: var(--text-dim); padding: 7px 16px; border-radius: 8px; transition: .15s;
+  }
+  .mtab.active { background: var(--accent); color: #fff; box-shadow: 0 4px 12px -4px rgba(18,184,134,.5); }
   .meta-info { font-size: 12.5px; color: var(--text-faint); display: flex; align-items: center; gap: 8px; }
   .meta-info b { color: var(--text-dim); font-weight: 600; }
   .grow { flex: 1; }
@@ -382,6 +387,10 @@
       </div>
       <div class="meta-info"><b id="metaSource">No source yet</b></div>
       <div class="grow"></div>
+      <div class="seg" id="modeSeg" title="Fast = one dense-frame pass · Agent = multi-step tools">
+        <button class="mtab active" data-mode="agent">Agent</button>
+        <button class="mtab" data-mode="fast">Fast</button>
+      </div>
       <button class="btn" id="startBtn">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
         Start session
@@ -512,7 +521,18 @@ const YOUTUBE_BOOT_TIMEOUT_S = 600;
 const LOGO = '<img src="logo.jpg" alt="">';
 
 const $ = (id) => document.getElementById(id);
-const state = { sessionId: null, videoId: null, sourceTab: "upload", file: null, busy: false };
+const state = { sessionId: null, videoId: null, sourceTab: "upload", file: null, busy: false, mode: "agent" };
+
+// Fast vs Agent track: picks the agent toolset marker the server dispatches on.
+const MODE_TOOLS = {
+  agent: [{ type: "video_agent_20260825" }],
+  fast: [{ type: "video_fast_20260825" }],
+};
+document.querySelectorAll(".mtab").forEach(b => b.addEventListener("click", () => {
+  if (state.sessionId) { toast("Start a new session to change mode."); return; }
+  document.querySelectorAll(".mtab").forEach(t => t.classList.toggle("active", t === b));
+  state.mode = b.dataset.mode;
+}));
 
 // ---- persisted settings ----
 function loadSettings() {
@@ -662,8 +682,8 @@ async function startSession() {
 
     btn.textContent = "Creating session…";
     const agent = await api("POST", "/v1/agents", {
-      name: "Video Analyst", model: $("model").value.trim() || DEFAULTS.model,
-      system: $("system").value.trim() || DEFAULTS.system, tools: [{ type: "agent_toolset_20260401" }],
+      name: `Video Analyst (${state.mode})`, model: $("model").value.trim() || DEFAULTS.model,
+      system: $("system").value.trim() || DEFAULTS.system, tools: MODE_TOOLS[state.mode],
     });
     const env = await api("POST", "/v1/environments", { name: "ambient-web" });
     const session = await api("POST", "/v1/sessions", {
@@ -685,7 +705,7 @@ async function startSession() {
     state.sessionId = session.id; state.videoId = videoId;
     onSessionReady(session.id, videoId);
     putSession({
-      id: session.id, videoId,
+      id: session.id, videoId, mode: state.mode,
       source: useYoutube ? "youtube" : "upload",
       title: useYoutube ? youtubeUrl : (state.file ? state.file.name : "Upload"),
       model: $("model").value.trim() || DEFAULTS.model,
@@ -703,7 +723,7 @@ async function startSession() {
 
 function onSessionReady(sessionId, videoId) {
   setStatus("idle", "Ready");
-  $("sessTitle").innerHTML = `Session active<span class="tag-pill">${state.sourceTab === "youtube" ? "YouTube" : "Upload"}</span>`;
+  $("sessTitle").innerHTML = `Session active<span class="tag-pill">${state.mode === "fast" ? "⚡ Fast" : "Agent"}</span><span class="tag-pill">${state.sourceTab === "youtube" ? "YouTube" : "Upload"}</span>`;
   $("sessSub").textContent = `${sessionId} · video ${videoId}`;
   $("startBtn").classList.add("hidden");
   $("newBtn").classList.remove("hidden");
@@ -733,6 +753,58 @@ function addBot(html) {
   el.innerHTML = `<div class="avatar bot">${LOGO}</div><div class="col"><div class="who">Ambient</div><div class="bubble"></div></div>`;
   el.querySelector(".bubble").innerHTML = html;
   chatInner.appendChild(el); scrollDown();
+}
+// Live token-by-token answer streaming (agent.message.delta), finalized to
+// rendered markdown once the full agent.message arrives.
+let streamEl = null, streamText = "";
+function appendStream(delta) {
+  if (!streamEl) {
+    clearEmpty();
+    const el = document.createElement("div");
+    el.className = "msg bot";
+    el.innerHTML = `<div class="avatar bot">${LOGO}</div><div class="col"><div class="who">Ambient</div><div class="bubble"></div></div>`;
+    chatInner.appendChild(el);
+    streamEl = el.querySelector(".bubble");
+    streamText = "";
+  }
+  streamText += delta;
+  streamEl.textContent = streamText;   // plain text while streaming (partial markdown)
+  scrollDown();
+}
+function finalizeStream(html) {
+  if (!streamEl) return false;
+  streamEl.innerHTML = (html != null) ? html : md(streamText);
+  streamEl = null; streamText = "";
+  scrollDown();
+  return true;
+}
+// Live streaming of the reasoning trace (agent.reasoning.delta) into a collapsible
+// card that auto-collapses once the answer starts.
+let reasonEl = null, reasonText = "", reasonStreamed = false;
+function appendReasoningStream(delta) {
+  if (!reasonEl) {
+    clearEmpty(); hideThinking();
+    const el = document.createElement("details");
+    el.className = "tool"; el.open = true;
+    el.innerHTML = `<summary>💭 Thinking <span class="tag run" data-rstatus>streaming…</span><span class="chev">▸</span></summary><div class="body reasoning"></div>`;
+    chatInner.appendChild(el);
+    reasonEl = el.querySelector(".body");
+    reasonText = ""; reasonStreamed = true;
+  }
+  reasonText += delta;
+  reasonEl.textContent = reasonText;   // plain while streaming
+  scrollDown();
+}
+function finalizeReasoning() {
+  if (!reasonEl) return;
+  const card = reasonEl.closest("details");
+  reasonEl.innerHTML = md(reasonText);
+  if (card) {
+    card.open = false;
+    const s = card.querySelector("[data-rstatus]");
+    if (s) { s.textContent = "reasoning"; s.className = "tag ok"; }
+  }
+  reasonEl = null; reasonText = "";
 }
 // One card per tool call, keyed by tool_use_id, so its result fills into the
 // SAME card instead of appending a separate result card. This keeps the count
@@ -832,17 +904,22 @@ function renderEvent(data, replay) {
     case "user.message": if (replay) addUser(eventText(data.content)); break;
     case "session.status_running": setThinking("Analyzing the video…"); break;
     case "agent.thinking": {
-      // The server attaches the reasoning text as `content` on the otherwise
-      // content-less agent.thinking event.
+      // Final full reasoning. If we already streamed it live, just finalize the
+      // streamed card instead of adding a duplicate.
+      if (reasonStreamed) { finalizeReasoning(); break; }
       const think = eventText(data.content);
       if (think) { hideThinking(); addThinkingCard(think); showThinking("Working…"); }
       break;
     }
-    case "agent.tool_use": hideThinking(); addToolUse(data.id, data.name, data.input); showThinking("Running tools…"); break;
+    case "agent.reasoning.delta": { if (data.reasoning) appendReasoningStream(data.reasoning); break; }
+    case "agent.message.delta": { const d = eventText(data.content); if (d) { finalizeReasoning(); hideThinking(); appendStream(d); } break; }
+    case "agent.tool_use": finalizeReasoning(); finalizeStream(); hideThinking(); addToolUse(data.id, data.name, data.input); showThinking("Running tools…"); break;
     case "agent.tool_result": fillToolResult(data.tool_use_id, eventText(data.content), data.is_error); break;
     case "agent.message": {
+      finalizeReasoning();
       const ans = eventText(data.content);
-      if (ans) { hideThinking(); addBot(md(ans)); lastRunAnswered = true; }
+      if (ans) { hideThinking(); if (!finalizeStream(md(ans))) addBot(md(ans)); lastRunAnswered = true; }
+      else if (streamEl) { finalizeStream(); lastRunAnswered = true; }
       break;
     }
     case "session.error": {
@@ -854,6 +931,8 @@ function renderEvent(data, replay) {
     case "session.status_idle":
       lastStopReason = data.stop_reason || null;
       hideThinking();
+      finalizeReasoning();
+      finalizeStream();
       addUsageCard(data.usage);
       return true; // stop live streaming (ignored during replay)
   }
@@ -866,6 +945,8 @@ async function sendMessage(text) {
   text = text.trim(); if (!text) return;
   state.busy = true;
   toolCards = {};
+  streamEl = null; streamText = "";
+  reasonEl = null; reasonText = ""; reasonStreamed = false;
   $("sendBtn").disabled = true; $("msg").disabled = true;
   addUser(text);
   showThinking("Thinking…");
@@ -995,6 +1076,8 @@ function resetChatPane() {
   chatInner.innerHTML = "";
   thinkingEl = null;
   toolCards = {};
+  streamEl = null; streamText = "";
+  reasonEl = null; reasonText = ""; reasonStreamed = false;
 }
 
 async function resumeSession(id) {
@@ -1011,6 +1094,7 @@ async function resumeSession(id) {
     const sess = await api("GET", `/v1/sessions/${id}`);  // throws 404 if the server no longer has it
     state.sessionId = id;
     state.videoId = rec.videoId;
+    state.mode = rec.mode || "agent";
     state.sourceTab = rec.source === "youtube" ? "youtube" : "upload";
     resetChatPane();
     onSessionReady(id, rec.videoId);

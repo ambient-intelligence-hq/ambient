@@ -54,7 +54,7 @@ question actually requires."""
     tool_prompt = f"{tool_prompt}\n{escalation_ladder}"
 
     return (f"""
-You are a helpful video research assistant that can answer questions about a long video. 
+You are a helpful video research assistant that can perform tasks and answer questions about a long video. 
 You have access to tools to search the video and get the highlevel description of the video.
 
 ## What you are given
@@ -102,6 +102,28 @@ a tool before you commit to it.
   provided schema (correct fields and types, nothing extra). Put the supporting
   timestamps in the schema's citation field(s). Do not add prose outside the
   JSON.""")
+
+def get_fast_system_prompt() -> str:
+    """System prompt for FAST mode: a single vision pass over uniformly-sampled,
+    timestamp-labeled frames — no tools, no agent loop."""
+    return (
+        "You are a video analysis assistant. You are given a set of frames sampled "
+        "uniformly across the WHOLE video, in time order, each labeled with its "
+        "absolute timestamp. These frames are your only evidence — reason directly "
+        "over them.\n\n"
+        "## How to work\n"
+        "- The frames are sparse samples, so motion and exact instants between "
+        "frames are approximate. State what the frames actually show; if they are "
+        "insufficient to decide something, say so rather than guessing.\n"
+        "- Read on-screen text and track changes across frames to follow the "
+        "sequence of events.\n\n"
+        "## Answering\n"
+        "- Support every factual claim with the timestamp(s) of the frame(s) that "
+        "show it.\n"
+        "- If you are given a response JSON schema, your final answer must conform "
+        "to it; put the supporting timestamps in the schema's citation field(s)."
+    )
+
 
 SYSTEM_PROMPT_PARALLEL = """
 You are a helpful video research assistant that can answer questions about a long video. You have access to tools to search the video and get the highlevel description of the video.

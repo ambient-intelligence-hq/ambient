@@ -154,10 +154,19 @@ class SessionRunner:
         store: Store,
         broker: Broker,
         messages: Optional[list[dict]] = None,
+        mode: str = "agent",
+        system: Optional[str] = None,
     ):
         self.session_id = session_id
         self.video_id = video_id
         self.video_description = None
+        # "agent" -> multi-step tool loop; "fast" -> single dense-frame vision call.
+        self.mode = mode
+        # Optional per-agent task prompt appended to the mode's base system prompt.
+        self.agent_system = system
+        # Response schema for the current run (set by submit_user_message).
+        self.output_structure: Optional[dict] = None
+        self._fast_frames_loaded = False
         self.model = model
         self.max_turns_per_run = max_turns_per_run
         self.backend = backend
@@ -197,10 +206,17 @@ class SessionRunner:
 
 
 
-    def _get_seed_messages(self, model_modalities: list[str]) -> None:
-        return [
-            {"role": "system", "content": get_system_prompt(model_modalities)}
-        ]
+    def _get_seed_messages(self, model_modalities: list[str]) -> list[dict]:
+        if self.mode == "fast":
+            from ambient.prompt import get_fast_system_prompt
+            system = get_fast_system_prompt()
+        else:
+            system = get_system_prompt(model_modalities)
+        # A per-agent system prompt (agents.create system=...) is appended as the
+        # task, keeping the mode's base (tools / frame instructions + answering).
+        if self.agent_system:
+            system = f"{system}\n\n## Task\n{self.agent_system}"
+        return [{"role": "system", "content": system}]
         
 
     async def start_sandbox(self) -> None:
@@ -333,6 +349,21 @@ class SessionRunner:
         output_structure: Optional[dict] = None,
     ) -> None:
         """Start a new run from a user message. Caller has already verified no run is in flight."""
+        self.output_structure = output_structure
+        self._cancel_requested = False
+        model = model_override or self.model
+
+        # FAST mode: one vision pass over a densely-sampled, timestamp-labeled frame
+        # set (loaded once, reused across follow-ups). No tools, no schema injected
+        # into the text — response_format enforces the schema natively.
+        if self.mode == "fast":
+            # Frame sampling happens inside the run (streamed) so the /events POST
+            # returns immediately instead of blocking on extraction.
+            self.messages.append({"role": "user", "content": [{"type": "text", "text": content}]})
+            await self.store.save_messages(self.session_id, self.messages)
+            self._run_task = asyncio.create_task(self._run_fast(model), name=f"fast-{self.session_id}")
+            return
+
         text = content
         if output_structure:
             # Mirror ambient.agent.run_agent: steer the final answer to the schema.
@@ -348,8 +379,6 @@ class SessionRunner:
         # Persist the user turn up front so a rehydrating worker sees it even if
         # this run is interrupted before producing an assistant turn.
         await self.store.save_messages(self.session_id, self.messages)
-        model = model_override or self.model
-        self._cancel_requested = False
         self._run_task = asyncio.create_task(self._run_until_done(model), name=f"run-{self.session_id}")
 
     def is_running(self) -> bool:
@@ -491,6 +520,125 @@ class SessionRunner:
             await self._persist_usage()
             await self._set_status("ready")
             # Release the run-ownership lease so any worker can serve the next turn.
+            await self.broker.release(self.session_id)
+
+    # --- fast mode --------------------------------------------------------
+
+    async def _ensure_fast_frames(self) -> None:
+        """Load the video into the conversation once, as a stable, cacheable prefix
+        (right after the system prompt). Either a single `video_url` (self-hosted
+        vLLM samples internally — no e2b) or uniformly-sampled frames (OpenRouter).
+        Reused across follow-up turns."""
+        if self._fast_frames_loaded:
+            return
+        from ambient import fast_mode as fm
+
+        # Media tools / the video URL read the source from S3 for youtube imports.
+        await self._await_source_ready()
+
+        # Fast mode calls the LLM (vision) endpoint, so classify the service from
+        # that one — not the agent-orchestrator endpoint.
+        service = fm.service_from_base_url(settings.llm_base_url or "")
+        duration = 0.0
+        try:
+            rec = await self.store.get_file(self.video_id)
+            if rec:
+                duration = float((rec.get("youtube") or {}).get("duration") or 0) or 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+        strategy = fm.pick_fast_strategy(service, self.model, duration)
+
+        # Direct-video path: send the source URL and let the server sample frames.
+        # No sandbox, no frame upload (~3-4x faster than the e2b frame pipeline).
+        if strategy.method == "video":
+            url = await fm.source_video_url(self.video_id, self.store)
+            if url:
+                self.messages.insert(1, fm.build_fast_video_message(url))
+                self._fast_frames_loaded = True
+                log.info(f"[fast] session {self.session_id}: using direct video_url")
+                return
+            # No S3 URL available -> fall back to frame sampling.
+            strategy = fm.FastStrategy("frames", max_frames=fm.FRAMES_MAX)
+
+        if strategy.method == "clips":
+            # TODO: the video_url clips path isn't wired for fast mode yet; fall
+            # back to dense frames (capped) so long videos still work.
+            strategy = fm.FastStrategy("frames", max_frames=fm.FRAMES_MAX, max_dim=strategy.max_dim)
+
+        frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, strategy)
+        self.messages.insert(1, fm.build_fast_frames_message(frames))
+        self._fast_frames_loaded = True
+        log.info(f"[fast] session {self.session_id}: sampled {len(frames)} frames")
+
+    async def _run_fast(self, model: str) -> None:
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        await self._set_status("running")
+        await self._emit("run.started", {"run_id": run_id, "model": model})
+        await self._seed_usage_once()
+        self.usage["runs"] = int(self.usage.get("runs", 0)) + 1
+
+        final_answer = ""
+        stop_reason = "end_turn"
+        try:
+            # Sample + insert the frame set on the first run (streamed, so the UI
+            # shows activity); reused across follow-up turns.
+            if not self._fast_frames_loaded:
+                await self._emit("tool.progress", {"run_id": run_id, "turn": 1,
+                                                   "progress": {"message": "sampling frames"}})
+                await self._ensure_fast_frames()
+
+            response_format = None
+            if self.output_structure:
+                from ambient.fast_mode import build_response_format
+                response_format = build_response_format("answer", self.output_structure)
+
+            await self.broker.renew(self.session_id)
+            prepared = _normalize_for_openai(self.messages)
+            # Disable thinking so the model emits the answer directly rather than
+            # burning the budget on a reasoning trace (covers OpenRouter via
+            # reasoning_enabled=False and vLLM via chat_template_kwargs).
+            reasoning_enabled = not settings.fast_disable_thinking
+            extra_body = ({"chat_template_kwargs": {"enable_thinking": False}}
+                          if settings.fast_disable_thinking else None)
+            chunks: list[dict] = []
+            try:
+                async for chunk in stream_chat_completion(
+                    model=model, messages=prepared, tools=[], response_format=response_format,
+                    reasoning_enabled=reasoning_enabled, max_tokens=settings.fast_max_tokens,
+                    extra_body=extra_body,
+                    # Fast mode is a direct vision call -> use the LLM (vision)
+                    # endpoint, not the agent-orchestrator endpoint.
+                    base_url=settings.llm_base_url, api_key=settings.llm_api_key,
+                ):
+                    chunks.append(chunk)
+                    await self._emit("chat.completion.chunk", chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await self._emit("error", {"code": "llm_error", "message": str(exc), "fatal": False})
+                stop_reason = "error"
+                chunks = []
+
+            if chunks:
+                assistant_msg, _finish, _tools, reasoning, agent_usage = assemble_assistant_message(chunks)
+                self.messages.append(assistant_msg)
+                self.usage["turns"] = int(self.usage.get("turns", 0)) + 1
+                await self._record_usage(run_id, 1, model, agent_usage, "agent")
+                if settings.expose_thinking and reasoning:
+                    await self._emit("agent.reasoning", {"run_id": run_id, "turn": 1, "reasoning": reasoning})
+                final_answer = self._extract_answer_text(assistant_msg)
+
+            await self._emit("run.completed", {
+                "run_id": run_id, "stop_reason": stop_reason,
+                "answer": final_answer, "usage": self.usage,
+            })
+        except asyncio.CancelledError:
+            await self._emit("run.completed", {"run_id": run_id, "stop_reason": "cancelled", "answer": ""})
+        finally:
+            await self.store.save_messages(self.session_id, self.messages)
+            await self._persist_usage()
+            await self._set_status("ready")
             await self.broker.release(self.session_id)
 
     async def _run_tool_calls(self, run_id: str, turn: int, tool_uses: list[dict]) -> None:

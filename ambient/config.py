@@ -96,6 +96,14 @@ class Settings(BaseSettings):
     analysis_fps: int = 2
     analysis_max_dim: int = 768
     analysis_max_size_mb: int = 8
+
+    # Fast mode (single dense-frame vision pass, no tools). Thinking is left ON by
+    # default (better quality on reasoning models) with a large token budget so the
+    # reasoning trace + the final answer aren't truncated. Set
+    # `fast_disable_thinking=True` to instead force a direct answer (also sends
+    # vLLM's `chat_template_kwargs={"enable_thinking": false}`).
+    fast_max_tokens: int = 64000
+    fast_disable_thinking: bool = False
     
 
     # Video-description generation (the high-level overview computed at ingestion).

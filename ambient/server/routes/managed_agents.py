@@ -57,6 +57,7 @@ router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
 # these when the client omits `agent` / `environment_id`, so callers can skip the
 # agents.create / environments.create steps entirely.
 DEFAULT_AGENT_ID = "ambient_v1"
+DEFAULT_FAST_AGENT_ID = "ambient_fast"
 DEFAULT_ENV_ID = "default"
 
 
@@ -72,10 +73,27 @@ async def seed_defaults(store) -> None:
             "id": DEFAULT_AGENT_ID,
             "version": 1,
             "name": settings.default_agent_name,
-            "description": "Default video-analysis agent (auto-seeded).",
+            "description": "Default video-analysis agent — agent mode (tool loop).",
             "model": settings.agent_model,
             "system": settings.default_agent_system,
-            "tools": [{"type": "agent_toolset_20260401"}],
+            "tools": [{"type": "video_agent_20260825"}],
+            "skills": [],
+            "mcp_servers": [],
+            "metadata": {},
+            "created_at": now,
+            "updated_at": now,
+        })
+    if await store.get_agent(DEFAULT_FAST_AGENT_ID) is None:
+        now = _now()
+        await store.put_agent({
+            "id": DEFAULT_FAST_AGENT_ID,
+            "version": 1,
+            "name": "Video Analyst (Fast)",
+            "description": "Fast mode — single dense-frame vision pass, no tools.",
+            # Fast mode is a single call on the vision model directly.
+            "model": settings.llm_model,
+            "system": settings.default_agent_system,
+            "tools": [{"type": "video_fast_20260825"}],
             "skills": [],
             "mcp_servers": [],
             "metadata": {},
@@ -391,6 +409,23 @@ def _session_status(ambient_status: Optional[str]) -> str:
     }.get(ambient_status or "", "idle")
 
 
+def _mode_from_agent(agent_rec: dict, metadata: dict) -> str:
+    """Select the track: 'agent' (tool loop) vs 'fast' (single dense-frame call).
+
+    An explicit metadata.mode wins; otherwise it's read from the agent's declared
+    tools — a `video_agent_*` (or legacy `agent_toolset_*`) marker means agent
+    mode, and anything else (a `video_fast_*` marker or no tools) means fast mode.
+    """
+    m = (metadata or {}).get("mode")
+    if m in ("fast", "agent"):
+        return m
+    for t in agent_rec.get("tools") or []:
+        typ = (t or {}).get("type", "") if isinstance(t, dict) else ""
+        if typ.startswith("video_agent") or typ.startswith("agent_toolset"):
+            return "agent"
+    return "fast"
+
+
 async def build_session_record(body: dict, store) -> dict:
     agent_rec = await _resolve_agent_ref(body.get("agent") or DEFAULT_AGENT_ID, store)
     if agent_rec is None:
@@ -420,11 +455,14 @@ async def build_session_record(body: dict, store) -> dict:
         "wall_seconds": settings.sandbox_wall_seconds,
     }
     ma_agent = {"type": "agent", "id": agent_rec["id"], "version": agent_rec["version"]}
+    mode = _mode_from_agent(agent_rec, meta)
     return {
         "session_id": session_id,
         "status": "created",
         "video_id": video_id,
         "model": model,
+        "mode": mode,
+        "agent_system": agent_rec.get("system"),
         "title": body.get("title"),
         "metadata": body.get("metadata") or {},
         "permission_policy": {"type": "always_allow", "tools": None},
@@ -459,6 +497,8 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
         limits=SandboxLimits(**record["sandbox"]["limits"]),
         store=store,
         broker=broker,
+        mode=record.get("mode", "agent"),
+        system=record.get("agent_system"),
     )
     request.app.state.runners[record["session_id"]] = runner
 
@@ -537,6 +577,8 @@ async def _get_or_rehydrate_runner(session_id: str, request: Request) -> Optiona
         store=store,
         broker=request.app.state.broker,
         messages=messages or None,
+        mode=record.get("mode", "agent"),
+        system=record.get("agent_system"),
     )
     await runner.attach_sandbox(sandbox)
     request.app.state.runners[session_id] = runner
@@ -714,6 +756,28 @@ def _to_managed_events(ev: dict) -> list[dict]:
             "content": [{"type": "text", "text": str(p.get("content") or "")}],
             "processed_at": ts,
         }]
+
+    if etype == "chat.completion.chunk":
+        # Forward incremental reasoning + answer text so clients can render
+        # token-by-token. (The official SDK ignores unknown event names; the demo
+        # UI renders them.)
+        content_delta = ""
+        reasoning_delta = ""
+        for ch in (p.get("choices") or []):
+            d = ch.get("delta") or {}
+            if isinstance(d.get("content"), str):
+                content_delta += d["content"]
+            r = d.get("reasoning") or d.get("reasoning_content")
+            if isinstance(r, str):
+                reasoning_delta += r
+        out: list[dict] = []
+        if reasoning_delta:
+            out.append({"type": "agent.reasoning.delta", "id": _new_id("evt"),
+                        "reasoning": reasoning_delta, "processed_at": ts})
+        if content_delta:
+            out.append({"type": "agent.message.delta", "id": _new_id("evt"),
+                        "content": [{"type": "text", "text": content_delta}], "processed_at": ts})
+        return out
 
     return []
 

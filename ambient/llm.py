@@ -195,10 +195,18 @@ async def llm_call(
     video_frames: Optional[List[Frame]] = None,
     reasoning_enabled: bool = True,
     max_tokens: Optional[int] = None,
+    response_format: Optional[dict] = None,
 ) -> BaseModel:
     payload = construct_payload(video_clips,video_frames)
-    
+
     provider_params = get_provider_params(model, base_url)
+    # Native structured outputs: when a response_format (json_schema) is set, also
+    # tell OpenRouter to only route to providers that actually honor it, so we
+    # don't silently land on one that ignores the schema.
+    if response_format:
+        prov = dict(provider_params.get("provider") or {})
+        prov["require_parameters"] = True
+        provider_params = {**provider_params, "provider": prov}
     # print(payload)
     logger.info(f"Making LLM call to model {model} with {len(payload)} items")
     async with aiohttp.ClientSession(
@@ -231,6 +239,7 @@ async def llm_call(
                 # token counts + actual cost (picked up by the usage sink).
                 "usage": {"include": True},
                 **({"max_tokens": max_tokens} if max_tokens else {}),
+                **({"response_format": response_format} if response_format else {}),
                 **provider_params,
             },
         ) as response:
