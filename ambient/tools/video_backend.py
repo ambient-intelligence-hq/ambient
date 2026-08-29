@@ -25,6 +25,13 @@ current_media_box: ContextVar[Optional[object]] = ContextVar("current_media_box"
 
 def make_video_tools(video_id: str, max_frame_dimention: Optional[int] = None):
     """Return the VideoFrameTools implementation for the configured backend."""
+    # Opt-in: produce clips by host-transcoding the window from S3 (no e2b/tiling).
+    # Overrides the sandbox backend for clip production only.
+    if settings.clip_backend == "rangeproxy":
+        from ambient.tools.rangeproxy_video_tools import RangeProxyVideoFrameTools
+
+        return RangeProxyVideoFrameTools(video_id, max_frame_dimention)
+
     box = current_media_box.get()
     if box is not None:
         from ambient.tools.sandbox_video_tools import SandboxVideoFrameTools
