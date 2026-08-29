@@ -23,8 +23,9 @@ picture of what happens there. Window ≤ 5 minutes.
     before predicting bounding boxes. The span must be ≤ 5 seconds. Do not use it
     to browse the video.
 
-- draw_bounding_box(timestamp, box, label): Draw a box [y_min, x_min, y_max,
-x_max] on a frame to visually check a spatial prediction before you rely on it.
+- draw_bounding_box(timestamp, bounding_boxes): Draw one or more boxes on a
+frame, each given as {box: [y_min, x_min, y_max, x_max], label}, to visually
+check spatial predictions before you rely on them.
 
 - draw_point(timestamp, point, label): Draw a point on a frame to visually 
 check a point coordinate prediction before you rely on it.

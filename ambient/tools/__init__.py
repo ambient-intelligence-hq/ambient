@@ -57,7 +57,7 @@ IMAGE_MODALITY_ONLY_TOOLS = [
         "type": "function",
         "function": {
             "name": "draw_bounding_box",
-            "description": "Draw the bounding box on the frame at the given timestamp. The bounding box coordinates should be in the format [y_min, x_min,y_max, x_max]. The label should be a description of the bounding box. Use this tool to verify your bounding box predictions",
+            "description": "Draw one or more bounding boxes on the frame at the given timestamp. Pass a list of boxes, each with its own coordinates in the format [y_min, x_min, y_max, x_max] on a 0-1000 normalizedgrid and a label describing it. Use this tool to verify your bounding box predictions. You should call the grab_frames tool before this to inspect the exact frame and its dimention, before drawing the bounding box.",
             "parameters": DrawBoundingBoxTool.model_json_schema(),
         },
     },

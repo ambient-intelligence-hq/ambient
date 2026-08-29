@@ -11,15 +11,21 @@ s3_client = get_s3_client()
 ENABLE_RETURN_CITATION_IMAGES = False
 
 
+class BoundingBox(BaseModel):
+    box: List[float] = Field(
+        description="The bounding box coordinates in the format [y_min, x_min, y_max, x_max]."
+    )
+    label: str = Field(description="The label of this bounding box.")
+
+
 class DrawBoundingBoxTool(BaseModel):
     video_id: str = Field(description="The id of the video to search the clip from.")
     frame_timestamp: float = Field(
-        description="The global timestamp of the frame to draw the bounding box on in seconds."
+        description="The global timestamp of the frame to draw the bounding box(es) on in seconds."
     )
-    bounding_box: List[float] = Field(
-        description="The bounding box coordinates to draw on the frame. The bounding box coordinates should be in the format [y_min, x_min,y_max, x_max]."
+    bounding_boxes: List[BoundingBox] = Field(
+        description="One or more bounding boxes to draw on the frame, each with its own coordinates and label."
     )
-    label: str = Field(description="The label of the bounding box.")
 
 
 @tenacity.retry(
@@ -30,8 +36,7 @@ class DrawBoundingBoxTool(BaseModel):
 async def draw_bounding_box(
     video_id: str,
     frame_timestamp: float,
-    bounding_box: List[float],
-    label: str,
+    bounding_boxes: List[Dict],
 ) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
     video_tools = make_video_tools(
@@ -40,18 +45,31 @@ async def draw_bounding_box(
     user_message_contents = []
     annotated = None
 
+    # Normalize each box: tool args arrive as dicts (from func(**tool_input)),
+    # but tolerate BoundingBox instances too.
+    boxes = [
+        b.model_dump() if isinstance(b, BoundingBox) else dict(b)
+        for b in bounding_boxes
+    ]
+    annotations = [
+        {"bounding_box": b.get("box"), "label": b.get("label")} for b in boxes
+    ]
+
     try:
         annotated = video_tools.annotate_frame(
             timestamp=frame_timestamp,
-            annotations=[{"bounding_box": bounding_box, "label": label}],
+            annotations=annotations,
         )
     except Exception as e:  # noqa: BLE001 - annotation is non-essential
         print(f"[draw_bounding_box] annotate_frame failed at {frame_timestamp}s: {e}")
 
+    boxes_desc = "; ".join(
+        f"{a['label']}: {a['bounding_box']}" for a in annotations
+    )
     RESULT_PROMPT = (
-        f"The bounding box has been drawn on the frame at {frame_timestamp} seconds with the label {label}."
-        f"The bounding box coordinates are {bounding_box}."
-        "Carefully inspect the frame and verify if your bounding box prediction is correct. If not, retry again with the correct bounding box."
+        f"{len(annotations)} bounding box(es) have been drawn on the frame at {frame_timestamp} seconds."
+        f" The bounding boxes are — {boxes_desc}."
+        " Carefully inspect the frame and verify if your bounding box predictions are correct. If not, retry again with the correct bounding boxes."
     )
 
     if annotated and annotated.get("annotated_url"):
@@ -69,11 +87,13 @@ if __name__ == "__main__":
 
     dotenv.load_dotenv()
     frame_timestamp = 240
-    bounding_box = [0.1, 0.1, 0.2, 0.2]
-    label = "Police Car"
+    bounding_boxes = [
+        {"box": [0.1, 0.1, 0.2, 0.2], "label": "Police Car"},
+        {"box": [0.3, 0.3, 0.5, 0.5], "label": "Pedestrian"},
+    ]
     result, user_message_contents = asyncio.run(
         draw_bounding_box(
-            "Seattle_bad_driver_accident", frame_timestamp, bounding_box, label
+            "Seattle_bad_driver_accident", frame_timestamp, bounding_boxes
         )
     )
     print(result)
