@@ -4,7 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from dataclasses import dataclass
 import os
 import json
+import re
+import logging
 from enum import Enum
+
+log = logging.getLogger(__name__)
 class Settings(BaseSettings):
     """
     Settings for the application. Environment variables are loaded from the .env file and overrides the default values.
@@ -79,6 +83,12 @@ class Settings(BaseSettings):
     #   "inprocess" -> ffmpeg/decord run locally in ambient/tools/video_tools.py
     #   "e2b"       -> media ops run in an E2B sandbox (LLM calls always stay on the host)
     sandbox_backend: str = "inprocess"
+    # Clip production for search_clip/focus_clip. "rangeproxy" transcodes the
+    # requested window [start,end] from the S3 source on the host and inlines it
+    # as base64 (no e2b, no tiling, no S3 clip storage). None -> the sandbox_backend
+    # path (e2b tiles / inprocess). Clips only — grab_frames/overview still need e2b.
+    clip_backend: Optional[str] = None
+    self_video_analysis_tool: bool = False
     # When True, clip tools skip the S3 upload and leave clip_url unset so the LLM
     # payload embeds the local clip as a base64 data URL instead. Lets the core
     # agent run with no S3/R2 bucket (see notebooks/test_sdk.ipynb).
@@ -197,30 +207,87 @@ def get_provider_quality_settings(model: str) -> provider_quality_settings:
             max_size_mb=settings.analysis_max_size_mb,
         )
 
-# TODO: if no match with existing models file, fetch from https://openrouter.ai/api/v1/models
-@lru_cache(maxsize=1)
-def get_model_modalities(model: str) -> list[str]:
-    """ 
-    Get the input modalities for a given model.
-    """
+# Quant/format suffixes that repackagers (unsloth, TheBloke, ...) append to a
+# model name but that never appear in the catalog id. Stripped so a served quant
+# resolves to its base model. GGUF `q*` is matched only in its shaped form so a
+# tier like "-q3" isn't mistaken for a quant.
+_QUANT_RE = re.compile(
+    r"^(nvfp\d+|fp\d+|bf16|int\d+|w\d+a\d+|q\d+(?:_[a-z0-9]+)*|\d+bit|awq|gptq|gguf|ggml|exl\d*|mlx|bnb|onnx)$",
+    re.IGNORECASE,
+)
+# Model tiers/variants that must NEVER be stripped — defense against a future
+# over-broad quant pattern, so e.g. gpt-5.6-luna stays != gpt-5.6-luna-pro.
+_KEEP_TOKENS = {
+    "pro", "mini", "nano", "micro", "turbo", "flash", "lite", "max", "plus", "air",
+    "preview", "thinking", "instruct", "chat", "base", "vl", "vision", "coder", "reasoner",
+}
 
-    def match_model(model:str, model_id:str) -> bool:
-        if model == model_id:
-            return True
-        # check if model_id ends with model
-        if model_id.endswith(model):
-            return True
+
+def _core_model_key(model: str) -> str:
+    """Normalize a model id to a comparable core: drop the org prefix and any
+    OpenRouter `:variant`, lowercase, and strip trailing quant/format tokens."""
+    m = (model or "").strip().lower().split("/")[-1].split(":")[0]
+    parts = m.split("-")
+    while len(parts) > 1 and _QUANT_RE.match(parts[-1]) and parts[-1] not in _KEEP_TOKENS:
+        parts.pop()
+    return "-".join(parts)
+
+
+def match_model(model: str, model_id: str) -> bool:
+    """True if `model` (e.g. a served quant like unsloth/Qwen3.8-27B-NVFP4) refers
+    to the same model as the catalog `model_id` (e.g. qwen/qwen3.8-27b). Matches on
+    the normalized core, so it bridges org prefix, case, and quant suffix."""
+    if not model or not model_id:
         return False
+    if model == model_id:
+        return True
+    return _core_model_key(model) == _core_model_key(model_id)
 
+
+def _find_input_modalities(entries: list, model: str) -> Optional[list]:
+    """First entry whose id matches `model`, returning its input_modalities (or None)."""
+    for entry in entries or []:
+        if match_model(model, (entry or {}).get("id")):
+            mods = (entry.get("architecture") or {}).get("input_modalities", [])
+            if isinstance(mods, list):
+                return mods
+    return None
+
+
+@lru_cache(maxsize=1)
+def _openrouter_catalog() -> list:
+    """Live OpenRouter model catalog, fetched once (best-effort). [] on failure."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models", headers={"User-Agent": "ambient"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read()).get("data", []) or []
+    except Exception as e:  # noqa: BLE001 - network/parse failure is non-fatal
+        log.warning("OpenRouter model catalog fetch failed: %s", e)
+        return []
+
+
+@lru_cache(maxsize=None)
+def get_model_modalities(model: str) -> list[str]:
+    """Get the input modalities for a model.
+
+    Tries the local models file first; on a miss, falls back to the live
+    OpenRouter catalog so newly-released models
+    still resolve. Returns [] when nothing matches.
+    """
     model_definitions = {}
     try:
         with open(settings.model_definitions_file, "r") as f:
             model_definitions = json.load(f)
     except Exception as e:
         raise Exception(f"Error loading model definitions file: {e}")
-    
-    modalities = [model_json.get("architecture",{}).get("input_modalities", []) for model_json in model_definitions.get("data", []) if match_model(model, model_json.get("id"))]
-    modalities = modalities[0] if modalities and isinstance(modalities[0], list) else modalities
+
+    modalities = _find_input_modalities(model_definitions.get("data", []), model)
+    if modalities is None:
+        modalities = _find_input_modalities(_openrouter_catalog(), model)
+    modalities = modalities or []
     return [model_modalities(modality) for modality in modalities if modality in model_modalities]
 
 
