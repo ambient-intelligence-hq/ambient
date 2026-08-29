@@ -5,6 +5,7 @@ from ambient.tools.grab_frames import grab_frames, GrabFramesTool
 from ambient.tools.draw_bounding_box import draw_bounding_box, DrawBoundingBoxTool
 from ambient.tools.draw_point import draw_point, DrawPointTool
 from ambient.config import get_model_modalities, settings, model_modalities
+from ambient.tools.self_focus_clip import self_focus_clip, SelfFocusClipTool
 
 
 TOOL_REGISTRY = {}
@@ -32,6 +33,18 @@ DEFAULT_TOOLS = [
     },
 ]
 
+# override the default tools when self video analysis tool is enabled
+if settings.self_video_analysis_tool:
+    DEFAULT_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "focus_clip",
+            "description": "Focus a specific portion of the video for the query. The end time should be within 5 mins from the start_time. You will receive a high fidelity clip of the video between the start and end time for detailed inspection. Carefully review the clip and decide next actions. ",
+            "parameters": SelfFocusClipTool.model_json_schema(),
+        },
+    }]
+    TOOL_REGISTRY = {}
+    TOOL_REGISTRY["focus_clip"] = self_focus_clip
 
 TEXT_MODALITY_ONLY_TOOLS = [
     {

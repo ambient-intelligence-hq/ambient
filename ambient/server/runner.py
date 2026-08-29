@@ -365,6 +365,16 @@ class SessionRunner:
             return
 
         text = content
+
+        # Append only during initial turns, to avoid adding the video url to the context for every user turn.
+        if len(self.messages) < 3 and settings.self_video_analysis_tool:
+            from ambient import fast_mode as fm
+            url = await fm.source_video_url(self.video_id, self.store)
+            print(f"[submit_user_message] attaching video_url: {url}")
+            if url:
+                self.messages.insert(1, fm.build_fast_video_message(url,video_id=self.video_id))
+                log.info(f"[self_video_analysis] session {self.session_id}: using direct video_url")
+            
         if output_structure:
             # Mirror ambient.agent.run_agent: steer the final answer to the schema.
             text = (
@@ -372,7 +382,7 @@ class SessionRunner:
                 f"{json.dumps(output_structure)}"
             )
 
-        if len(self.messages) == 1:
+        if len(self.messages) == 1 and not settings.self_video_analysis_tool:
             seed = await self._build_seed_text()
             self.messages.append({"role": "user", "content": [{"type": "text", "text": seed}]})
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
@@ -536,9 +546,8 @@ class SessionRunner:
         # Media tools / the video URL read the source from S3 for youtube imports.
         await self._await_source_ready()
 
-        # Fast mode calls the LLM (vision) endpoint, so classify the service from
-        # that one — not the agent-orchestrator endpoint.
-        service = fm.service_from_base_url(settings.llm_base_url or "")
+        # Duration drives the per-step sampling budget (frames = fps x duration,
+        # capped). Youtube imports carry it; 0 -> sample_fast_frames probes for it.
         duration = 0.0
         try:
             rec = await self.store.get_file(self.video_id)
@@ -547,29 +556,35 @@ class SessionRunner:
         except Exception:  # noqa: BLE001
             pass
 
-        strategy = fm.pick_fast_strategy(service, self.model, duration)
+        # One decision path (media_plan) for every media step. "context" is fast
+        # mode's whole-video attachment; video-vs-frames is chosen by the vision
+        # endpoint's capability, not hardcoded here. Fast mode hits the LLM (vision)
+        # endpoint, so classify from settings.llm_base_url, not the orchestrator.
+        from ambient.media_plan import plan_media
+        plan = plan_media("context", settings.llm_base_url, self.model, duration)
 
-        # Direct-video path: send the source URL and let the server sample frames.
-        # No sandbox, no frame upload (~3-4x faster than the e2b frame pipeline).
-        if strategy.method == "video":
+        # Direct-video path (self-hosted vLLM samples internally): send the source
+        # URL — no sandbox, no frame upload (~3-4x faster than the e2b pipeline).
+        if plan.method == "video":
             url = await fm.source_video_url(self.video_id, self.store)
             if url:
-                self.messages.insert(1, fm.build_fast_video_message(url))
+                self.messages.insert(1, fm.build_fast_video_message(url, video_id=self.video_id))
                 self._fast_frames_loaded = True
-                log.info(f"[fast] session {self.session_id}: using direct video_url")
+                log.info(f"[fast] session {self.session_id}: using direct video_url "
+                         f"(fps~{plan.fps:.2f}, <={plan.max_frames}f)")
                 return
-            # No S3 URL available -> fall back to frame sampling.
-            strategy = fm.FastStrategy("frames", max_frames=fm.FRAMES_MAX)
+            # No S3 URL to host the video -> force the frames path instead.
+            plan = plan_media("context", settings.llm_base_url, self.model, duration,
+                              force_frames=True)
 
-        if strategy.method == "clips":
-            # TODO: the video_url clips path isn't wired for fast mode yet; fall
-            # back to dense frames (capped) so long videos still work.
-            strategy = fm.FastStrategy("frames", max_frames=fm.FRAMES_MAX, max_dim=strategy.max_dim)
-
-        frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, strategy)
+        # Frames path (external providers / image-only models): uniformly sample and
+        # attach as timestamp-labeled image blocks. MediaPlan is duck-compatible with
+        # sample_fast_frames (it reads .max_frames + .max_dim).
+        frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, plan)
         self.messages.insert(1, fm.build_fast_frames_message(frames))
         self._fast_frames_loaded = True
-        log.info(f"[fast] session {self.session_id}: sampled {len(frames)} frames")
+        log.info(f"[fast] session {self.session_id}: sampled {len(frames)} frames "
+                 f"(plan fps~{plan.fps:.2f}, cap {plan.max_frames})")
 
     async def _run_fast(self, model: str) -> None:
         run_id = f"run_{uuid.uuid4().hex[:12]}"

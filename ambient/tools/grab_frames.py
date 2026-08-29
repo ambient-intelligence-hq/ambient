@@ -38,6 +38,8 @@ async def grab_frames(
     )
     user_message_contents = []
 
+    print(f"[Tool call] grab_frames: video_id: {video_id} , start_time: {start_time} , end_time: {end_time}")
+
     try:
         # Returns one or more clips on a single continuous 0-based timeline plus the
         # window's global start (clip_start). With a size cap on a tiled video the

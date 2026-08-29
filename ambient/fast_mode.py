@@ -236,10 +236,10 @@ async def source_video_url(video_id: str, store, expires_in: int = 7200) -> Opti
         return None
 
 
-def build_fast_video_message(url: str) -> dict:
+def build_fast_video_message(url: str, video_id: str = None) -> dict:
     """A stable user message carrying the whole video as a single `video_url`.
     The vision server samples frames internally per its processor config."""
     return {"role": "user", "content": [
-        {"type": "text", "text": "The full video (frames are sampled across its entire duration):"},
+        {"type": "text", "text": f"The full video of video id: {video_id} (frames are sampled across its entire duration):"},
         {"type": "video_url", "video_url": {"url": url}},
     ]}
