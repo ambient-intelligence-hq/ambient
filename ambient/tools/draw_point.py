@@ -136,10 +136,10 @@ async def draw_point(
     results.extend(errors)
 
     annotated_url = (annotated or {}).get("annotated_url")
-    if annotated_url:
-        for r in results:
-            if "error" not in r:
-                r["annotated_url"] = annotated_url
+    # if annotated_url:
+    #     for r in results:
+    #         if "error" not in r:
+    #             r["annotated_url"] = annotated_url
 
     points_desc = "; ".join(f"'{v['label']}' at {[v['x'], v['y']]}" for v in valid)
     verify_prompt = (
