@@ -27,8 +27,9 @@ picture of what happens there. Window ≤ 5 minutes.
 frame, each given as {box: [y_min, x_min, y_max, x_max], label}, to visually
 check spatial predictions before you rely on them.
 
-- draw_point(timestamp, point, label): Draw a point on a frame to visually 
-check a point coordinate prediction before you rely on it.
+- draw_point(timestamp, points): Draw one or more points on a frame, each given
+as {point: [x, y], label}, to visually check point coordinate predictions before
+you rely on them.
         """
         escalation_ladder += """
 Escalation ladder: overview → search_clip (locate) → focus_clip (understand) →

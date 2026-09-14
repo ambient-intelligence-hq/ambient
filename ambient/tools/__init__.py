@@ -78,7 +78,7 @@ IMAGE_MODALITY_ONLY_TOOLS = [
         "type": "function",
         "function": {
             "name": "draw_point",
-            "description": "Visualize a single point / click coordinate on the frame at the given timestamp. The point should be [x, y] on a 0-1000 grid (x horizontal, y vertical). Returns the annotated frame plus the click point in pixel and normalized coordinates. Use this tool to verify a predicted point/click location before relying on it.",
+            "description": "Visualize one or more point / click coordinates on the frame at the given timestamp. Pass a list of points, each as [x, y] on a 0-1000 grid (x horizontal, y vertical) with a label. Returns the annotated frame plus each click point in pixel and normalized coordinates. Use this tool to verify predicted point/click locations before relying on them.",
             "parameters": DrawPointTool.model_json_schema(),
         },
     },
