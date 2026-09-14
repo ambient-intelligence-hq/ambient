@@ -79,15 +79,11 @@ class Settings(BaseSettings):
     server_db_path: str = "ambient_server.sqlite"
     session_idle_ttl_seconds: int = 30 * 60
     session_hard_ttl_seconds: int = 24 * 60 * 60
-    # Selects where VideoFrameTools' media ops run:
-    #   "inprocess" -> ffmpeg/decord run locally in ambient/tools/video_tools.py
+    # Selects where the video tools' media ops run:
+    #   "inprocess" -> ffmpeg on the host, in-process, via the range proxy
+    #                  (local cached file when present, else HTTP range reads from S3/R2)
     #   "e2b"       -> media ops run in an E2B sandbox (LLM calls always stay on the host)
     sandbox_backend: str = "inprocess"
-    # Clip production for search_clip/focus_clip. "rangeproxy" transcodes the
-    # requested window [start,end] from the S3 source on the host and inlines it
-    # as base64 (no e2b, no tiling, no S3 clip storage). None -> the sandbox_backend
-    # path (e2b tiles / inprocess). Clips only — grab_frames/overview still need e2b.
-    clip_backend: Optional[str] = None
     self_video_analysis_tool: bool = False
     # When True, clip tools skip the S3 upload and leave clip_url unset so the LLM
     # payload embeds the local clip as a base64 data URL instead. Lets the core
@@ -178,6 +174,8 @@ class Settings(BaseSettings):
     worker_id: str = ""
     server_workers: int = 1
     model_definitions_file: str = os.path.join(os.path.dirname(__file__),"artifacts","models.json")
+    # Per-model preferred OpenRouter upstream + image-block cap (routing + frames budget).
+    openrouter_providers_file: str = os.path.join(os.path.dirname(__file__),"artifacts","openrouter_providers.json")
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -289,6 +287,41 @@ def get_model_modalities(model: str) -> list[str]:
         modalities = _find_input_modalities(_openrouter_catalog(), model)
     modalities = modalities or []
     return [model_modalities(modality) for modality in modalities if modality in model_modalities]
+
+
+@lru_cache(maxsize=1)
+def _load_openrouter_providers() -> dict:
+    try:
+        with open(settings.openrouter_providers_file, "r") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 - missing/broken table -> auto-route everywhere
+        return {}
+
+
+def get_openrouter_route(model: str) -> dict:
+    """Preferred OpenRouter upstream + image-block cap for `model`.
+
+    Single source of truth (``artifacts/openrouter_providers.json``) for both
+    request routing (``llm.get_provider_params``) and the frames-path budget
+    (``media_plan``). Resolves most-specific-first: exact model id, then the
+    longest family-substring key (so ``qwen/qwen3.6-35b-a3b`` overrides ``qwen``),
+    then ``_default``. Always returns a dict:
+
+        {"provider": str | None,   # None -> auto-route (no pin)
+         "image_cap": int,         # max image_url blocks for this route
+         "video": bool,            # True -> provider samples video_url densely (usable)
+         "mapped": bool}           # False -> nothing matched (fell to _default)
+    """
+    table = _load_openrouter_providers()
+    route = {"provider": None, "image_cap": 100, "video": False}
+    route.update(table.get("_default", {}))
+    m = (model or "").lower()
+    if model in table:
+        return {**route, **table[model], "mapped": True}
+    for key in sorted((k for k in table if not k.startswith("_")), key=len, reverse=True):
+        if key.lower() in m:
+            return {**route, **table[key], "mapped": True}
+    return {**route, "mapped": False}
 
 
 settings = get_settings()
