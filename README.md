@@ -5,7 +5,42 @@ Ambient is a video understanding and research agent that can reason over long-fo
 
 ---
 
-## Quick start
+## Try it in 60 seconds (CLI)
+
+No server, database, S3, or sandbox — just [ffmpeg](https://ffmpeg.org/) on your
+PATH and an LLM key. The CLI runs the *same* agent loop the server uses, driven
+by in-memory adapters, and produces clips locally with ffmpeg (the range-proxy
+backend reads windows straight off your file).
+
+```bash
+# 1. install ffmpeg (macOS: `brew install ffmpeg`, Debian/Ubuntu: `apt install ffmpeg`)
+# 2. bring your own LLM key (OpenRouter shown; any OpenAI-compatible endpoint works)
+export OPENROUTER_API_KEY=sk-or-...
+
+# interactive chat over a video — ask many questions with context, streamed live:
+uv run ambient chat trip.mp4
+
+# or one-shot:
+uv run ambient analyze trip.mp4 "when do they reach the summit?"
+# point at a URL (needs yt-dlp):
+uv run ambient analyze "https://youtu.be/…" "summarize the itinerary"
+
+ambient doctor          # check ffmpeg / key / config
+ambient --help
+```
+
+`chat` opens a REPL (Ctrl-D or `/exit` to quit); each answer streams token by
+token and renders as markdown, with tool calls shown inline as the agent works.
+
+Useful flags (both `chat` and `analyze`): `--model <id>` (sets the agent + vision
+model), `--fast` (one dense-frame pass, no tools), `--show-thinking` (stream the
+reasoning), `--subtitles file.srt`. `analyze` also takes `--schema out.json`
+(steer the answer to a JSON Schema) and `--json` (machine-readable stdout).
+Persist a key with `ambient config set OPENROUTER_API_KEY sk-or-...`.
+
+---
+
+## Full server setup
 
 ### 1. Prerequisites
 - [uv](https://docs.astral.sh/uv/) and Python 3.13
