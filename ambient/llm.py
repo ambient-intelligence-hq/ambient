@@ -75,6 +75,7 @@ RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 def is_retryable_exception(exc: BaseException) -> bool:
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+        print(f"LLM call failed, Retryable exception: {exc}")
         return True
     if isinstance(exc, aiohttp.ClientResponseError):
         return exc.status in RETRYABLE_STATUS_CODES
@@ -162,19 +163,23 @@ def construct_payload(clips: Optional[List[Clip]] = None, frames: Optional[List[
 
 
 def get_provider_params(model: str, base_url: str) -> dict:
-    if "gemini" in model.lower() and "openrouter" in base_url.lower():
-        return {
-            "provider": {
-                "only": ["google-ai-studio"],
-            },
-        }
-    
-    # if "qwen3.5-35b-a3b" in model.lower() and "openrouter" in base_url.lower():
-    #     return {
-    #         "provider": {
-    #             "only": ["atlas-cloud/fp8"],
-    #         },  
-    #     }
+    """OpenRouter provider-routing params for `model`, from the preferred-provider
+    lookup (``artifacts/openrouter_providers.json`` via
+    ``config.get_openrouter_route``).
+
+    Pins the maintained upstream with ``provider.only`` so a model always lands on
+    the same vetted provider — on OpenRouter the frame budget and image-block cap are
+    a per-upstream lottery otherwise (same model id, 69->1083 frames across upstreams;
+    see findings.md). Returns ``{}`` to auto-route when the model has no preferred
+    provider, and for non-OpenRouter endpoints.
+    """
+    if "openrouter" not in (base_url or "").lower():
+        return {}
+    from ambient.config import get_openrouter_route
+
+    provider = get_openrouter_route(model).get("provider")
+    if provider:
+        return {"provider": {"only": [provider]}}
     return {}
 
 

@@ -1,0 +1,8 @@
+{
+  "_doc": "Preferred OpenRouter upstream provider + measured caps, per model. Single source of truth for BOTH request routing (llm.get_provider_params) and the media budget (media_plan). Resolution is most-specific-first: exact model id > longest matching family-substring key > _default. Fields: 'provider' (upstream slug; null/omitted => auto-route, no pin); 'image_cap' (max image_url blocks this route reliably accepts, 0-250 by upstream); 'video' (true => the pinned provider samples video_url DENSELY, i.e. no extreme frame downsampling, so whole-video 'context' can be sent as one video_url instead of frames; false/omitted => frames-only because the provider would undersample video). 'video': true is only trusted when a provider is pinned (else auto-route could land on a stingy upstream). Populate a new model with the E06/E07 provider sweep (blog_experiments/video-llm-public-provider-challenges): pick the densest ROUTABLE upstream, record its image cap, and set video=true only if its frames/min is high. Numbers drift; providers move. Measured 2026-08-30.",
+  "_default": { "provider": null, "image_cap": 100, "video": false },
+
+  "qwen/qwen3.8-27b": { "provider": "alibaba", "image_cap": 250, "video": false },
+  "qwen/qwen3.6-35b-a3b": { "provider": null, "image_cap": 100, "video": false },
+  "gemini": { "provider": "google-ai-studio", "image_cap": 200, "video": true }
+}

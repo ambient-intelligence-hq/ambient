@@ -60,10 +60,14 @@ def _normalize_tool_result(raw: Any) -> dict[str, Any]:
 class ToolDispatcher:
     """Dispatches agent tools by name, caching the video description per video_id."""
 
-    def __init__(self) -> None:
+    def __init__(self, video_id: Optional[str] = None) -> None:
         # The per-session E2B media box, set by the runner for the "e2b" backend.
         # None for "inprocess".
         self.media_box: Optional[object] = None
+        # The session's real video_id. Forced onto every tool call so the model can't
+        # mis-supply it (some models pass a placeholder like "video" or mangle the
+        # opaque id) or target a different video.
+        self.session_video_id: Optional[str] = video_id
         # Per-session cache of the high-level video description, keyed by video_id.
         # get_video_description fills it; search_clip / focus_clip receive it as
         # `video_description` on later calls (mirrors ambient.agent.execute_tool).
@@ -97,11 +101,19 @@ class ToolDispatcher:
         usage_token = usage_sink.set(usage_records)
         try:
             tool_input = dict(input or {})
+            func_args = inspect.getfullargspec(func).args
+
+            # video_id is session state, not the model's to choose: force the session's
+            # real id onto any tool that takes one. Models sometimes pass a placeholder
+            # ("video") or mangle the opaque id (breaking source resolution), and this
+            # also stops a tool call from targeting a different video. Fall back to the
+            # model-supplied value only when we have no session id (older callers).
+            if self.session_video_id and "video_id" in func_args:
+                tool_input["video_id"] = self.session_video_id
             video_id = tool_input.get("video_id")
 
             # Inject the cached video description for tools that accept it.
             if name != "get_video_description":
-                func_args = inspect.getfullargspec(func).args
                 if (
                     "video_description" in func_args
                     and video_id

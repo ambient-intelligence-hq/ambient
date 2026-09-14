@@ -27,7 +27,7 @@ DEFAULT_TOOLS = [
         "type": "function",
         "function": {
             "name": "focus_clip",
-            "description": "Focus a specific portion of the video for the query. The end time should be within 5 mins from the start_time. An video analysis will analyse the portion of the video and return a detailed description of the clip.",
+            "description": "Focus a specific portion of the video. The end time should be within 5 mins from the start_time. An video analysis will analyse the portion of the video and return a detailed description of the clip.",
             "parameters": FocusClipTool.model_json_schema(),
         },
     },
@@ -39,7 +39,7 @@ if settings.self_video_analysis_tool:
         "type": "function",
         "function": {
             "name": "focus_clip",
-            "description": "Focus a specific portion of the video for the query. The end time should be within 5 mins from the start_time. You will receive a high fidelity clip of the video between the start and end time for detailed inspection. Carefully review the clip and decide next actions. ",
+            "description": "Focus a specific portion of the video. The end time should be within 5 mins from the start_time. You will receive a high fidelity clip of the video between the start and end time for detailed inspection. Carefully review the clip and decide next actions. ",
             "parameters": SelfFocusClipTool.model_json_schema(),
         },
     }]

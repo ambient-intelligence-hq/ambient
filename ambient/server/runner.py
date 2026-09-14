@@ -35,8 +35,8 @@ import logging
 
 log = logging.getLogger(__name__)
 
-MAX_CLIPS = 5
-MAX_FRAMES = 30
+MAX_CLIPS = 25
+MAX_FRAMES = 3000
 
 _TOKEN_FIELDS = (
     "input_tokens",
@@ -176,11 +176,12 @@ class SessionRunner:
 
         # Tools always run in-process; only VideoFrameTools' media ops vary by
         # backend. For "e2b" the runner owns a per-session media sandbox and
-        # hands it to the dispatcher.
-        self._dispatcher = ToolDispatcher()
+        # hands it to the dispatcher. The dispatcher forces this session's video_id
+        # onto every tool call (the model can't be trusted to echo the opaque id).
+        self._dispatcher = ToolDispatcher(video_id=self.video_id)
         self._media_box: Optional[object] = None
         self.sandbox_id: Optional[str] = None
-        model_modalities = get_model_modalities(self.model)
+        model_modalities = [m.value for m in get_model_modalities(self.model)]
 
         # On a fresh session `messages` is None -> empty list; seed is built in
         # start_sandbox() after the description is ready. On rehydration the
@@ -366,15 +367,6 @@ class SessionRunner:
 
         text = content
 
-        # Append only during initial turns, to avoid adding the video url to the context for every user turn.
-        if len(self.messages) < 3 and settings.self_video_analysis_tool:
-            from ambient import fast_mode as fm
-            url = await fm.source_video_url(self.video_id, self.store)
-            print(f"[submit_user_message] attaching video_url: {url}")
-            if url:
-                self.messages.insert(1, fm.build_fast_video_message(url,video_id=self.video_id))
-                log.info(f"[self_video_analysis] session {self.session_id}: using direct video_url")
-            
         if output_structure:
             # Mirror ambient.agent.run_agent: steer the final answer to the schema.
             text = (
@@ -429,6 +421,21 @@ class SessionRunner:
                 "progress": {"message": "preparing video description"},
             })
             await self._await_description(settings.first_turn_description_timeout_seconds)
+
+        # Self-video-analysis: attach the whole video as a cacheable prefix on the
+        # first run (streamed here, so submit_user_message stays instant). media_plan
+        # decides video_url vs sampled frames per the AGENT endpoint's capability
+        # (openrouter_providers.json). Skipped on follow-ups/rehydration — the context
+        # is already in the persisted messages.
+        if settings.self_video_analysis_tool and not self._has_video_context():
+            await self._emit("tool.progress", {
+                "run_id": run_id,
+                "turn": 1,
+                "progress": {"message": "attaching video"},
+            })
+            await self._await_source_ready()
+            await self._attach_video_context(
+                settings.agent_base_url or settings.llm_base_url, model)
 
         try:
             for turn in range(1, self.max_turns_per_run + 1):
@@ -534,57 +541,88 @@ class SessionRunner:
 
     # --- fast mode --------------------------------------------------------
 
-    async def _ensure_fast_frames(self) -> None:
-        """Load the video into the conversation once, as a stable, cacheable prefix
-        (right after the system prompt). Either a single `video_url` (self-hosted
-        vLLM samples internally — no e2b) or uniformly-sampled frames (OpenRouter).
-        Reused across follow-up turns."""
-        if self._fast_frames_loaded:
-            return
-        from ambient import fast_mode as fm
+    def _has_video_context(self) -> bool:
+        """True if the whole-video context (a `video_url` or sampled-frame message) is
+        already attached near the top of the conversation. Used as a rehydration-safe
+        'attach once' guard: the persisted messages are the source of truth, so a
+        rehydrated or follow-up run won't attach a second copy. Only the attached
+        context carries media blocks this early — tool-result media come later, after
+        an assistant turn."""
+        for msg in self.messages[:3]:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") in ("video_url", "image_url")
+                for b in content
+            ):
+                return True
+        return False
 
-        # Media tools / the video URL read the source from S3 for youtube imports.
-        await self._await_source_ready()
+    async def _attach_video_context(self, base_url: Optional[str], model: str) -> None:
+        """Attach the whole video once as a cacheable prefix (right after the system
+        prompt): a single `video_url` when the endpoint samples video densely
+        (self-hosted vLLM, or a pinned dense OpenRouter provider), else uniformly-
+        sampled `image_url` frames.
+
+        The choice is `plan_media("context", base_url, model, ...)` against the
+        endpoint that will READ this context — so the openrouter_providers.json
+        lookup drives it. Shared by fast mode (vision endpoint) and agent
+        self-video-analysis (agent orchestrator endpoint); the caller owns the
+        'attach once' guard, this only decides + inserts."""
+        from ambient import fast_mode as fm
+        from ambient.media_plan import plan_media
 
         # Duration drives the per-step sampling budget (frames = fps x duration,
-        # capped). Youtube imports carry it; 0 -> sample_fast_frames probes for it.
+        # capped). Youtube imports carry it under "youtube"; uploads carry a top-level
+        # "duration" probed at ingest (store_video). 0 -> tools probe for it.
         duration = 0.0
         try:
             rec = await self.store.get_file(self.video_id)
             if rec:
-                duration = float((rec.get("youtube") or {}).get("duration") or 0) or 0.0
+                duration = float(
+                    (rec.get("youtube") or {}).get("duration")
+                    or rec.get("duration") or 0
+                ) or 0.0
         except Exception:  # noqa: BLE001
             pass
 
-        # One decision path (media_plan) for every media step. "context" is fast
-        # mode's whole-video attachment; video-vs-frames is chosen by the vision
-        # endpoint's capability, not hardcoded here. Fast mode hits the LLM (vision)
-        # endpoint, so classify from settings.llm_base_url, not the orchestrator.
-        from ambient.media_plan import plan_media
-        plan = plan_media("context", settings.llm_base_url, self.model, duration)
+        plan = plan_media("context", base_url, model, duration)
 
-        # Direct-video path (self-hosted vLLM samples internally): send the source
-        # URL — no sandbox, no frame upload (~3-4x faster than the e2b pipeline).
+        # Dense-video path (endpoint samples internally): send the source URL — no
+        # sandbox, no frame upload (~3-4x faster than the e2b frame pipeline).
         if plan.method == "video":
+            print(f"[plan_media] attaching video context for session {self.session_id}, video_id: {self.video_id} , duration: {duration}")
             url = await fm.source_video_url(self.video_id, self.store)
             if url:
                 self.messages.insert(1, fm.build_fast_video_message(url, video_id=self.video_id))
-                self._fast_frames_loaded = True
-                log.info(f"[fast] session {self.session_id}: using direct video_url "
+                log.info(f"[video_context] session {self.session_id}: video_url "
                          f"(fps~{plan.fps:.2f}, <={plan.max_frames}f)")
                 return
             # No S3 URL to host the video -> force the frames path instead.
-            plan = plan_media("context", settings.llm_base_url, self.model, duration,
-                              force_frames=True)
+            plan = plan_media("context", base_url, model, duration, force_frames=True)
 
-        # Frames path (external providers / image-only models): uniformly sample and
-        # attach as timestamp-labeled image blocks. MediaPlan is duck-compatible with
-        # sample_fast_frames (it reads .max_frames + .max_dim).
-        frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, plan)
+        # Frames path (endpoints that can't control video sampling / image-only
+        # models): uniformly sample and attach as timestamp-labeled image blocks.
+        # MediaPlan is duck-compatible with sample_fast_frames (.max_frames+.max_dim).
+        frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, plan,
+                                                   duration=duration or None)
+        print(f"[plan_media] attaching frames context for session {self.session_id}, Number of frames: {len(frames)}")
+
         self.messages.insert(1, fm.build_fast_frames_message(frames))
+        log.info(f"[video_context] session {self.session_id}: sampled {len(frames)} frames "
+                 f"(cap {plan.max_frames})")
+
+    async def _ensure_fast_frames(self) -> None:
+        """Fast mode: attach the whole-video context once, reused across follow-up
+        turns. Fast mode is a direct vision call, so it classifies the LLM (vision)
+        endpoint — not the agent orchestrator."""
+        if self._fast_frames_loaded:
+            return
+        # Media tools / the video URL read the source from S3 for youtube imports.
+        await self._await_source_ready()
+        await self._attach_video_context(settings.llm_base_url, self.model)
         self._fast_frames_loaded = True
-        log.info(f"[fast] session {self.session_id}: sampled {len(frames)} frames "
-                 f"(plan fps~{plan.fps:.2f}, cap {plan.max_frames})")
 
     async def _run_fast(self, model: str) -> None:
         run_id = f"run_{uuid.uuid4().hex[:12]}"

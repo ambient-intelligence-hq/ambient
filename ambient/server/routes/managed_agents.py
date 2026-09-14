@@ -505,7 +505,7 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
     async def _boot() -> None:
         try:
             # fast mode or self video analysis tool does not need a sandbox
-            if not settings.self_video_analysis_tool or not record.get("mode") == "fast":
+            if (not settings.self_video_analysis_tool) and (not record.get("mode") == "fast"):
                 await runner.start_sandbox()
             await store.update_session(record["session_id"], lambda r: {
                 **r, "status": "ready",

@@ -158,34 +158,42 @@ def service_from_base_url(base_url: Optional[str]) -> str:
     return "self_hosted"
 
 
-async def sample_fast_frames(video_id: str, media_box, strategy: "FastStrategy"):
+async def sample_fast_frames(video_id: str, media_box, strategy: "FastStrategy",
+                             duration: Optional[float] = None):
     """Uniformly sample `strategy.max_frames` frames across the whole video.
 
     Runs the (blocking) media work on a worker thread; `media_box` is published on
     the `current_media_box` ContextVar so the e2b backend picks it up (None for the
-    inprocess backend). Returns `(frames, duration_seconds)`.
+    inprocess backend). `duration` (seconds), when known from the file record, is
+    passed to the tools so they don't probe it. Returns `(frames, duration_seconds)`.
     """
     from ambient.tools.video_backend import current_media_box, make_video_tools
 
     n = strategy.max_frames or FRAMES_MAX
 
     def _work():
-        tools = make_video_tools(video_id, max_frame_dimention=strategy.max_dim)
-        duration = getattr(tools, "_duration_sec", None)
-        if not duration:
-            # Cheap probe to learn the duration, then sample uniformly.
+        tools = make_video_tools(video_id, max_frame_dimention=strategy.max_dim,
+                                 duration=duration)
+        # `dur` (local) keeps the outer `duration` param unshadowed. For the
+        # range-proxy the passed duration is already on tools._duration_sec.
+        dur = getattr(tools, "_duration_sec", None) or duration
+        if not dur and hasattr(tools, "probe_duration"):
+            # Range-proxy: cheap ffprobe (no frame extraction) for the duration.
+            dur = tools.probe_duration()
+        if not dur:
+            # inprocess/e2b: a 1-frame fetch populates their _duration_sec.
             tools.fetch_frames(fps=1, start_time_sec=0, end_time_sec=None, max_frames=1)
-            duration = getattr(tools, "_duration_sec", None)
-        if duration and duration > 0:
+            dur = getattr(tools, "_duration_sec", None)
+        if dur and dur > 0:
             # The extractor needs an integer fps >= 1 and samples `max_frames`
             # uniformly across the window. Pick the smallest integer fps whose grid
             # yields >= n candidates, then let max_frames downsample to exactly n.
-            fps = max(1, math.ceil(n / duration))
+            fps = max(1, math.ceil(n / dur))
             frames = tools.fetch_frames(fps=fps, start_time_sec=0,
-                                        end_time_sec=duration, max_frames=n)
+                                        end_time_sec=dur, max_frames=n)
         else:
             frames = tools.fetch_frames(fps=1, start_time_sec=0, end_time_sec=None, max_frames=n)
-        return frames, (duration or 0.0)
+        return frames, (dur or 0.0)
 
     token = current_media_box.set(media_box)
     try:

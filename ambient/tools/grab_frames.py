@@ -82,6 +82,6 @@ if __name__ == "__main__":
         "Find the moment when the police car arrived at the scene after the accident."
     )
     result, user_message_contents = asyncio.run(
-        search_clip("Seattle_bad_driver_accident", query, start_time, end_time)
+        grab_frames("Seattle_bad_driver_accident", query, start_time, end_time)
     )
     print(result)

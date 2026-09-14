@@ -29,9 +29,13 @@ its inputs + the registries below, so it's trivially extendable:
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Literal, Optional
+
+log = logging.getLogger(__name__)
+_warned_unmapped: set[str] = set()  # models we've already logged an auto-route warning for
 
 # --- 1. Per-step sampling budgets -------------------------------------------
 
@@ -68,6 +72,12 @@ SAMPLING: dict[str, SamplingSpec] = {
 # sub-call), so they must always be `frames` regardless of endpoint capability.
 FRAME_ONLY_STEPS = frozenset({"grab_frames"})
 
+# Steps that tolerate an uncontrolled frame *count* (a whole-video attachment cited
+# only approximately), so a densely-sampling pinned provider's video_url may be used
+# instead of frames. Clip/frame-exact steps are excluded — they need controllable,
+# citable timestamps.
+UNCONTROLLED_VIDEO_STEPS = frozenset({"context"})
+
 
 # --- 2. Endpoint capabilities ------------------------------------------------
 
@@ -85,7 +95,9 @@ class EndpointProfile:
 
 ENDPOINT_PROFILES: dict[str, EndpointProfile] = {
     "self_hosted": EndpointProfile("self_hosted", video_frame_control=True,  image_block_cap=1000),
-    "openrouter":  EndpointProfile("openrouter",  video_frame_control=False, image_block_cap=200),
+    # OpenRouter's cap is a per-*upstream* lottery (0-250), so the real cap comes from
+    # the preferred-provider lookup (image_block_cap()); this is only the unmapped floor.
+    "openrouter":  EndpointProfile("openrouter",  video_frame_control=False, image_block_cap=100),
     "vercel":      EndpointProfile("vercel",      video_frame_control=False, image_block_cap=200),
 }
 
@@ -123,6 +135,42 @@ def model_modalities(model: str) -> list[str]:
     except Exception:  # noqa: BLE001
         pass
     return ["text", "image", "video"]
+
+
+def image_block_cap(base_url: Optional[str], model: str) -> int:
+    """Max `image_url` blocks for (endpoint, model).
+
+    On OpenRouter this is a *per-model* property, not a flat endpoint constant: the
+    cap swings 0-250 by upstream provider, so it's read from the maintained
+    preferred-provider lookup (same table that pins routing). Elsewhere it's the
+    endpoint profile's flat cap. Warns once per model when an OpenRouter model has no
+    preferred provider (auto-route at the conservative floor)."""
+    prof = profile_for(base_url)
+    if prof.service == "openrouter":
+        from ambient.config import get_openrouter_route
+        route = get_openrouter_route(model)
+        if not route.get("mapped") and model not in _warned_unmapped:
+            _warned_unmapped.add(model)
+            log.warning(
+                "media_plan: no preferred OpenRouter provider for %r; auto-routing at "
+                "image cap %d. Run the E06/E07 sweep and add it to "
+                "openrouter_providers.json for deterministic frame budgets.",
+                model, route["image_cap"])
+        return int(route["image_cap"])
+    return prof.image_block_cap
+
+
+def route_allows_video(base_url: Optional[str], model: str) -> bool:
+    """Whether a *pinned* OpenRouter provider samples `video_url` densely enough to
+    send video instead of frames (the entry's `video` flag). Requires an actual pin
+    — under auto-route we can't guarantee landing on the dense upstream, so a stingy
+    one would extreme-downsample. Only meaningful on OpenRouter; self-host uses the
+    controlled-video path, and other no-control endpoints (vercel) don't qualify."""
+    if profile_for(base_url).service != "openrouter":
+        return False
+    from ambient.config import get_openrouter_route
+    route = get_openrouter_route(model)
+    return bool(route.get("video") and route.get("provider"))
 
 
 # --- 3. The plan -------------------------------------------------------------
@@ -165,10 +213,11 @@ def plan_media(
     prof = profile_for(base_url)
     mods = model_modalities(model)
     eff_fps = spec.effective_fps(span_seconds)
+    img_cap = image_block_cap(base_url, model)  # per-model on OpenRouter, flat elsewhere
 
     # Raw-frame steps (grab_frames) and forced-frames always deliver image frames.
     if force_frames or step in FRAME_ONLY_STEPS:
-        cap = min(spec.max_frames, prof.image_block_cap)
+        cap = min(spec.max_frames, img_cap)
         return MediaPlan("frames", fps=min(eff_fps, cap / max(span_seconds, 1)),
                          max_frames=cap, max_dim=spec.max_dim,
                          meta={"service": prof.service, "reason": "frame-only step"})
@@ -179,10 +228,22 @@ def plan_media(
         return MediaPlan("video", fps=eff_fps, max_frames=spec.max_frames, max_dim=spec.max_dim,
                          meta={"service": prof.service, "reason": "video frame-control"})
 
+    # Dense-provider video on a no-control endpoint: the pinned OpenRouter upstream
+    # samples video_url densely (no extreme downsampling), so for whole-video steps
+    # that tolerate an uncontrolled count (context), one video_url beats the image-
+    # block cap on long videos and skips frame extraction/upload. Clip/frame-exact
+    # steps fall through to frames below for controllable, citable timestamps.
+    if ("video" in mods and step in UNCONTROLLED_VIDEO_STEPS
+            and route_allows_video(base_url, model)):
+        return MediaPlan("video", fps=eff_fps, max_frames=spec.max_frames, max_dim=spec.max_dim,
+                         controlled=False,
+                         note="pinned provider samples video densely (count uncontrolled)",
+                         meta={"service": prof.service, "reason": "dense-provider video"})
+
     # Frames: deterministic on any image-capable model (external proxies,
     # image-only models). Drop fps if the frame count would exceed the block cap.
     if "image" in mods:
-        cap = min(spec.max_frames, prof.image_block_cap)
+        cap = min(spec.max_frames, img_cap)
         fps = min(eff_fps, cap / max(span_seconds, 1))
         return MediaPlan("frames", fps=fps, max_frames=cap, max_dim=spec.max_dim,
                          meta={"service": prof.service,

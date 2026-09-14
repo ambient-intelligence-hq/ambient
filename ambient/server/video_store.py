@@ -14,6 +14,7 @@ import hashlib
 import logging
 import mimetypes
 import os
+import subprocess
 from urllib.parse import parse_qs, urlparse
 
 from ambient.config import settings
@@ -23,7 +24,53 @@ log = logging.getLogger(__name__)
 
 VIDEO_FOLDER = settings.video_folder
 _VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg"}
+# Containers where moov placement matters and `+faststart` is a valid stream-copy.
+_FASTSTART_EXTS = {".mp4", ".mov", ".m4v"}
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+
+
+def _faststart_in_place(path: str) -> None:
+    """Stream-copy remux so the mp4 `moov` atom sits at the FRONT (faststart).
+
+    Uploads commonly ship moov-at-end, which forces any HTTP reader (the
+    range-proxy) to pull most of the file before it can probe duration or seek —
+    turning a 1-frame extract into a whole-file download. `-c copy` keeps it cheap
+    (no re-encode). Best-effort: leaves the original untouched on any failure.
+    """
+    # Keep the source extension on the temp file so ffmpeg infers the output
+    # container (a `.tmp` suffix -> "Unable to choose an output format").
+    root, ext = os.path.splitext(path)
+    tmp = f"{root}.faststart{ext}"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", path,
+             "-c", "copy", "-movflags", "+faststart", tmp],
+            capture_output=True, timeout=300)
+        if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+        else:
+            log.warning("faststart remux skipped for %s: %s", path,
+                        r.stderr.decode("utf-8", "replace")[:200])
+    except Exception as exc:  # noqa: BLE001 - best-effort; original file still works
+        log.warning("faststart remux failed for %s: %s", path, exc)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _probe_duration_local(path: str) -> "float | None":
+    """Duration (seconds) via a fast LOCAL ffprobe. None on failure. Probed at
+    ingest and persisted so tools never probe duration over the network."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", path],
+            capture_output=True, timeout=30)
+        if r.returncode == 0:
+            return float(r.stdout.decode().strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def content_video_id(data: bytes) -> str:
@@ -95,6 +142,13 @@ def store_video(data: bytes, filename: str | None, mime_type: str | None) -> dic
     with open(local_path, "wb") as f:
         f.write(data)
 
+    # Normalize moov -> front (faststart) so the range-proxy's HTTP seeks/probes are
+    # cheap for any worker without the local cache, then probe duration once locally
+    # (instant) and persist it so tools never probe over the network. Both best-effort.
+    if ext in _FASTSTART_EXTS:
+        _faststart_in_place(local_path)
+    duration = _probe_duration_local(local_path)
+
     r2_key: str | None = None
     try:
         client = get_s3_client()
@@ -121,6 +175,7 @@ def store_video(data: bytes, filename: str | None, mime_type: str | None) -> dic
         "size_bytes": len(data),
         "local_path": local_path,
         "r2_key": r2_key,
+        "duration": duration,
         "source_type": "upload",
         "source_status": "ready",
         "source_error": None,

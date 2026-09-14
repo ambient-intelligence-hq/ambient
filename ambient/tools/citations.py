@@ -1,6 +1,5 @@
-from typing import List, Dict
+from typing import Any, List, Dict
 import re
-from ambient.tools.inprocess_video_tools import VideoFrameTools
 from ambient.llm import video_to_data_url
 
 
@@ -233,7 +232,7 @@ def _replace_citations_with_global_video_timestamps(
 
 
 def _build_user_message_contents_from_citations(
-    video_tools: VideoFrameTools,
+    video_tools: Any,
     citations: List[Dict[str, float]],
     start_time: float,
     end_time: float,
@@ -283,7 +282,7 @@ def _build_user_message_contents_from_citations(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": video_to_data_url(frame.frame_file_path, "image/jpeg")
+                        "url": frame.frame_url or video_to_data_url(frame.frame_file_path, "image/jpeg")
                     },
                 }
             )
