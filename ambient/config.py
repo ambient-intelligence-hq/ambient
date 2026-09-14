@@ -84,7 +84,12 @@ class Settings(BaseSettings):
     #                  (local cached file when present, else HTTP range reads from S3/R2)
     #   "e2b"       -> media ops run in an E2B sandbox (LLM calls always stay on the host)
     sandbox_backend: str = "inprocess"
-    self_video_analysis_tool: bool = False
+    # Self-video-analysis (the agent model views clips itself via self_focus_clip +
+    # a whole-video context prefix, instead of delegating to a separate vision
+    # sub-model) is ON by default whenever the agent model is vision-capable. Set
+    # DISABLE_SELF_VIDEO_ANALYSIS_TOOL=1 to force the delegated (focus_clip) path.
+    # See self_video_analysis_enabled().
+    disable_self_video_analysis_tool: bool = False
     # When True, clip tools skip the S3 upload and leave clip_url unset so the LLM
     # payload embeds the local clip as a base64 data URL instead. Lets the core
     # agent run with no S3/R2 bucket (see notebooks/test_sdk.ipynb).
@@ -287,6 +292,22 @@ def get_model_modalities(model: str) -> list[str]:
         modalities = _find_input_modalities(_openrouter_catalog(), model)
     modalities = modalities or []
     return [model_modalities(modality) for modality in modalities if modality in model_modalities]
+
+
+def self_video_analysis_enabled(model: Optional[str] = None) -> bool:
+    """Whether the agent should analyze video/clips itself (self_focus_clip + a
+    whole-video context prefix) rather than delegating to a separate vision model.
+
+    Default ON when the (agent) model is vision-capable — supports IMAGE or VIDEO
+    input — and off when `DISABLE_SELF_VIDEO_ANALYSIS_TOOL` is set. `model` defaults
+    to `settings.agent_model` (used for the process-global tool selection); the
+    runner passes its per-session model so its behavior tracks that session's model.
+    Only meaningful in agent mode — fast mode never runs the agent loop or tools.
+    """
+    if settings.disable_self_video_analysis_tool:
+        return False
+    mods = get_model_modalities(model or settings.agent_model)
+    return bool(mods) and (model_modalities.IMAGE in mods or model_modalities.VIDEO in mods)
 
 
 @lru_cache(maxsize=1)

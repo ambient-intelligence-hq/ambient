@@ -30,7 +30,7 @@ from ambient.server.sandbox import SandboxLimits, ToolDispatcher
 from ambient.server.store import Store
 from ambient.tools import TOOLS
 from ambient.server.ingest import ensure_description
-from ambient.config import get_model_modalities
+from ambient.config import get_model_modalities, self_video_analysis_enabled
 import logging
 
 log = logging.getLogger(__name__)
@@ -374,7 +374,7 @@ class SessionRunner:
                 f"{json.dumps(output_structure)}"
             )
 
-        if len(self.messages) == 1 and not settings.self_video_analysis_tool:
+        if len(self.messages) == 1 and not self_video_analysis_enabled(self.model):
             seed = await self._build_seed_text()
             self.messages.append({"role": "user", "content": [{"type": "text", "text": seed}]})
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
@@ -427,7 +427,7 @@ class SessionRunner:
         # decides video_url vs sampled frames per the AGENT endpoint's capability
         # (openrouter_providers.json). Skipped on follow-ups/rehydration — the context
         # is already in the persisted messages.
-        if settings.self_video_analysis_tool and not self._has_video_context():
+        if self_video_analysis_enabled(self.model) and not self._has_video_context():
             await self._emit("tool.progress", {
                 "run_id": run_id,
                 "turn": 1,

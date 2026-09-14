@@ -40,7 +40,7 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from sse_starlette.sse import EventSourceResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from ambient.config import settings
+from ambient.config import settings, self_video_analysis_enabled
 from ambient.server.auth import require_api_key
 from ambient.server.errors import bad_request, conflict, not_found
 from ambient.server.runner import SandboxNotReady, SessionRunner, _empty_usage
@@ -504,8 +504,9 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
 
     async def _boot() -> None:
         try:
-            # fast mode or self video analysis tool does not need a sandbox
-            if (not settings.self_video_analysis_tool) and (not record.get("mode") == "fast"):
+            # fast mode or self-video-analysis (vision-capable agent model) does not
+            # need a pre-booted sandbox.
+            if (not self_video_analysis_enabled(record.get("model"))) and (not record.get("mode") == "fast"):
                 await runner.start_sandbox()
             await store.update_session(record["session_id"], lambda r: {
                 **r, "status": "ready",

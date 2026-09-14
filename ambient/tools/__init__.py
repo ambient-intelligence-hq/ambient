@@ -4,7 +4,7 @@ from ambient.tools.annotate_frames import annotate_frames, AnnotateFramesTool
 from ambient.tools.grab_frames import grab_frames, GrabFramesTool
 from ambient.tools.draw_bounding_box import draw_bounding_box, DrawBoundingBoxTool
 from ambient.tools.draw_point import draw_point, DrawPointTool
-from ambient.config import get_model_modalities, settings, model_modalities
+from ambient.config import get_model_modalities, settings, model_modalities, self_video_analysis_enabled
 from ambient.tools.self_focus_clip import self_focus_clip, SelfFocusClipTool
 
 
@@ -33,8 +33,9 @@ DEFAULT_TOOLS = [
     },
 ]
 
-# override the default tools when self video analysis tool is enabled
-if settings.self_video_analysis_tool:
+# override the default tools when self video analysis is enabled (agent model is
+# vision-capable and not explicitly disabled). Uses the global agent_model.
+if self_video_analysis_enabled():
     DEFAULT_TOOLS = [{
         "type": "function",
         "function": {

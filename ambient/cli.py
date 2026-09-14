@@ -123,9 +123,11 @@ def _apply_env(model: Optional[str], vision_model: Optional[str], workspace: Pat
     #    gets None for an empty bucket, and falls back to locally-sampled base64
     #    frames instead of a presigned URL for an object we never uploaded. Clips
     #    from the range proxy are already inline base64, so no upload is needed.
-    # We intentionally do NOT force self_video_analysis_tool: the CLI honors the
-    # same setting the server uses, so the agent workflow (tool loop vs whole-video
-    # self-analysis) is identical across UI and CLI.
+    # We intentionally do NOT override self-video-analysis: the CLI honors the same
+    # derivation the server uses (on by default for a vision-capable agent model,
+    # unless DISABLE_SELF_VIDEO_ANALYSIS_TOOL is set — see self_video_analysis_enabled),
+    # so the agent workflow (tool loop vs whole-video self-analysis) is identical
+    # across UI and CLI.
     os.environ["SANDBOX_BACKEND"] = "host"
     os.environ["S3_BUCKET"] = ""
     os.environ["VIDEO_FOLDER"] = str(workspace)
