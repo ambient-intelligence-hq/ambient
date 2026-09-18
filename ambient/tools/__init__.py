@@ -6,6 +6,7 @@ from ambient.tools.draw_bounding_box import draw_bounding_box, DrawBoundingBoxTo
 from ambient.tools.draw_point import draw_point, DrawPointTool
 from ambient.config import get_model_modalities, settings, model_modalities, self_video_analysis_enabled
 from ambient.tools.self_focus_clip import self_focus_clip, SelfFocusClipTool
+from ambient.tools.bash_tool import bash, BashTool
 
 
 TOOL_REGISTRY = {}
@@ -100,3 +101,24 @@ if agent_modalities and model_modalities.IMAGE in agent_modalities:
     TOOL_REGISTRY["grab_frames"] = grab_frames
     TOOL_REGISTRY["draw_bounding_box"] = draw_bounding_box
     TOOL_REGISTRY["draw_point"] = draw_point
+
+# Opt-in bash tool (settings.enable_bash_tool). Backend-agnostic: runs in the
+# per-session e2b box when active, else on the host. See ambient/tools/bash_tool.py.
+BASH_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": (
+                "Run a non-interactive shell command via `/bin/sh -c` and get back its "
+                "exit code, stdout, and stderr. Runs inside the session sandbox when one "
+                "is active, otherwise on the host. Use for ffmpeg/ffprobe, inspecting "
+                "files in the working directory, or quick computations."
+            ),
+            "parameters": BashTool.model_json_schema(),
+        },
+    }
+]
+if settings.enable_bash_tool:
+    TOOLS.extend(BASH_TOOLS)
+    TOOL_REGISTRY["bash"] = bash

@@ -124,6 +124,30 @@ class E2BMediaSandbox(MediaSandbox):
                 return _parse_envelope(exc.stdout, exc.stderr, exc.exit_code)
         return _parse_envelope(res.stdout, res.stderr, res.exit_code)
 
+    def run_shell(self, command: str, timeout: int | None = None) -> dict:
+        """Run a raw shell command inside the sandbox (bash tool, e2b backend).
+
+        Unlike `run`, which invokes the media CLI (`python /app/main.py …`), this
+        passes `command` straight to the box's shell. Returns
+        {stdout, stderr, exit_code}; a non-zero exit still returns cleanly rather
+        than raising."""
+        if self.sandbox is None:
+            raise RuntimeError("Sandbox not created or killed")
+        from e2b.sandbox.commands.command_handle import CommandExitException
+
+        with self._sem:
+            self.sandbox.set_timeout(self._keepalive_secs)
+            try:
+                res = self.sandbox.commands.run(
+                    command,
+                    envs=self.envs,
+                    cwd="/app",
+                    timeout=int(timeout or _CMD_TIMEOUT_SECS),
+                )
+            except CommandExitException as exc:
+                return {"stdout": exc.stdout, "stderr": exc.stderr, "exit_code": exc.exit_code}
+        return {"stdout": res.stdout, "stderr": res.stderr, "exit_code": res.exit_code}
+
     def kill(self) -> None:
         try:
             self.sandbox.kill()

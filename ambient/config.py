@@ -94,6 +94,18 @@ class Settings(BaseSettings):
     # payload embeds the local clip as a base64 data URL instead. Lets the core
     # agent run with no S3/R2 bucket (see notebooks/test_sdk.ipynb).
     inline_clips: bool = False
+
+    # Bash tool: lets the agent run shell commands (ffmpeg/ffprobe, file inspection,
+    # etc.). Selects the same backend as media tools — the per-session E2B sandbox
+    # when active, else the HOST. SECURITY: on the host backend this executes
+    # arbitrary shell with the server process's privileges and NO OS isolation, so
+    # it is OFF by default; enable only when you trust the model + prompt, and
+    # prefer the e2b backend for anything untrusted. Host runs get soft hygiene
+    # only: a timeout, an output byte cap, cwd confinement, and process-group kill.
+    enable_bash_tool: bool = True
+    bash_timeout_seconds: int = 120           # per-command wall clock before SIGKILL
+    bash_max_output_bytes: int = 20000        # stdout/stderr each truncated to this
+    bash_cwd: str | None = None               # host working dir; None -> video_folder
     sandbox_cpu_seconds: int = 600
     sandbox_memory_mb: int = 4096
     sandbox_wall_seconds: int = 1800
