@@ -9,7 +9,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_BOX_VIDEO_FOLDER = "/tmp/videos"
+_BOX_VIDEO_FOLDER = settings.box_video_folder
 RESULT_SENTINEL = "===AMBIENT_RESULT==="
 _SENTINEL_RE = re.compile(re.escape(RESULT_SENTINEL) + r"(.*?)" + re.escape(RESULT_SENTINEL), re.S)
 

@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     embedding_client: str = "gemini"
 
     video_folder: str = "/Users/logesh/self/video-llm-tests/videos"
+    box_video_folder: str = "/tmp/videos/"
     video_clip_duration: int = 60 # secs
     video_clip_fps: int = 5
     video_clip_max_dimentions: Optional[int] = 768

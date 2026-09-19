@@ -18,6 +18,7 @@ import asyncio
 import json
 import time
 import uuid
+import os
 from typing import Any, Optional
 
 from ambient.config import settings
@@ -218,6 +219,14 @@ class SessionRunner:
         if self.agent_system:
             system = f"{system}\n\n## Task\n{self.agent_system}"
         return [{"role": "system", "content": system}]
+    
+    def _video_source_path(self, rec: dict | None) -> Optional[str]:
+        ext = os.path.splitext((rec or {}).get("local_path") or (rec or {}).get("r2_key") or "")[1] or ".mp4"
+        if self.backend == "e2b":
+            # mirrors resolve_video_source(): <box_folder>/<id>/<id><ext>
+            return f"{settings.box_video_folder}/{self.video_id}/{self.video_id}{ext}"
+        lp = (rec or {}).get("local_path")           # host: exact path the store wrote
+        return lp if lp and os.path.exists(lp) else None
         
 
     async def start_sandbox(self) -> None:
@@ -374,8 +383,9 @@ class SessionRunner:
                 f"{json.dumps(output_structure)}"
             )
 
-        if len(self.messages) == 1 and not self_video_analysis_enabled(self.model):
-            seed = await self._build_seed_text()
+        if len(self.messages) == 1:
+            attach_video_description = not self_video_analysis_enabled(self.model)
+            seed = await self._build_seed_text(attach_video_description)
             self.messages.append({"role": "user", "content": [{"type": "text", "text": seed}]})
         self.messages.append({"role": "user", "content": [{"type": "text", "text": text}]})
         # Persist the user turn up front so a rehydrating worker sees it even if
@@ -796,7 +806,7 @@ class SessionRunner:
 
     # --- helpers ----------------------------------------------------------
 
-    async def _build_seed_text(self) -> str:
+    async def _build_seed_text(self, attach_video_description: bool = False) -> str:
         """First-turn context. Uses the full description if it's already resolved,
         otherwise a metadata-only seed so the turn never blocks on ingestion."""
         if self.video_description:
@@ -809,15 +819,35 @@ class SessionRunner:
         if rec:
             yt = rec.get("youtube") or {}
             title = yt.get("title") or rec.get("filename")
-            duration = yt.get("duration")
-        return (
+            duration = yt.get("duration") or rec.get("duration")
+
+        if duration is None and self.backend != "e2b":
+            from ambient.tools.rangeproxy_video_tools import RangeProxyVideoFrameTools
+            duration = await asyncio.to_thread(
+                lambda: RangeProxyVideoFrameTools(self.video_id).probe_duration()
+            )
+
+            if duration is not None and rec is not None:
+                try:
+                    await self.store.update_file(self.video_id, lambda r: {**r, "duration": duration})
+                except Exception:  # noqa: BLE001 - caching is best-effort
+                    pass
+        
+        seed_text = (
             f"Video id: {self.video_id}\n"
             f"Title: {title or 'unknown'}\n"
-            f"Duration: {duration if duration is not None else 'unknown'} seconds\n"
-            "Note: a detailed video description is being generated in the background "
-            "and will be provided in a later message. You can use your video tools "
-            "immediately."
+            f"Duration: {duration if duration is not None else 'unknown'} seconds\n"   
         )
+
+        if attach_video_description:
+            seed_text += "Note: a detailed video description is being generated in the background and will be provided in a later message. You can use your video tools immediately." + "\n"
+        
+        video_path = self._video_source_path(await self.store.get_file(self.video_id))
+        if video_path:
+            seed_text += f"\nVideo file path: {video_path}\n"
+        
+        return seed_text
+
 
     def _description_injected(self) -> bool:
         """True if the full description is already in the conversation — either as
