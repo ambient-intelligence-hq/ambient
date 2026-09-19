@@ -4,6 +4,8 @@ from ambient.tools.annotate_frames import annotate_frames, AnnotateFramesTool
 from ambient.tools.grab_frames import grab_frames, GrabFramesTool
 from ambient.tools.draw_bounding_box import draw_bounding_box, DrawBoundingBoxTool
 from ambient.tools.draw_point import draw_point, DrawPointTool
+from ambient.tools.read_image import read_image, ReadImageTool
+from ambient.tools.upload_artifact import upload_artifact, UploadArtifactTool
 from ambient.config import get_model_modalities, settings, model_modalities, self_video_analysis_enabled
 from ambient.tools.self_focus_clip import self_focus_clip, SelfFocusClipTool
 from ambient.tools.bash_tool import bash, BashTool
@@ -84,6 +86,14 @@ IMAGE_MODALITY_ONLY_TOOLS = [
             "parameters": DrawPointTool.model_json_schema(),
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_image",
+            "description": "Read a standalone image FILE at an absolute path and inspect it directly (e.g. a screenshot, chart, or frame you saved via the bash tool). For frames of the session video use grab_frames instead.",
+            "parameters": ReadImageTool.model_json_schema(),
+        },
+    },
 ]
 
 TOOLS = DEFAULT_TOOLS
@@ -101,6 +111,21 @@ if agent_modalities and model_modalities.IMAGE in agent_modalities:
     TOOL_REGISTRY["grab_frames"] = grab_frames
     TOOL_REGISTRY["draw_bounding_box"] = draw_bounding_box
     TOOL_REGISTRY["draw_point"] = draw_point
+    TOOL_REGISTRY["read_image"] = read_image
+
+# upload_artifact: publish a file the agent produced to S3 (works on either
+# backend). Modality-agnostic, so registered outside the image/text blocks —
+# only when S3 is configured.
+if settings.s3_bucket:
+    TOOLS.append({
+        "type": "function",
+        "function": {
+            "name": "upload_artifact",
+            "description": "Upload a file you produced (e.g. via the bash tool) to S3 and get back its s3:// path and a presigned download URL to share with the user. Use for deliverables the user should be able to download (reports, rendered clips, charts, extracted data).",
+            "parameters": UploadArtifactTool.model_json_schema(),
+        },
+    })
+    TOOL_REGISTRY["upload_artifact"] = upload_artifact
 
 # Opt-in bash tool (settings.enable_bash_tool). Backend-agnostic: runs in the
 # per-session e2b box when active, else on the host. See ambient/tools/bash_tool.py.

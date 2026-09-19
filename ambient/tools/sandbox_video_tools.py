@@ -48,11 +48,18 @@ class SandboxVideoFrameTools:
     OVERVIEW_MAX_FRAMES = 75
     MAX_CLIP_DURATION_SEC = 600
 
-    def __init__(self, video_id: str, max_frame_dimention: Optional[int] = None, *, box: MediaSandbox) -> None:
+    def __init__(self, video_id: str, max_frame_dimention: Optional[int] = None, *,
+                 box: MediaSandbox, source_path: Optional[str] = None) -> None:
         self.video_id = video_id
         self.max_frame_dimention = max_frame_dimention
         self._box = box
         self._duration_sec: Optional[float] = None
+        # Explicit box-local source file (external-video path). When set, the in-box
+        # CLI reads it directly (--source-path) instead of resolving via video_id.
+        self._source_path: Optional[str] = source_path
+
+    def _source_args(self) -> List[str]:
+        return ["--source-path", self._source_path] if self._source_path else []
 
     # ------------------------------------------------------------------ frames
     def _extract_frames(
@@ -63,7 +70,8 @@ class SandboxVideoFrameTools:
         max_frames: Optional[int] = None,
     ) -> List[Frame]:
         try:
-            argv = ["extract-frames", "--video-id", self.video_id, "--fps", str(int(fps)), "--upload-s3"]
+            argv = ["extract-frames", "--video-id", self.video_id, "--fps", str(int(fps)),
+                    "--upload-s3", *self._source_args()]
             if start_time_sec:
                 argv += ["--start", str(start_time_sec)]
             if end_time_sec is not None:
@@ -128,7 +136,7 @@ class SandboxVideoFrameTools:
             "--timestamp", str(timestamp),
             "--annotations", json.dumps(boxed),
             "--coord-scale", str(coord_scale),
-            "--upload-s3",
+            "--upload-s3", *self._source_args(),
         ]
         if max_dim is not None:
             argv += ["--max-dim", str(int(max_dim))]
@@ -158,7 +166,7 @@ class SandboxVideoFrameTools:
         argv = [
             "fetch-clip", "--video-id", self.video_id,
             "--start", str(start_time_sec), "--end", str(end_time_sec),
-            "--fps", str(int(fps)), "--upload-s3",
+            "--fps", str(int(fps)), "--upload-s3", *self._source_args(),
         ]
         if crf is not None:
             argv += ["--crf", str(int(crf))]

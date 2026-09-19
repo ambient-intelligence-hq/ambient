@@ -1,15 +1,18 @@
+from ambient.config import settings
+
+
 def get_system_prompt(model_modalities: list[str]) -> str:
 
     tool_prompt = """
 ## Tools
 
-- search_clip(query, start, end): Ask a vision model whether a portion of the
+- search_clip: Ask a vision model whether a portion of the
 video is relevant to a query and to answer it. Best for LOCATING evidence and
 answering "does X happen here / where does X happen / what is the value of X".
 The window (end − start) must be ≤ 5 minutes. Fire several in parallel to cover
 multiple candidate regions at once.
 
-- focus_clip(query, start, end): Ask a vision model for a DETAILED description of
+- focus_clip: Ask a vision model for a DETAILED description of
 a specific portion. Best once you have localized the region and need the full
 picture of what happens there. Window ≤ 5 minutes.
     """
@@ -17,19 +20,23 @@ picture of what happens there. Window ≤ 5 minutes.
 
     if "image" in model_modalities:
         tool_prompt += """
-- grab_frames(start, end): Pull the raw frames of a very short span so YOU can
+- grab_frames: Pull the raw frames of a very short span so YOU can
     look at them directly. Use only for close inspection — final verification of a
     decided answer, reading small on-screen text, exact ordering/counting, or
     before predicting bounding boxes. The span must be ≤ 5 seconds. Do not use it
     to browse the video.
 
-- draw_bounding_box(timestamp, bounding_boxes): Draw one or more boxes on a
+- draw_bounding_box: Draw one or more boxes on a
 frame, each given as {box: [y_min, x_min, y_max, x_max], label}, to visually
 check spatial predictions before you rely on them.
 
-- draw_point(timestamp, points): Draw one or more points on a frame, each given
+- draw_point: Draw one or more points on a frame, each given
 as {point: [x, y], label}, to visually check point coordinate predictions before
 you rely on them.
+
+- read_image(image_path): Look directly at a standalone image FILE at an absolute
+path (e.g. a screenshot/chart/frame you saved via the bash tool). For frames of
+the video itself use grab_frames instead.
         """
         escalation_ladder += """
 Escalation ladder: overview → search_clip (locate) → focus_clip (understand) →
@@ -53,7 +60,26 @@ Escalation ladder: overview → search_clip (locate) → focus_clip (understand)
 annotate_frames (only if the answer requires coordinates). Only descend as far as the
 question actually requires."""
     
-    tool_prompt = f"{tool_prompt}\n{escalation_ladder}"
+    other_videos_prompt = """
+## Working with other videos
+Every video tool (search_clip, focus_clip, grab_frames, draw_bounding_box,
+draw_point) takes an optional `video_path`. Omit it to work on the session's
+initial video (referred to by `video_id`). To analyze a DIFFERENT video, pass the
+ABSOLUTE path of a local video file as `video_path` — the tool then reads that
+file instead, and its timestamps are that file's own timeline.
+"""
+
+    artifact_prompt = ""
+    if settings.s3_bucket:
+        artifact_prompt = """
+## Sharing files with the user
+- upload_artifact(path): Upload a file you produced (e.g. a report, rendered clip,
+chart, or extracted data written via the bash tool) to S3 and get back an s3://
+path and a presigned download URL. Use it when the user should be able to download
+a deliverable — then include the returned URL in your answer.
+"""
+
+    tool_prompt = f"{tool_prompt}\n{escalation_ladder}\n{other_videos_prompt}\n{artifact_prompt}"
 
     return (f"""
 You are a helpful video research assistant that can perform tasks and answer questions about a long video. 

@@ -1,8 +1,8 @@
 import tenacity
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import make_video_tools
+from ambient.tools.video_backend import resolve_video_tools
 from ambient.utils.s3 import get_s3_client
 import asyncio
 from pydantic import BaseModel, Field
@@ -20,6 +20,7 @@ class BoundingBox(BaseModel):
 
 class DrawBoundingBoxTool(BaseModel):
     video_id: str = Field(description="The id of the video to search the clip from.")
+    video_path: Optional[str] = Field(default=None, description="Absolute path to a local video file whose frame to annotate instead of the session's initial video (e.g. one you downloaded via the bash tool into the workspace). Leave empty to use the initial video.")
     frame_timestamp: float = Field(
         description="The global timestamp of the frame to draw the bounding box(es) on in seconds."
     )
@@ -37,10 +38,11 @@ async def draw_bounding_box(
     video_id: str,
     frame_timestamp: float,
     bounding_boxes: List[Dict],
+    video_path: Optional[str] = None,
 ) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
-    video_tools = make_video_tools(
-        video_id, max_frame_dimention=provider_quality_settings.max_dimentions
+    video_tools = resolve_video_tools(
+        video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions
     )
     user_message_contents = []
     annotated = None

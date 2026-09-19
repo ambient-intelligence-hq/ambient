@@ -1,17 +1,14 @@
 import asyncio
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 import uuid
 from typing import Optional
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from ambient.config import settings
+from ambient.config import get_model_modalities, settings
 from ambient.llm import get_provider_params , video_to_data_url
-from ambient.prompt import SYSTEM_PROMPT
+from ambient.prompt import get_system_prompt
 from ambient.tools import TOOL_REGISTRY, TOOLS
 from ambient.tools import video_description as _video_description
 import inspect
@@ -283,6 +280,42 @@ async def _send_request(
 # Agent loop
 # ---------------------------------------------------------------------------
 
+def _resolve_output_schema(output_structure) -> Optional[dict]:
+    """Normalize `output_structure` to a JSON Schema dict or None.
+
+    Accepts a pydantic model class (harness/notebook callers) or a plain JSON
+    Schema dict (the CLI's --schema file). None -> no schema constraint.
+    """
+    if output_structure is None:
+        return None
+    model_json_schema = getattr(output_structure, "model_json_schema", None)
+    if callable(model_json_schema):
+        return model_json_schema()
+    if isinstance(output_structure, dict):
+        return output_structure
+    raise TypeError(
+        "output_structure must be a pydantic model, a JSON Schema dict, or None"
+    )
+
+
+def _trajectory_dir() -> str:
+    """Where run trajectories are written.
+
+    Defaults under the user's data dir so a pip/uvx install (whose package dir is
+    read-only) still works; overridable via AMBIENT_TRAJECTORY_DIR. Falls back to
+    the repo-local ambient/trajectories/ when running from a writable checkout.
+    """
+    env_dir = os.environ.get("AMBIENT_TRAJECTORY_DIR")
+    if env_dir:
+        return env_dir
+    pkg_dir = os.path.join(os.path.dirname(__file__), "trajectories")
+    if os.path.isdir(pkg_dir) and os.access(pkg_dir, os.W_OK):
+        return pkg_dir
+    return os.path.join(
+        os.path.expanduser("~"), ".local", "share", "ambient", "trajectories"
+    )
+
+
 def _trajectory_filename(video_id: str, question: str) -> str:
     questions_gist = "_".join(question.split()[:5]).lower()
     return f"trajectory_{video_id}_{questions_gist}_{uuid.uuid4().hex[:8]}.json"
@@ -322,17 +355,29 @@ async def run_agent(
         with open(subtitle_path, "r") as f:
             _video_description._TRANSCRIPT = f.read()
 
+    modalities = [m.value for m in get_model_modalities(model)]
+    system_prompt = get_system_prompt(modalities)
+
+    # output_structure is optional and may be a pydantic model class or a plain
+    # JSON Schema dict (the CLI loads --schema from a file as a dict). Only append
+    # the schema instruction when one was supplied.
+    schema = _resolve_output_schema(output_structure)
+    schema_clause = (
+        f", Your final answer should strictly follow the schema: {schema}"
+        if schema else ""
+    )
+
     messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": f"Video id: {video_id},Video Description: {video_description if video_description else ''}, question to answer: {question}, Your final answer should strictly follow the schema: {output_structure.model_json_schema()}"}
+                {"type": "text", "text": f"Video id: {video_id},Video Description: {video_description if video_description else ''}, question to answer: {question}{schema_clause}"}
             ],
         },
     ]
 
-    trajectory_dir = os.path.join(os.path.dirname(__file__), "trajectories")
+    trajectory_dir = _trajectory_dir()
     os.makedirs(trajectory_dir, exist_ok=True)
     trajectory_file = os.path.join(trajectory_dir, _trajectory_filename(video_id, question))
     trajectory: dict = {

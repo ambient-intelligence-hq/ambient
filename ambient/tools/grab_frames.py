@@ -1,8 +1,8 @@
 import tenacity
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import make_video_tools
+from ambient.tools.video_backend import resolve_video_tools
 from ambient.utils.s3 import get_s3_client
 from ambient.llm import video_to_data_url
 import asyncio
@@ -16,6 +16,7 @@ ENABLE_RETURN_CITATION_IMAGES = False
 
 class GrabFramesTool(BaseModel):
     video_id: str = Field(description="The id of the video to search the clip from.")
+    video_path: Optional[str] = Field(default=None, description="Absolute path to a local video file to grab frames from instead of the session's initial video (e.g. one you downloaded via the bash tool into the workspace). Leave empty to use the initial video.")
     start_time: float = Field(description="The start time of the clip in seconds.")
     end_time: float = Field(
         description="The end time of the clip to search in seconds. The end time should be within 5 mins from the start_time."
@@ -31,10 +32,11 @@ async def grab_frames(
     video_id: str,
     start_time: float,
     end_time: float,
+    video_path: Optional[str] = None,
 ) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
-    video_tools = make_video_tools(
-        video_id, max_frame_dimention=provider_quality_settings.max_dimentions
+    video_tools = resolve_video_tools(
+        video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions
     )
     user_message_contents = []
 

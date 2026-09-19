@@ -18,7 +18,7 @@ is y-first ([y_min, x_min, ...]) while this point is x,y.
 import tenacity
 from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import make_video_tools
+from ambient.tools.video_backend import resolve_video_tools
 from pydantic import BaseModel, Field
 
 # Half-size of the marker square, in 0-1000 grid units (~2.4% of the frame edge).
@@ -39,6 +39,7 @@ class Point(BaseModel):
 
 class DrawPointTool(BaseModel):
     video_id: str = Field(description="The id of the video containing the frame.")
+    video_path: Optional[str] = Field(default=None, description="Absolute path to a local video file whose frame to mark instead of the session's initial video (e.g. one you downloaded via the bash tool into the workspace). Leave empty to use the initial video.")
     frame_timestamp: float = Field(
         description="The global timestamp of the frame to mark, in seconds."
     )
@@ -61,6 +62,7 @@ async def draw_point(
     video_id: str,
     frame_timestamp: float,
     points: List[Dict],
+    video_path: Optional[str] = None,
 ) -> tuple[List[dict], List[Dict]]:
     if not points:
         return ([{"error": "points must be a non-empty list of {point, label}"}], [])
@@ -97,8 +99,8 @@ async def draw_point(
         return (errors, [])
 
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
-    video_tools = make_video_tools(
-        video_id, max_frame_dimention=provider_quality_settings.max_dimentions
+    video_tools = resolve_video_tools(
+        video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions
     )
 
     annotated: Optional[dict] = None

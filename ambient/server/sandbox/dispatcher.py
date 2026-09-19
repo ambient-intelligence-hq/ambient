@@ -112,11 +112,14 @@ class ToolDispatcher:
                 tool_input["video_id"] = self.session_video_id
             video_id = tool_input.get("video_id")
 
-            # Inject the cached video description for tools that accept it.
+            # Inject the cached video description for tools that accept it. Skip it
+            # when the call targets an external video_path: the cached description is
+            # the session (initial) video's and would be wrong for another video.
             if name != "get_video_description":
                 if (
                     "video_description" in func_args
                     and video_id
+                    and not tool_input.get("video_path")
                     and self._video_description.get(video_id)
                     and "video_description" not in tool_input
                 ):

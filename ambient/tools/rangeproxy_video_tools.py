@@ -45,16 +45,22 @@ class RangeProxyVideoFrameTools:
     _LOCAL_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi")
 
     def __init__(self, video_id: str, max_frame_dimention: Optional[int] = None,
-                 duration: Optional[float] = None) -> None:
+                 duration: Optional[float] = None, source_path: Optional[str] = None) -> None:
         self.video_id = video_id
         self.max_dim = int(max_frame_dimention or settings.analysis_max_dim or 768)
         # Duration is probed + persisted at ingest; when the caller passes it we skip
         # the probe. None -> probe_duration() resolves it lazily (local/faststart).
         self._duration_sec: Optional[float] = duration
+        # Explicit host source file (external-video path). When set it wins over
+        # video_id resolution (local cache / S3), so ffmpeg reads it directly.
+        self._source_path: Optional[str] = source_path
 
     def _local_source(self) -> Optional[str]:
         """Locally-cached source file if present on this host (store_video writes it).
-        Reading from disk avoids HTTP entirely and keeps seeks fast even moov-at-end."""
+        Reading from disk avoids HTTP entirely and keeps seeks fast even moov-at-end.
+        An explicit `source_path` (external video) always takes precedence."""
+        if self._source_path:
+            return self._source_path
         for ext in self._LOCAL_EXTS:
             p = os.path.join(settings.video_folder, f"{self.video_id}{ext}")
             if os.path.exists(p) and os.path.getsize(p) > 0:

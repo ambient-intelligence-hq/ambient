@@ -106,6 +106,19 @@ class Settings(BaseSettings):
     bash_timeout_seconds: int = 120           # per-command wall clock before SIGKILL
     bash_max_output_bytes: int = 20000        # stdout/stderr each truncated to this
     bash_cwd: str | None = None               # host working dir; None -> video_folder
+    # External-video support: the agent may point the video tools at another video
+    # by passing an absolute `video_path` (e.g. one it downloaded via the bash tool).
+    # Paths are confined to these roots. Host paths (range proxy) are validated to
+    # exist and live under a host root; box paths (e2b, inside the sandbox) are
+    # prefix-checked against the box roots (existence is checked in-box). Comma-sep;
+    # host roots default to [video_folder, bash_cwd, tempdir] plus any listed here.
+    external_video_allowed_roots: str = ""              # extra host roots (comma-sep)
+    # upload_artifact: exfiltrate a file the agent produced (in the e2b sandbox or on
+    # the host) to S3 and hand back an s3:// path + presigned download URL. Available
+    # whenever S3 is configured (s3_bucket set); objects are keyed under
+    # artifacts/<video_id>/. Host uploads are confined to the external-video roots.
+    artifact_url_ttl_seconds: int = 604800   # presigned download-URL lifetime (7d, SigV4 max)
+    artifact_max_size_mb: int = 1024         # reject uploads larger than this
     sandbox_cpu_seconds: int = 600
     sandbox_memory_mb: int = 4096
     sandbox_wall_seconds: int = 1800

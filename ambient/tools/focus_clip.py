@@ -1,9 +1,9 @@
 import logging
 import asyncio
 import aiohttp
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import make_video_tools
+from ambient.tools.video_backend import resolve_video_tools
 from ambient.utils.s3 import get_s3_client
 from ambient.llm import llm_call
 from ambient.tools.citations import (
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 class FocusClipTool(BaseModel):
     video_id: str = Field(description="The id of the video to focus the clip from.")
+    video_path: Optional[str] = Field(default=None, description="Absolute path to a local video file to focus instead of the session's initial video (e.g. one you downloaded via the bash tool into the workspace). Leave empty to use the initial video.")
     start_time: float = Field(
         description="The start time of the clip to focus in seconds."
     )
@@ -30,11 +31,12 @@ class FocusClipTool(BaseModel):
 
 
 async def focus_clip(
-    video_id: str, start_time: float, end_time: float, video_description: str = None
+    video_id: str, start_time: float, end_time: float, video_description: str = None,
+    video_path: Optional[str] = None,
 ) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
-    video_tools = make_video_tools(
-        video_id, max_frame_dimention=provider_quality_settings.max_dimentions
+    video_tools = resolve_video_tools(
+        video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions
     )
 
     from ambient.tools.clip_media import produce_window_media

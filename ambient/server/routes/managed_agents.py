@@ -506,7 +506,7 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
         try:
             # fast mode or self-video-analysis (vision-capable agent model) does not
             # need a pre-booted sandbox.
-            if (not self_video_analysis_enabled(record.get("model"))) and (not record.get("mode") == "fast"):
+            if (not record.get("mode") == "fast"):
                 await runner.start_sandbox()
             await store.update_session(record["session_id"], lambda r: {
                 **r, "status": "ready",
