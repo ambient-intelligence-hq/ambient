@@ -500,6 +500,12 @@ class UploadSourceResult(BaseModel):
     size_bytes: int
 
 
+class EnsureSourceResult(BaseModel):
+    video_id: str
+    path: str
+    size_bytes: int
+
+
 class ResultError(BaseModel):
     code: str
     message: str
@@ -1304,6 +1310,26 @@ def cmd_upload_source(args: argparse.Namespace) -> None:
     ))
 
 
+def cmd_ensure_source(args: argparse.Namespace) -> None:
+    """Force the source to exist as a LOCAL file in the box, downloading from S3
+    if it isn't cached (a no-op if it already is). Returns {path}.
+
+    The media tools stream the source via presigned range reads, so it may never
+    touch disk. Raw shell / ffmpeg (the bash tool) needs a real file, so the model
+    calls this on demand to materialize it, then reads the returned path.
+    """
+    s3 = _make_s3_client()
+    if s3 is None:
+        emit(error=ResultError(code="S3NotConfigured", message="S3 is required for ensure-source"))
+        return
+    local_path = _download_source_local(s3, args.video_id)  # cache hit -> no re-download
+    emit(data=EnsureSourceResult(
+        video_id=args.video_id,
+        path=local_path,
+        size_bytes=os.path.getsize(local_path),
+    ))
+
+
 def cmd_prepare_youtube(args: argparse.Namespace) -> None:
     start_download_time = time.time()
     print(f"[youtube] preparing {args.url}", file=sys.stderr)
@@ -1917,6 +1943,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_us = sub.add_parser("upload-source", help="Upload the already-downloaded local source MP4 to S3")
     p_us.add_argument("--video-id", required=True, help="Video ID whose local source to upload")
     p_us.set_defaults(func=cmd_upload_source)
+
+    # ── ensure-source ─────────────────────────────────────────────────────────
+    p_es = sub.add_parser("ensure-source", help="Download the source to a local file in the box (for bash/ffmpeg) and print its path")
+    p_es.add_argument("--video-id", required=True, help="Video ID to materialize into VIDEO_FOLDER")
+    p_es.set_defaults(func=cmd_ensure_source)
 
     # ── transcode-tiles ──────────────────────────────────────────────────────
     p_tt = sub.add_parser("transcode-tiles", help="Transcode the whole video into fixed target-quality tiles + manifest (ingestion)")
