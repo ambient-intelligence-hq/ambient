@@ -220,13 +220,43 @@ class SessionRunner:
             system = f"{system}\n\n## Task\n{self.agent_system}"
         return [{"role": "system", "content": system}]
     
-    def _video_source_path(self, rec: dict | None) -> Optional[str]:
+    def _video_source_hint(self, rec: dict | None) -> Optional[str]:
+        """Seed blurb telling the model where the video lives and how to get a
+        local copy if it needs one for shell/ffmpeg (the bash tool).
+
+        The video *tools* resolve by video_id and never need this, so it's only
+        emitted when the bash tool is enabled. For e2b the source may be streamed
+        (not on disk), so we share the cache folder + the S3 location + the exact
+        command to materialize it on demand — rather than advertising a path that
+        may not exist. For the host backend the file is always local, so we hand
+        over the path directly."""
+        if not settings.enable_bash_tool:
+            return None
         ext = os.path.splitext((rec or {}).get("local_path") or (rec or {}).get("r2_key") or "")[1] or ".mp4"
         if self.backend == "e2b":
-            # mirrors resolve_video_source(): <box_folder>/<id>/<id><ext>
-            return f"{settings.box_video_folder}/{self.video_id}/{self.video_id}{ext}"
-        lp = (rec or {}).get("local_path")           # host: exact path the store wrote
-        return lp if lp and os.path.exists(lp) else None
+            folder = f"{settings.box_video_folder}/{self.video_id}"
+            lines = [
+                "Video source (E2B sandbox):",
+                f"- Local cache folder: {folder}/ — check here first for {self.video_id}{ext}.",
+                f"- If it is not there, the source is being streamed from S3. To get a local "
+                f"file for ffmpeg/shell, run: `python /app/main.py ensure-source --video-id "
+                f"{self.video_id}` — it downloads the source and prints the local path. Only "
+                f"do this if you actually need the file on disk.",
+            ]
+            if settings.s3_bucket:
+                lines.append(
+                    f"- S3 source: s3://{settings.s3_bucket}/{settings.s3_video_base_key}/{self.video_id}{ext}"
+                )
+            return "\n".join(lines)
+        # Host backend: the file is always on disk (store_video writes it, or the
+        # range proxy convention). Hand over the path + folder; no download needed.
+        lp = (rec or {}).get("local_path") or os.path.join(settings.video_folder, f"{self.video_id}{ext}")
+        if os.path.exists(lp):
+            return (
+                f"Video source (host): {lp} — already on disk, use it directly; do NOT "
+                f"search the filesystem for it.\n- Video folder: {settings.video_folder}"
+            )
+        return None
         
 
     async def start_sandbox(self) -> None:
@@ -252,7 +282,8 @@ class SessionRunner:
         # Resolve the video description in the background: the session is ready to
         # take input as soon as the sandbox boots. `_run_until_done` injects the
         # description into the conversation once it lands.
-        self._maybe_start_description()
+        if not self_video_analysis_enabled(self.model):
+            self._maybe_start_description()
 
         boot_ms = int((time.monotonic() - t0) * 1000)
         await self._emit("session.status_changed", {
@@ -311,7 +342,8 @@ class SessionRunner:
         sid = (sandbox_rec or {}).get("id")
         if self.backend != "e2b":
             self.sandbox_id = sid or f"ip_{uuid.uuid4().hex[:12]}"
-            self._maybe_start_description()
+            if not self_video_analysis_enabled(self.model):
+                self._maybe_start_description()
             return
         if not sid:
             raise SandboxNotReady(self.session_id)
@@ -325,7 +357,8 @@ class SessionRunner:
         # A rehydrated worker may pick up a session whose description never landed
         # (creator died mid-boot); resolve it here unless it's already in the
         # persisted conversation.
-        self._maybe_start_description()
+        if not self_video_analysis_enabled(self.model):
+            self._maybe_start_description()
 
     async def terminate(self) -> None:
         if self._description_task and not self._description_task.done():
@@ -809,8 +842,7 @@ class SessionRunner:
     async def _build_seed_text(self, attach_video_description: bool = False) -> str:
         """First-turn context. Uses the full description if it's already resolved,
         otherwise a metadata-only seed so the turn never blocks on ingestion."""
-        if self.video_description:
-            return f"Video id: {self.video_id}, Description: {self.video_description}"
+        
         title = duration = None
         try:
             rec = await self.store.get_file(self.video_id)
@@ -839,13 +871,16 @@ class SessionRunner:
             f"Duration: {duration if duration is not None else 'unknown'} seconds\n"   
         )
 
+        if self.video_description:
+            seed_text += f"\nDescription: {self.video_description}\n\n"
+
         if attach_video_description:
             seed_text += "Note: a detailed video description is being generated in the background and will be provided in a later message. You can use your video tools immediately." + "\n"
         
-        video_path = self._video_source_path(await self.store.get_file(self.video_id))
-        if video_path:
-            seed_text += f"\nVideo file path: {video_path}\n"
-        
+        source_hint = self._video_source_hint(await self.store.get_file(self.video_id))
+        if source_hint:
+            seed_text += f"\n{source_hint}\n"
+
         return seed_text
 
 
