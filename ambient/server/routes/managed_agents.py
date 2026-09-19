@@ -505,8 +505,8 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
     async def _boot() -> None:
         try:
             # fast mode or self-video-analysis (vision-capable agent model) does not
-            # need a pre-booted sandbox.
-            if (not record.get("mode") == "fast"):
+            # need a pre-booted sandbox. and only if backend is e2b
+            if (not record.get("mode") == "fast") and settings.sandbox_backend == "e2b":
                 await runner.start_sandbox()
             await store.update_session(record["session_id"], lambda r: {
                 **r, "status": "ready",
