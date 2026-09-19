@@ -35,7 +35,7 @@ load_dotenv()
 
 DEFAULT_BASE_URL = os.getenv("AMBIENT_BASE_URL", "http://127.0.0.1:8080")
 DEFAULT_API_KEY = os.getenv("AMBIENT_API_KEY", "dev-token")
-DEFAULT_MODEL = os.getenv("AMBIENT_AGENT_MODEL", "z-ai/glm-5.2")
+DEFAULT_MODEL = os.getenv("AGENT_MODEL", "openai/gpt-5.6-sol")
 DEFAULT_SYSTEM = "Analyze videos and answer questions about them with citations."
 
 SANDBOX_BOOT_TIMEOUT_S = 90

@@ -9,7 +9,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_BOX_VIDEO_FOLDER = "/tmp/videos"
+_BOX_VIDEO_FOLDER = settings.box_video_folder
 RESULT_SENTINEL = "===AMBIENT_RESULT==="
 _SENTINEL_RE = re.compile(re.escape(RESULT_SENTINEL) + r"(.*?)" + re.escape(RESULT_SENTINEL), re.S)
 
@@ -47,6 +47,7 @@ def _media_env() -> dict[str, str]:
         "SOURCE_URL_TTL": str(settings.source_url_ttl),
         "STREAM_MIN_BYTES": str(settings.stream_min_bytes),
         "OVERVIEW_SEEK_CONCURRENCY": str(settings.overview_seek_concurrency),
+        "YOUTUBE_MAX_HEIGHT": str(settings.youtube_max_height),
         "YOUTUBE_MAX_DURATION_SECONDS": str(settings.youtube_max_duration_seconds),
         "YOUTUBE_MAX_SIZE_BYTES": str(settings.youtube_max_size_bytes),
         "YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS": str(settings.youtube_download_timeout_seconds),
@@ -122,6 +123,30 @@ class E2BMediaSandbox(MediaSandbox):
                 # CommandExitException.
                 return _parse_envelope(exc.stdout, exc.stderr, exc.exit_code)
         return _parse_envelope(res.stdout, res.stderr, res.exit_code)
+
+    def run_shell(self, command: str, timeout: int | None = None) -> dict:
+        """Run a raw shell command inside the sandbox (bash tool, e2b backend).
+
+        Unlike `run`, which invokes the media CLI (`python /app/main.py …`), this
+        passes `command` straight to the box's shell. Returns
+        {stdout, stderr, exit_code}; a non-zero exit still returns cleanly rather
+        than raising."""
+        if self.sandbox is None:
+            raise RuntimeError("Sandbox not created or killed")
+        from e2b.sandbox.commands.command_handle import CommandExitException
+
+        with self._sem:
+            self.sandbox.set_timeout(self._keepalive_secs)
+            try:
+                res = self.sandbox.commands.run(
+                    command,
+                    envs=self.envs,
+                    cwd="/app",
+                    timeout=int(timeout or _CMD_TIMEOUT_SECS),
+                )
+            except CommandExitException as exc:
+                return {"stdout": exc.stdout, "stderr": exc.stderr, "exit_code": exc.exit_code}
+        return {"stdout": res.stdout, "stderr": res.stderr, "exit_code": res.exit_code}
 
     def kill(self) -> None:
         try:

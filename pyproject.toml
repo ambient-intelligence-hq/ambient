@@ -1,32 +1,50 @@
 [project]
-name = "ambient-db"
+name = "ambient-video"
 version = "0.1.0"
-description = "Add your description here"
+description = "Video-understanding agent: ask questions about long videos and get cited answers."
 readme = "README.md"
 requires-python = ">=3.13"
+# Core covers both the `ambient` CLI and the HTTP server. Only the heavy ML/vector
+# deps (torch/torchcodec/datasets/pymilvus/sqlite-vec) and the optional e2b backend
+# live in extras below, so `uvx ambient-video` (CLI) installs in seconds without
+# pulling gigabytes of torch — while `uv sync` still gives a working server.
 dependencies = [
     "aiohttp>=3.10",
     "anthropic>=0.111.0",
     "asyncpg>=0.31.0",
     "boto3>=1.42.73",
-    "datasets>=5.0.0",
-    "e2b>=2.25.1",
     "fastapi>=0.115",
     "httpx>=0.28",
+    "pillow>=10",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.13.1",
-    "pymilvus[milvus-lite]>=2.6.10",
+    "python-dotenv>=1.0",
     "python-multipart>=0.0.32",
     "redis>=8.0.0",
     "rich>=13.9",
     "setuptools<81",
-    "sqlite-vec>=0.1.7",
     "sse-starlette>=2.1",
     "tenacity>=9.1.4",
-    "torch>=2.13.0",
-    "torchcodec>=0.14.0",
     "typer>=0.15",
     "uvicorn[standard]>=0.32",
+]
+
+[project.scripts]
+ambient = "ambient.cli:app"
+
+[project.optional-dependencies]
+# Fetch YouTube / http(s) URLs from the CLI.
+youtube = ["yt-dlp"]
+# Accelerated local frame decode (decord/torchcodec). ffmpeg covers the media
+# path without these; this only speeds up frame decode on long videos.
+accel = ["torch>=2.13.0", "torchcodec>=0.14.0"]
+# E2B media sandbox backend (SANDBOX_BACKEND=e2b).
+e2b = ["e2b>=2.25.1"]
+# Vector store + dataset tooling used by benchmarks/embedding, not the agent path.
+bench = [
+    "datasets>=5.0.0",
+    "pymilvus[milvus-lite]>=2.6.10",
+    "sqlite-vec>=0.1.7",
 ]
 
 [build-system]

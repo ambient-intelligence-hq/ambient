@@ -1,4 +1,5 @@
 import base64
+import contextvars
 from typing import List , Optional
 import os
 from ambient.config import settings
@@ -11,11 +12,70 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Per-call sink for LLM token usage. When a caller (e.g. the tool dispatcher) sets
+# this to a list, every `llm_call` in that context appends a normalized usage
+# record {model, usage} to it. `asyncio.to_thread` copies the context into the
+# worker thread, so tool LLM calls running off-thread still report back into the
+# same list object. None (the default) means "don't collect".
+usage_sink: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "llm_usage_sink", default=None
+)
+
+
+def normalize_usage(raw: Optional[dict]) -> dict:
+    """Map an OpenAI/OpenRouter chat-completions `usage` block onto the ATIF-style
+    token fields used across the session (input/output/cache/total).
+
+    OpenRouter also reports the actual `cost` (USD) and cache details when the
+    request opts in (`usage: {include: true}` / `stream_options.include_usage`);
+    we carry `cost` through when present so callers can prefer it over estimation.
+    """
+    raw = raw or {}
+    prompt_details = raw.get("prompt_tokens_details") or {}
+    cache_read = int(
+        prompt_details.get("cached_tokens")
+        or raw.get("cache_read_input_tokens")
+        or raw.get("prompt_cache_hit_tokens")
+        or 0
+    )
+    cache_write = int(
+        prompt_details.get("cache_write_tokens")
+        or raw.get("cache_creation_input_tokens")
+        or 0
+    )
+    input_tokens = int(raw.get("prompt_tokens") or raw.get("input_tokens") or 0)
+    output_tokens = int(raw.get("completion_tokens") or raw.get("output_tokens") or 0)
+    total = int(raw.get("total_tokens") or (input_tokens + output_tokens))
+    norm = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        "total_tokens": total,
+    }
+    # Provider-reported cost (OpenRouter). None when the provider didn't report it.
+    if raw.get("cost") is not None:
+        try:
+            norm["cost"] = float(raw["cost"])
+        except (TypeError, ValueError):
+            pass
+    return norm
+
+
+def _record_usage(model: str, raw_usage: Optional[dict]) -> None:
+    # Store the provider's raw usage block; the consumer (runner) normalizes it
+    # once so cost/token extraction stays in one place.
+    sink = usage_sink.get()
+    if sink is None or not raw_usage:
+        return
+    sink.append({"model": model, "usage": raw_usage})
+
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 def is_retryable_exception(exc: BaseException) -> bool:
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError)):
+        print(f"LLM call failed, Retryable exception: {exc}")
         return True
     if isinstance(exc, aiohttp.ClientResponseError):
         return exc.status in RETRYABLE_STATUS_CODES
@@ -103,19 +163,23 @@ def construct_payload(clips: Optional[List[Clip]] = None, frames: Optional[List[
 
 
 def get_provider_params(model: str, base_url: str) -> dict:
-    if "gemini" in model.lower() and "openrouter" in base_url.lower():
-        return {
-            "provider": {
-                "only": ["google-ai-studio"],
-            },
-        }
-    
-    # if "qwen3.5-35b-a3b" in model.lower() and "openrouter" in base_url.lower():
-    #     return {
-    #         "provider": {
-    #             "only": ["atlas-cloud/fp8"],
-    #         },  
-    #     }
+    """OpenRouter provider-routing params for `model`, from the preferred-provider
+    lookup (``artifacts/openrouter_providers.json`` via
+    ``config.get_openrouter_route``).
+
+    Pins the maintained upstream with ``provider.only`` so a model always lands on
+    the same vetted provider — on OpenRouter the frame budget and image-block cap are
+    a per-upstream lottery otherwise (same model id, 69->1083 frames across upstreams;
+    see findings.md). Returns ``{}`` to auto-route when the model has no preferred
+    provider, and for non-OpenRouter endpoints.
+    """
+    if "openrouter" not in (base_url or "").lower():
+        return {}
+    from ambient.config import get_openrouter_route
+
+    provider = get_openrouter_route(model).get("provider")
+    if provider:
+        return {"provider": {"only": [provider]}}
     return {}
 
 
@@ -136,10 +200,18 @@ async def llm_call(
     video_frames: Optional[List[Frame]] = None,
     reasoning_enabled: bool = True,
     max_tokens: Optional[int] = None,
+    response_format: Optional[dict] = None,
 ) -> BaseModel:
     payload = construct_payload(video_clips,video_frames)
-    
+
     provider_params = get_provider_params(model, base_url)
+    # Native structured outputs: when a response_format (json_schema) is set, also
+    # tell OpenRouter to only route to providers that actually honor it, so we
+    # don't silently land on one that ignores the schema.
+    if response_format:
+        prov = dict(provider_params.get("provider") or {})
+        prov["require_parameters"] = True
+        provider_params = {**provider_params, "provider": prov}
     # print(payload)
     logger.info(f"Making LLM call to model {model} with {len(payload)} items")
     async with aiohttp.ClientSession(
@@ -168,7 +240,11 @@ async def llm_call(
                     },
                 ],
                 "reasoning": {"enabled": reasoning_enabled},
+                # Opt into OpenRouter usage accounting so tool LLM calls report
+                # token counts + actual cost (picked up by the usage sink).
+                "usage": {"include": True},
                 **({"max_tokens": max_tokens} if max_tokens else {}),
+                **({"response_format": response_format} if response_format else {}),
                 **provider_params,
             },
         ) as response:
@@ -188,4 +264,5 @@ async def llm_call(
             except Exception as e:
                 print(f"Error: {e} {await response.text()}")
                 raise e
+            _record_usage(settings.llm_model, response_json.get("usage"))
             return response_json

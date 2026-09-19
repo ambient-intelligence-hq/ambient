@@ -1,9 +1,9 @@
 import logging
 import asyncio
 import aiohttp
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import make_video_tools
+from ambient.tools.video_backend import resolve_video_tools
 from ambient.utils.s3 import get_s3_client
 from ambient.llm import llm_call
 from ambient.tools.citations import (
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 class FocusClipTool(BaseModel):
     video_id: str = Field(description="The id of the video to focus the clip from.")
+    video_path: Optional[str] = Field(default=None, description="Absolute path to a local video file to focus instead of the session's initial video (e.g. one you downloaded via the bash tool into the workspace). Leave empty to use the initial video.")
     start_time: float = Field(
         description="The start time of the clip to focus in seconds."
     )
@@ -30,27 +31,32 @@ class FocusClipTool(BaseModel):
 
 
 async def focus_clip(
-    video_id: str, start_time: float, end_time: float, video_description: str = None
+    video_id: str, start_time: float, end_time: float, video_description: str = None,
+    video_path: Optional[str] = None,
 ) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
-    video_tools = make_video_tools(
-        video_id, max_frame_dimention=provider_quality_settings.max_dimentions
+    video_tools = resolve_video_tools(
+        video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions
     )
 
-    # Returns one or more clips on a single continuous 0-based timeline plus the
-    # window's global start (clip_start). When a size cap is set and the video is
-    # tiled, the covering tiles come back as separate (already-small) clips; the
-    # model still reads them as one clip and cites mm:ss within the window.
-    clips, clip_start = await video_tools.fetch_clips(
-        start_time,
-        end_time,
-        fps=provider_quality_settings.fps,
-        crf=provider_quality_settings.crf,
-        max_size_mb=provider_quality_settings.max_size_mb,
-    )
+    from ambient.tools.clip_media import produce_window_media
+
+    # media_plan decides video-clips vs image-frames for this window (frames only
+    # where the endpoint can't control a video's frame count). Returns the window's
+    # global start (clip_start) for mapping the sub-model's citations back. Clips
+    # ride a single 0-based timeline; the model reads them as one clip and cites
+    # mm:ss within the window.
+    kind, media, clip_start, _plan = await produce_window_media(
+        video_tools, "focus_clip", start_time, end_time)
+    clips = media if kind == "clips" else None
+    frames = media if kind == "frames" else None
+
+    print(f"[Tool call] focus_clip: kind: {kind} , media_count: {len(media)} , clip_start: {clip_start} , _plan: {_plan}")
+
     # The e2b backend already uploaded clips and set clip_url; only the local
-    # backend returns local files that still need uploading.
-    for clip in clips:
+    # backend returns local files that still need uploading. (Frames come back
+    # already inlined/uploaded by the backend.)
+    for clip in (clips or []):
         if clip.clip_url is None:
             if settings.inline_clips:
                 # No S3: leave clip_url unset so construct_payload embeds the clip
@@ -73,6 +79,7 @@ async def focus_clip(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             video_clips=clips,
+            video_frames=frames,
             timeout=120,
         )
 
@@ -111,15 +118,16 @@ async def focus_clip(
         description = description.strip()
 
     citations = _extract_temporal_citations(description)
-    # clip_start is the window's global start (clips are labelled window-local, and
-    # may be snapped to tile boundaries), so the model's local mm:ss citations map
-    # to absolute video time by adding it.
+    # Clips are labelled window-local (and may be snapped to tile boundaries), so
+    # their citations need clip_start added. Frames are labelled with absolute
+    # video timestamps already -> no offset.
+    citation_offset = 0.0 if kind == "frames" else clip_start
     if ENABLE_RETURN_CITATION_IMAGES:
         user_message_contents = _build_user_message_contents_from_citations(
-            video_tools, citations, clip_start, end_time
+            video_tools, citations, citation_offset, end_time
         )
 
-    description = _replace_citations_with_global_video_timestamps(description, citations, clip_start)
+    description = _replace_citations_with_global_video_timestamps(description, citations, citation_offset)
     return description, user_message_contents
 
 

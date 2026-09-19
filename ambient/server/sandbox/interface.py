@@ -38,6 +38,11 @@ class MediaSandbox(Protocol):
     def run(self, argv: list[str]) -> dict:
         pass
 
+    def run_shell(self, command: str, timeout: Optional[int] = None) -> dict:
+        # Run a raw shell command inside the sandbox. Returns
+        # {stdout, stderr, exit_code}. Used by the bash tool (e2b backend).
+        pass
+
     def kill(self) -> None:
         pass
 

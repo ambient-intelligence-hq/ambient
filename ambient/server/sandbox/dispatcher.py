@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Optional
 
 from ambient.server.sandbox.interface import ToolEvent
 from ambient.tools.video_backend import current_media_box
+from ambient.llm import usage_sink
 
 
 def _run_tool_blocking(func, tool_input: dict[str, Any]) -> Any:
@@ -59,10 +60,14 @@ def _normalize_tool_result(raw: Any) -> dict[str, Any]:
 class ToolDispatcher:
     """Dispatches agent tools by name, caching the video description per video_id."""
 
-    def __init__(self) -> None:
+    def __init__(self, video_id: Optional[str] = None) -> None:
         # The per-session E2B media box, set by the runner for the "e2b" backend.
         # None for "inprocess".
         self.media_box: Optional[object] = None
+        # The session's real video_id. Forced onto every tool call so the model can't
+        # mis-supply it (some models pass a placeholder like "video" or mangle the
+        # opaque id) or target a different video.
+        self.session_video_id: Optional[str] = video_id
         # Per-session cache of the high-level video description, keyed by video_id.
         # get_video_description fills it; search_clip / focus_clip receive it as
         # `video_description` on later calls (mirrors ambient.agent.execute_tool).
@@ -90,16 +95,31 @@ class ToolDispatcher:
 
         # Publish the media box for the worker thread (to_thread copies this context).
         token = current_media_box.set(self.media_box)
+        # Collect any LLM usage this tool incurs. `to_thread` copies the context,
+        # so llm_call (running off-thread) appends into this same list object.
+        usage_records: list = []
+        usage_token = usage_sink.set(usage_records)
         try:
             tool_input = dict(input or {})
+            func_args = inspect.getfullargspec(func).args
+
+            # video_id is session state, not the model's to choose: force the session's
+            # real id onto any tool that takes one. Models sometimes pass a placeholder
+            # ("video") or mangle the opaque id (breaking source resolution), and this
+            # also stops a tool call from targeting a different video. Fall back to the
+            # model-supplied value only when we have no session id (older callers).
+            if self.session_video_id and "video_id" in func_args:
+                tool_input["video_id"] = self.session_video_id
             video_id = tool_input.get("video_id")
 
-            # Inject the cached video description for tools that accept it.
+            # Inject the cached video description for tools that accept it. Skip it
+            # when the call targets an external video_path: the cached description is
+            # the session (initial) video's and would be wrong for another video.
             if name != "get_video_description":
-                func_args = inspect.getfullargspec(func).args
                 if (
                     "video_description" in func_args
                     and video_id
+                    and not tool_input.get("video_path")
                     and self._video_description.get(video_id)
                     and "video_description" not in tool_input
                 ):
@@ -113,11 +133,16 @@ class ToolDispatcher:
                 if video_id and description:
                     self._video_description[video_id] = description
 
+            result = _normalize_tool_result(raw)
+            # Attach the LLM usage this tool incurred so the runner can attribute
+            # tool-side token/cost to the session totals.
+            if usage_records:
+                result["usage"] = list(usage_records)
             yield ToolEvent(
                 type="result",
                 tool_use_id=tool_use_id,
                 name=name,
-                data=_normalize_tool_result(raw),
+                data=result,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the runner as tool.failed
             yield ToolEvent(
@@ -132,3 +157,4 @@ class ToolDispatcher:
             )
         finally:
             current_media_box.reset(token)
+            usage_sink.reset(usage_token)

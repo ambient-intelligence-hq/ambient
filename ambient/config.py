@@ -2,7 +2,13 @@ from functools import lru_cache
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dataclasses import dataclass
+import os
+import json
+import re
+import logging
+from enum import Enum
 
+log = logging.getLogger(__name__)
 class Settings(BaseSettings):
     """
     Settings for the application. Environment variables are loaded from the .env file and overrides the default values.
@@ -35,6 +41,13 @@ class Settings(BaseSettings):
     default_agent_name: str = "Video Analyst"
     default_agent_system: str = "Analyze videos and answer with citations."
 
+    # Surface the main agent's extended-thinking/reasoning as `agent.thinking`
+    # session events (with the reasoning text attached) so clients can display it.
+    expose_thinking: bool = True
+    # Accumulate token usage + cost (main agent LLM calls and tool LLM calls) and
+    # expose it on the session resource / run.completed and per-request span events.
+    track_usage: bool = True
+
     redis_url: str = "redis://localhost:6379/0"
     database_url: str = "postgresql://ambient:ambient@localhost:5432/ambient"
     sqlite_db_path: str = "ambient_db.sqlite"
@@ -55,6 +68,7 @@ class Settings(BaseSettings):
     embedding_client: str = "gemini"
 
     video_folder: str = "/Users/logesh/self/video-llm-tests/videos"
+    box_video_folder: str = "/tmp/videos/"
     video_clip_duration: int = 60 # secs
     video_clip_fps: int = 5
     video_clip_max_dimentions: Optional[int] = 768
@@ -66,14 +80,46 @@ class Settings(BaseSettings):
     server_db_path: str = "ambient_server.sqlite"
     session_idle_ttl_seconds: int = 30 * 60
     session_hard_ttl_seconds: int = 24 * 60 * 60
-    # Selects where VideoFrameTools' media ops run:
-    #   "inprocess" -> ffmpeg/decord run locally in ambient/tools/video_tools.py
+    # Selects where the video tools' media ops run:
+    #   "inprocess" -> ffmpeg on the host, in-process, via the range proxy
+    #                  (local cached file when present, else HTTP range reads from S3/R2)
     #   "e2b"       -> media ops run in an E2B sandbox (LLM calls always stay on the host)
     sandbox_backend: str = "inprocess"
+    # Self-video-analysis (the agent model views clips itself via self_focus_clip +
+    # a whole-video context prefix, instead of delegating to a separate vision
+    # sub-model) is ON by default whenever the agent model is vision-capable. Set
+    # DISABLE_SELF_VIDEO_ANALYSIS_TOOL=1 to force the delegated (focus_clip) path.
+    # See self_video_analysis_enabled().
+    disable_self_video_analysis_tool: bool = False
     # When True, clip tools skip the S3 upload and leave clip_url unset so the LLM
     # payload embeds the local clip as a base64 data URL instead. Lets the core
     # agent run with no S3/R2 bucket (see notebooks/test_sdk.ipynb).
     inline_clips: bool = False
+
+    # Bash tool: lets the agent run shell commands (ffmpeg/ffprobe, file inspection,
+    # etc.). Selects the same backend as media tools — the per-session E2B sandbox
+    # when active, else the HOST. SECURITY: on the host backend this executes
+    # arbitrary shell with the server process's privileges and NO OS isolation, so
+    # it is OFF by default; enable only when you trust the model + prompt, and
+    # prefer the e2b backend for anything untrusted. Host runs get soft hygiene
+    # only: a timeout, an output byte cap, cwd confinement, and process-group kill.
+    enable_bash_tool: bool = True
+    bash_timeout_seconds: int = 120           # per-command wall clock before SIGKILL
+    bash_max_output_bytes: int = 20000        # stdout/stderr each truncated to this
+    bash_cwd: str | None = None               # host working dir; None -> video_folder
+    # External-video support: the agent may point the video tools at another video
+    # by passing an absolute `video_path` (e.g. one it downloaded via the bash tool).
+    # Paths are confined to these roots. Host paths (range proxy) are validated to
+    # exist and live under a host root; box paths (e2b, inside the sandbox) are
+    # prefix-checked against the box roots (existence is checked in-box). Comma-sep;
+    # host roots default to [video_folder, bash_cwd, tempdir] plus any listed here.
+    external_video_allowed_roots: str = ""              # extra host roots (comma-sep)
+    # upload_artifact: exfiltrate a file the agent produced (in the e2b sandbox or on
+    # the host) to S3 and hand back an s3:// path + presigned download URL. Available
+    # whenever S3 is configured (s3_bucket set); objects are keyed under
+    # artifacts/<video_id>/. Host uploads are confined to the external-video roots.
+    artifact_url_ttl_seconds: int = 604800   # presigned download-URL lifetime (7d, SigV4 max)
+    artifact_max_size_mb: int = 1024         # reject uploads larger than this
     sandbox_cpu_seconds: int = 600
     sandbox_memory_mb: int = 4096
     sandbox_wall_seconds: int = 1800
@@ -87,7 +133,30 @@ class Settings(BaseSettings):
     analysis_fps: int = 2
     analysis_max_dim: int = 768
     analysis_max_size_mb: int = 8
+
+    # Fast mode (single dense-frame vision pass, no tools). Thinking is left ON by
+    # default (better quality on reasoning models) with a large token budget so the
+    # reasoning trace + the final answer aren't truncated. Set
+    # `fast_disable_thinking=True` to instead force a direct answer (also sends
+    # vLLM's `chat_template_kwargs={"enable_thinking": false}`).
+    fast_max_tokens: int = 64000
+    fast_disable_thinking: bool = False
     
+
+    # Video-description generation (the high-level overview computed at ingestion).
+    # Exposed as knobs; an optional faster `description_model` is the main lever
+    # for trimming the description LLM call once the source download is off the
+    # path. Frame count is kept at 50 (do not reduce) for description quality.
+    description_max_frames: int = 50           # overview frames sent to the LLM
+    description_max_dim: int = 768             # frame longest-edge for the description
+    description_model: str | None = None       # None -> settings.llm_model
+
+    # If True, the first agent run waits (bounded) for the video description to
+    # land before its first LLM call, so the first answer is grounded in the
+    # description. Session readiness is unaffected (still ~instant); only the first
+    # run blocks. On timeout it falls back to the metadata seed + later injection.
+    first_turn_wait_for_description: bool = True
+    first_turn_description_timeout_seconds: int = 300
 
     # Background video-description ingestion. On upload we enqueue the video id
     # on a Redis stream; a per-worker consumer boots an ephemeral E2B sandbox,
@@ -124,6 +193,10 @@ class Settings(BaseSettings):
     # YouTube URL imports. The API records the URL and the ingest worker asks an
     # ephemeral E2B sandbox to download/remux/upload it before description.
     youtube_import_enabled: bool = True
+    # Cap the YouTube download height. Downstream consumers never use more than
+    # 768px (tiles, description frames, provider quality caps), so 720p loses
+    # nothing while downloading 3-10x less. 0 = uncapped (old behavior).
+    youtube_max_height: int = 720
     youtube_max_duration_seconds: int = 3 * 60 * 60
     youtube_max_size_bytes: int = 5 * 1024 * 1024 * 1024
     youtube_download_timeout_seconds: int = 900
@@ -131,6 +204,9 @@ class Settings(BaseSettings):
     # time; the Redis ownership lease is keyed by session and stamped with it.
     worker_id: str = ""
     server_workers: int = 1
+    model_definitions_file: str = os.path.join(os.path.dirname(__file__),"artifacts","models.json")
+    # Per-model preferred OpenRouter upstream + image-block cap (routing + frames budget).
+    openrouter_providers_file: str = os.path.join(os.path.dirname(__file__),"artifacts","openrouter_providers.json")
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -143,6 +219,12 @@ class provider_quality_settings:
     max_dimentions: Optional[int] = 768
     max_size_mb: Optional[int] = None
 
+class model_modalities(Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+
 
 def get_provider_quality_settings(model: str) -> provider_quality_settings:
     if "gemini" in model:
@@ -153,6 +235,140 @@ def get_provider_quality_settings(model: str) -> provider_quality_settings:
             max_dimentions=settings.analysis_max_dim,
             max_size_mb=settings.analysis_max_size_mb,
         )
+
+# Quant/format suffixes that repackagers (unsloth, TheBloke, ...) append to a
+# model name but that never appear in the catalog id. Stripped so a served quant
+# resolves to its base model. GGUF `q*` is matched only in its shaped form so a
+# tier like "-q3" isn't mistaken for a quant.
+_QUANT_RE = re.compile(
+    r"^(nvfp\d+|fp\d+|bf16|int\d+|w\d+a\d+|q\d+(?:_[a-z0-9]+)*|\d+bit|awq|gptq|gguf|ggml|exl\d*|mlx|bnb|onnx)$",
+    re.IGNORECASE,
+)
+# Model tiers/variants that must NEVER be stripped — defense against a future
+# over-broad quant pattern, so e.g. gpt-5.6-luna stays != gpt-5.6-luna-pro.
+_KEEP_TOKENS = {
+    "pro", "mini", "nano", "micro", "turbo", "flash", "lite", "max", "plus", "air",
+    "preview", "thinking", "instruct", "chat", "base", "vl", "vision", "coder", "reasoner",
+}
+
+
+def _core_model_key(model: str) -> str:
+    """Normalize a model id to a comparable core: drop the org prefix and any
+    OpenRouter `:variant`, lowercase, and strip trailing quant/format tokens."""
+    m = (model or "").strip().lower().split("/")[-1].split(":")[0]
+    parts = m.split("-")
+    while len(parts) > 1 and _QUANT_RE.match(parts[-1]) and parts[-1] not in _KEEP_TOKENS:
+        parts.pop()
+    return "-".join(parts)
+
+
+def match_model(model: str, model_id: str) -> bool:
+    """True if `model` (e.g. a served quant like unsloth/Qwen3.8-27B-NVFP4) refers
+    to the same model as the catalog `model_id` (e.g. qwen/qwen3.8-27b). Matches on
+    the normalized core, so it bridges org prefix, case, and quant suffix."""
+    if not model or not model_id:
+        return False
+    if model == model_id:
+        return True
+    return _core_model_key(model) == _core_model_key(model_id)
+
+
+def _find_input_modalities(entries: list, model: str) -> Optional[list]:
+    """First entry whose id matches `model`, returning its input_modalities (or None)."""
+    for entry in entries or []:
+        if match_model(model, (entry or {}).get("id")):
+            mods = (entry.get("architecture") or {}).get("input_modalities", [])
+            if isinstance(mods, list):
+                return mods
+    return None
+
+
+@lru_cache(maxsize=1)
+def _openrouter_catalog() -> list:
+    """Live OpenRouter model catalog, fetched once (best-effort). [] on failure."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models", headers={"User-Agent": "ambient"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read()).get("data", []) or []
+    except Exception as e:  # noqa: BLE001 - network/parse failure is non-fatal
+        log.warning("OpenRouter model catalog fetch failed: %s", e)
+        return []
+
+
+@lru_cache(maxsize=None)
+def get_model_modalities(model: str) -> list[str]:
+    """Get the input modalities for a model.
+
+    Tries the local models file first; on a miss, falls back to the live
+    OpenRouter catalog so newly-released models
+    still resolve. Returns [] when nothing matches.
+    """
+    model_definitions = {}
+    try:
+        with open(settings.model_definitions_file, "r") as f:
+            model_definitions = json.load(f)
+    except Exception as e:
+        raise Exception(f"Error loading model definitions file: {e}")
+
+    modalities = _find_input_modalities(model_definitions.get("data", []), model)
+    if modalities is None:
+        modalities = _find_input_modalities(_openrouter_catalog(), model)
+    modalities = modalities or []
+    return [model_modalities(modality) for modality in modalities if modality in model_modalities]
+
+
+def self_video_analysis_enabled(model: Optional[str] = None) -> bool:
+    """Whether the agent should analyze video/clips itself (self_focus_clip + a
+    whole-video context prefix) rather than delegating to a separate vision model.
+
+    Default ON when the (agent) model is vision-capable — supports IMAGE or VIDEO
+    input — and off when `DISABLE_SELF_VIDEO_ANALYSIS_TOOL` is set. `model` defaults
+    to `settings.agent_model` (used for the process-global tool selection); the
+    runner passes its per-session model so its behavior tracks that session's model.
+    Only meaningful in agent mode — fast mode never runs the agent loop or tools.
+    """
+    if settings.disable_self_video_analysis_tool:
+        return False
+    mods = get_model_modalities(model or settings.agent_model)
+    return bool(mods) and (model_modalities.IMAGE in mods or model_modalities.VIDEO in mods)
+
+
+@lru_cache(maxsize=1)
+def _load_openrouter_providers() -> dict:
+    try:
+        with open(settings.openrouter_providers_file, "r") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 - missing/broken table -> auto-route everywhere
+        return {}
+
+
+def get_openrouter_route(model: str) -> dict:
+    """Preferred OpenRouter upstream + image-block cap for `model`.
+
+    Single source of truth (``artifacts/openrouter_providers.json``) for both
+    request routing (``llm.get_provider_params``) and the frames-path budget
+    (``media_plan``). Resolves most-specific-first: exact model id, then the
+    longest family-substring key (so ``qwen/qwen3.6-35b-a3b`` overrides ``qwen``),
+    then ``_default``. Always returns a dict:
+
+        {"provider": str | None,   # None -> auto-route (no pin)
+         "image_cap": int,         # max image_url blocks for this route
+         "video": bool,            # True -> provider samples video_url densely (usable)
+         "mapped": bool}           # False -> nothing matched (fell to _default)
+    """
+    table = _load_openrouter_providers()
+    route = {"provider": None, "image_cap": 100, "video": False}
+    route.update(table.get("_default", {}))
+    m = (model or "").lower()
+    if model in table:
+        return {**route, **table[model], "mapped": True}
+    for key in sorted((k for k in table if not k.startswith("_")), key=len, reverse=True):
+        if key.lower() in m:
+            return {**route, **table[key], "mapped": True}
+    return {**route, "mapped": False}
 
 
 settings = get_settings()

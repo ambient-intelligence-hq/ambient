@@ -1,9 +1,9 @@
 import logging
 import asyncio
 import aiohttp
-from typing import List, Dict
+from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import make_video_tools
+from ambient.tools.video_backend import resolve_video_tools
 from ambient.utils.s3 import get_s3_client
 from ambient.llm import llm_call
 from ambient.tools.citations import _extract_temporal_citations, _build_user_message_contents_from_citations
@@ -18,32 +18,42 @@ log = logging.getLogger(__name__)
 
 class SearchClipTool(BaseModel):
     video_id: str = Field(description="The id of the video to search the clip from.")
+    video_path: Optional[str] = Field(default=None, description="Absolute path to a local video file to search instead of the session's initial video (e.g. one you downloaded via the bash tool into the workspace). Leave empty to use the initial video.")
     query: str = Field(description="The query to search the clip for. Provide a detailed descriptive query of what you are looking for in the video.")
     start_time: float = Field(description="The start time of the clip to search in seconds.")
     end_time: float = Field(description="The end time of the clip to search in seconds. The end time should be within 5 mins from the start_time.")
 
-async def search_clip(video_id: str, query: str, start_time: float, end_time: float, video_description: str = None) -> tuple[str, List[Dict]]:
+async def search_clip(video_id: str, query: str, start_time: float, end_time: float, video_description: str = None, video_path: Optional[str] = None) -> tuple[str, List[Dict]]:
     provider_quality_settings = get_provider_quality_settings(settings.llm_model)
-    video_tools = make_video_tools(video_id, max_frame_dimention=provider_quality_settings.max_dimentions)
+    video_tools = resolve_video_tools(video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions)
     user_message_contents = []
     global PROMPT
 
+    from ambient.tools.clip_media import produce_window_media
+
     try:
-        # Returns one or more clips on a single continuous 0-based timeline plus the
-        # window's global start (clip_start). With a size cap on a tiled video the
-        # covering tiles come back as separate (already-small) clips.
-        clips, clip_start = await video_tools.fetch_clips(start_time, end_time, fps=provider_quality_settings.fps,crf=provider_quality_settings.crf,max_size_mb=provider_quality_settings.max_size_mb)
+        # media_plan decides video-clips vs image-frames for this window (frames
+        # only where the endpoint can't control a video's frame count). Returns the
+        # window's global start (clip_start) for mapping the model's citations back.
+        kind, media, clip_start, _plan = await produce_window_media(
+            video_tools, "search_clip", start_time, end_time)
     except ValueError as e:
         if "clip size is still too large" in str(e):
             return f"Error fetching clip: {e} , please try again with a smaller time window", []
         return f"Error fetching clip: {e} , please try again", []
 
+    clips = media if kind == "clips" else None
+    frames = media if kind == "frames" else None
+
+    print(f"[Tool call] search_clip: kind: {kind} , media_count: {len(media)} , clip_start: {clip_start} , _plan: {_plan}")
+
     base_url = settings.llm_base_url or ""
     is_local_llm = "localhost" in base_url or "127.0.0.1" in base_url
 
     # The e2b backend already uploaded clips and set clip_url. Only the local
-    # backend returns bare local files that still need handling here.
-    for clip in clips:
+    # backend returns bare local files that still need handling here. (Frames come
+    # back already inlined/uploaded by the backend.)
+    for clip in (clips or []):
         if clip.clip_url is None:
             if is_local_llm or settings.inline_clips:
                 # Local server can't reach an S3 presigned URL (and inline_clips
@@ -59,7 +69,7 @@ async def search_clip(video_id: str, query: str, start_time: float, end_time: fl
     if video_description:
         PROMPT = PROMPT + f"\n\n Highlevel overview of the Video:\n{video_description}"
 
-    print(f"[search_clip] clips: {clips}")
+    print(f"[search_clip] {kind}: {len(media)} block(s)")
 
     try:
         llm_response = await llm_call(
@@ -69,6 +79,7 @@ async def search_clip(video_id: str, query: str, start_time: float, end_time: fl
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
             video_clips=clips,
+            video_frames=frames,
             timeout=120,
         )
     except (aiohttp.ClientResponseError, asyncio.TimeoutError) as exc:
@@ -98,13 +109,15 @@ async def search_clip(video_id: str, query: str, start_time: float, end_time: fl
         return "Error analyzing clip: LLM returned no content. Please try again.", []
 
     citations = _extract_temporal_citations(response_text)
-    # clip_start is the window's global start; the model's local mm:ss citations
-    # map to absolute video time by adding it.
+    # Clips are a fresh 0-based timeline, so their citations need the window's
+    # global start (clip_start) added. Frames are labeled with absolute video
+    # timestamps already, so their citations are absolute -> no offset.
+    citation_offset = 0.0 if kind == "frames" else clip_start
     if ENABLE_RETURN_CITATION_IMAGES:
-        user_message_contents = _build_user_message_contents_from_citations(video_tools, citations, clip_start, end_time)
+        user_message_contents = _build_user_message_contents_from_citations(video_tools, citations, citation_offset, end_time)
 
     result = f"Agent Reasoning: {reasoning}\nFinal Response: {response_text}"
-    result = _replace_citations_with_global_video_timestamps(result, citations, clip_start)
+    result = _replace_citations_with_global_video_timestamps(result, citations, citation_offset)
     # print(f"[search_clip] LLM Response: {llm_response}")
     return result, user_message_contents
 

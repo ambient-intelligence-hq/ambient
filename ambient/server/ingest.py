@@ -104,6 +104,22 @@ def _set_ready(description: str):
     return mut
 
 
+def _mark_source_ready(data: dict):
+    """Mutator flipping the youtube source to ready after its S3 upload lands."""
+    def mut(rec: dict) -> dict:
+        rec["source_status"] = "ready"
+        rec["source_error"] = None
+        rec["source_updated_at"] = _now_iso()
+        rec["r2_key"] = data.get("r2_key") or rec.get("r2_key")
+        rec["size_bytes"] = data.get("size_bytes") or rec.get("size_bytes")
+        rec["mime_type"] = "video/mp4"
+        if data.get("s3_uri"):
+            rec["s3_uri"] = data["s3_uri"]
+        return rec
+
+    return mut
+
+
 def _set_tiles_status(status: str, error: str | None = None):
     """Mutator recording tile-precompute status (observability only).
 
@@ -300,42 +316,73 @@ class IngestWorker:
             box = E2BMediaSandbox()
             await asyncio.to_thread(box.create, template=settings.e2b_template)
             rec = await self.store.get_file(video_id)
-            if (
+            is_youtube = bool(
                 rec
                 and rec.get("source_type") == "youtube"
                 and rec.get("source_status") != "ready"
-            ):
-                await self._prepare_youtube_source(video_id, rec, box)
+            )
 
-            # Tiling (CPU-bound, ~source_duration/6 wall-time) overlaps
-            # description generation (dominated by LLM wait); both share the box.
-            # Tiling is best-effort and idempotent — a missing manifest just makes
-            # fetch_clip fall back to on-demand transcode, so its failure never
-            # blocks description readiness. Run concurrently and collect both.
-            jobs = [asyncio.create_task(_generate_description(video_id, box))]
+            # For a youtube source: (a) probe metadata so the session can seed
+            # title/duration within seconds, then (b) download+remux locally. The
+            # slow S3 upload is deferred into the concurrent stage below so it no
+            # longer gates description readiness.
+            if is_youtube:
+                source_url = (rec or {}).get("source_url")
+                if not source_url:
+                    raise SourcePreparationError("YouTube source row is missing source_url")
+                await self._probe_youtube_metadata(video_id, source_url, box)
+                await self._download_youtube_source(video_id, source_url, box)
+
+            # Concurrent stage — all read the LOCAL source already in the box.
+            # Each task flips its own row status the moment IT finishes (not after
+            # the whole gather), so the fast upload (~seconds) unblocks sessions
+            # immediately instead of waiting on the slow tiling transcode.
+            #   description : dominated by LLM wait; gates the job on failure
+            #   upload      : push source to S3 (youtube only; sessions need it);
+            #                 failure => SourcePreparationError (re-enqueue)
+            #   tiling      : CPU-bound whole-video transcode; best-effort
+            async def _desc_job() -> None:
+                description = await _generate_description(video_id, box)
+                await self.store.update_file(video_id, _set_ready(description))
+                log.info("description ready for %s", video_id)
+
+            async def _upload_job() -> None:
+                try:
+                    up = await asyncio.to_thread(
+                        box.run, ["upload-source", "--video-id", video_id]
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise SourcePreparationError(str(exc)) from exc
+                await self.store.update_file(video_id, _mark_source_ready(up))
+                log.info("source ready for %s", video_id)
+
+            async def _tiling_job() -> None:
+                try:
+                    tiling_res = await asyncio.to_thread(
+                        box.run,
+                        ["transcode-tiles", "--video-id", video_id, "--upload-s3",
+                         "--workers", str(settings.tile_workers)],
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort, never fatal
+                    log.warning("tiling failed for %s; fetch_clip will fall back: %s", video_id, exc)
+                    await self.store.update_file(video_id, _set_tiles_status("failed", str(exc)))
+                    return
+                n_tiles = len((tiling_res or {}).get("tiles", []))
+                await self.store.update_file(video_id, _set_tiles_status("ready"))
+                log.info("tiles ready for %s (%d tiles)", video_id, n_tiles)
+
+            tasks = [asyncio.create_task(_desc_job())]
+            if is_youtube:
+                tasks.append(asyncio.create_task(_upload_job()))
             if settings.tiling_enabled:
-                jobs.append(asyncio.create_task(asyncio.to_thread(
-                    box.run,
-                    ["transcode-tiles", "--video-id", video_id, "--upload-s3",
-                     "--workers", str(settings.tile_workers)],
-                )))
-            results = await asyncio.gather(*jobs, return_exceptions=True)
+                tasks.append(asyncio.create_task(_tiling_job()))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            description = results[0]
-            if isinstance(description, Exception):
-                raise description
-            await self.store.update_file(video_id, _set_ready(description))
-            log.info("description ready for %s", video_id)
-
-            if settings.tiling_enabled:
-                tiling_res = results[1]
-                if isinstance(tiling_res, Exception):
-                    log.warning("tiling failed for %s; fetch_clip will fall back: %s", video_id, tiling_res)
-                    await self.store.update_file(video_id, _set_tiles_status("failed", str(tiling_res)))
-                else:
-                    n_tiles = len((tiling_res or {}).get("tiles", []))
-                    await self.store.update_file(video_id, _set_tiles_status("ready"))
-                    log.info("tiles ready for %s (%d tiles)", video_id, n_tiles)
+            # Surface the first real failure (description or upload) for retry;
+            # _tiling_job swallows its own errors and never appears here.
+            for r in results:
+                if isinstance(r, Exception):
+                    raise r
         except Exception as exc:  # noqa: BLE001
             await self._mark_failure(video_id, exc)
             raise
@@ -346,13 +393,13 @@ class IngestWorker:
                 except Exception:  # noqa: BLE001
                     log.warning("failed to kill ingest sandbox for %s", video_id)
 
-    async def _prepare_youtube_source(
-        self, video_id: str, rec: dict, box: object
+    async def _probe_youtube_metadata(
+        self, video_id: str, source_url: str, box: object
     ) -> None:
-        source_url = rec.get("source_url")
-        if not source_url:
-            raise SourcePreparationError("YouTube source row is missing source_url")
+        """Fetch title/duration/dimensions (no download) and persist them early.
 
+        This is what the session's metadata-only seed reads while the full
+        download proceeds. Keeps source_status='processing'."""
         def mark_processing(row: dict) -> dict:
             if row.get("source_status") != "ready":
                 row["source_status"] = "processing"
@@ -363,45 +410,61 @@ class IngestWorker:
         await self.store.update_file(video_id, mark_processing)
         try:
             data = await asyncio.to_thread(
-                box.run,
-                [
-                    "prepare-youtube",
-                    "--video-id",
-                    video_id,
-                    "--url",
-                    source_url,
-                    "--upload-s3",
-                ],
+                box.run, ["probe-youtube", "--video-id", video_id, "--url", source_url]
             )
         except Exception as exc:  # noqa: BLE001
             raise SourcePreparationError(str(exc)) from exc
 
-        def mark_ready(row: dict) -> dict:
-            row["source_status"] = "ready"
-            row["source_error"] = None
-            row["source_updated_at"] = _now_iso()
-            row["r2_key"] = data.get("r2_key") or row.get("r2_key")
-            row["size_bytes"] = data.get("size_bytes") or row.get("size_bytes")
+        def set_meta(row: dict) -> dict:
+            yt = dict(row.get("youtube") or {})
+            yt["webpage_url"] = data.get("webpage_url") or yt.get("webpage_url")
+            yt["title"] = data.get("title") or yt.get("title")
+            yt["extractor"] = data.get("extractor") or yt.get("extractor")
+            if data.get("duration") is not None:
+                yt["duration"] = data.get("duration")
+            yt["width"] = data.get("width") or yt.get("width")
+            yt["height"] = data.get("height") or yt.get("height")
+            row["youtube"] = yt
+            return row
+
+        await self.store.update_file(video_id, set_meta)
+        log.info("metadata ready for %s (title=%r)", video_id, data.get("title"))
+
+    async def _download_youtube_source(
+        self, video_id: str, source_url: str, box: object
+    ) -> None:
+        """Download + remux the source into the box's local cache (no S3 upload).
+
+        Leaves source_status='processing'; the concurrent `upload-source` step
+        flips it to 'ready' once the MP4 is on S3."""
+        try:
+            data = await asyncio.to_thread(
+                box.run, ["prepare-youtube", "--video-id", video_id, "--url", source_url]
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SourcePreparationError(str(exc)) from exc
+
+        def set_downloaded(row: dict) -> dict:
             row["mime_type"] = "video/mp4"
             row["filename"] = row.get("filename") or f"{video_id}.mp4"
             if data.get("source_file_path"):
                 row["sandbox_source_path"] = data["source_file_path"]
-            if data.get("s3_uri"):
-                row["s3_uri"] = data["s3_uri"]
+            if data.get("size_bytes"):
+                row["size_bytes"] = data.get("size_bytes")
             info = data.get("download_info") or {}
-            row["youtube"] = {
-                "webpage_url": info.get("webpage_url"),
-                "title": info.get("title"),
-                "extractor": info.get("extractor"),
-                "duration": data.get("duration"),
-                "width": data.get("width"),
-                "height": data.get("height"),
-                "format_id": info.get("format_id"),
-            }
+            yt = dict(row.get("youtube") or {})
+            yt.setdefault("format_id", info.get("format_id"))
+            if yt.get("duration") is None and data.get("duration") is not None:
+                yt["duration"] = data.get("duration")
+            if not yt.get("width") and data.get("width"):
+                yt["width"] = data.get("width")
+            if not yt.get("height") and data.get("height"):
+                yt["height"] = data.get("height")
+            row["youtube"] = yt
             return row
 
-        await self.store.update_file(video_id, mark_ready)
-        log.info("source ready for %s", video_id)
+        await self.store.update_file(video_id, set_downloaded)
+        log.info("source downloaded (local) for %s", video_id)
 
     async def _claim(self, video_id: str) -> bool:
         """Atomically take a claimable row to `processing`. True if we own it."""

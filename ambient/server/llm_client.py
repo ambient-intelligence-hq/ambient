@@ -24,6 +24,8 @@ async def stream_chat_completion(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = 300,
+    response_format: Optional[dict] = None,
+    extra_body: Optional[dict] = None,
 ) -> AsyncIterator[dict]:
     endpoint = (base_url or settings.agent_base_url or settings.llm_base_url or "").rstrip("/")
     api_key = api_key or settings.agent_api_key or settings.llm_api_key
@@ -33,14 +35,34 @@ async def stream_chat_completion(
     body = {
         "model": model,
         "max_tokens": max_tokens,
-        "tools": tools,
-        "tool_choice": "auto",
         "messages": messages,
         "stream": True,
+        # Ask the provider to include a final usage chunk in the stream so the
+        # runner can attribute token/cost to the session. `stream_options` is the
+        # OpenAI-native switch; `usage.include` is OpenRouter's (which also returns
+        # the actual USD cost). Sending both is harmless and maximizes coverage.
+        "stream_options": {"include_usage": True},
+        "usage": {"include": True},
     }
+    # Only include tools/tool_choice when there actually are tools — some servers
+    # (vLLM) reject an empty `tools` array. Fast mode passes tools=[].
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
     if reasoning_enabled:
         body["reasoning"] = {"enabled": True}
-    body.update(get_provider_params(model, endpoint))
+    provider_params = get_provider_params(model, endpoint)
+    if response_format:
+        body["response_format"] = response_format
+        # Only route to providers that honor structured outputs.
+        prov = dict(provider_params.get("provider") or {})
+        prov["require_parameters"] = True
+        provider_params = {**provider_params, "provider": prov}
+    body.update(provider_params)
+    if extra_body:
+        # Passthrough for provider-specific params (e.g. vLLM chat_template_kwargs
+        # to toggle a thinking model). Callers own compatibility.
+        body.update(extra_body)
 
     headers = {
         "Content-Type": "application/json",
@@ -71,20 +93,29 @@ async def stream_chat_completion(
                 yield chunk
 
 
-def assemble_assistant_message(chunks: list[dict]) -> tuple[dict, Optional[str], list[dict]]:
+def assemble_assistant_message(
+    chunks: list[dict],
+) -> tuple[dict, Optional[str], list[dict], str, Optional[dict]]:
     """Fold streamed chunks into an Anthropic-style assistant message.
 
-    Returns (message, finish_reason, tool_uses). `message` follows the shape
-    `run_agent` already builds: role=assistant, content=[{type:text,...} | {type:tool_use,...}].
-    `tool_uses` is the list of tool_use blocks (already inside message.content too) for
-    convenient dispatch by the runner.
+    Returns (message, finish_reason, tool_uses, reasoning, usage). `message`
+    follows the shape `run_agent` already builds: role=assistant,
+    content=[{type:text,...} | {type:tool_use,...}]. `tool_uses` is the list of
+    tool_use blocks (already inside message.content too) for convenient dispatch
+    by the runner. `reasoning` is the raw extended-thinking text (empty if none).
+    `usage` is the raw provider usage block from the final chunk (or None).
     """
     text_buf: list[str] = []
     reasoning_buf: list[str] = []
     tool_calls: dict[int, dict] = {}
     finish_reason: Optional[str] = None
+    usage: Optional[dict] = None
 
     for chunk in chunks:
+        # The final stream chunk (stream_options.include_usage) carries usage and
+        # usually has an empty choices list.
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             if isinstance(delta.get("content"), str):
@@ -136,4 +167,4 @@ def assemble_assistant_message(chunks: list[dict]) -> tuple[dict, Optional[str],
         tool_uses.append(block)
 
     message = {"role": "assistant", "content": content}
-    return message, finish_reason, tool_uses
+    return message, finish_reason, tool_uses, reasoning, usage

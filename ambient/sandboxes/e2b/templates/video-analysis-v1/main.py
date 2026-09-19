@@ -81,6 +81,7 @@ STREAM_MIN_BYTES = int(os.environ.get("STREAM_MIN_BYTES", str(100 * 1024 * 1024)
 OVERVIEW_SEEK_CONCURRENCY = int(os.environ.get("OVERVIEW_SEEK_CONCURRENCY", "16"))
 
 # --- YouTube imports -------------------------------------------------------
+YOUTUBE_MAX_HEIGHT = int(os.environ.get("YOUTUBE_MAX_HEIGHT", "720"))
 YOUTUBE_MAX_DURATION_SECONDS = int(os.environ.get("YOUTUBE_MAX_DURATION_SECONDS", str(3 * 60 * 60)))
 YOUTUBE_MAX_SIZE_BYTES = int(os.environ.get("YOUTUBE_MAX_SIZE_BYTES", str(5 * 1024 * 1024 * 1024)))
 YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS = int(os.environ.get("YOUTUBE_DOWNLOAD_TIMEOUT_SECONDS", "900"))
@@ -95,6 +96,22 @@ TILE_SECONDS = int(os.environ.get("TILE_SECONDS", "45"))
 TILE_FPS = int(os.environ.get("TILE_FPS", "2"))
 TILE_MAX_DIM = int(os.environ.get("TILE_MAX_DIM", "768"))
 TILE_WORKERS = int(os.environ.get("TILE_WORKERS", str(os.cpu_count() or 4)))
+
+
+def _scale_even_filter(dim: int) -> str:
+    """ffmpeg -vf scale that fits within dim x dim (aspect preserved) AND forces
+    even width/height.
+
+    `force_original_aspect_ratio=decrease` alone can yield an odd side (e.g.
+    573x768), which libx264 rejects ("width not divisible by 2"). The trailing
+    ``scale=trunc(iw/2)*2:trunc(ih/2)*2`` snaps both sides down to even. Written as
+    a second scale (not `force_divisible_by`, which needs ffmpeg >= 4.4) so it
+    works on any ffmpeg build in the sandbox base image.
+    """
+    return (
+        f"scale={dim}:{dim}:force_original_aspect_ratio=decrease,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +425,34 @@ class ClipResult(BaseModel):
     clip: ClipOut
 
 
+class AnnotatedFrameResult(BaseModel):
+    video_id: str
+    timestamp: float
+    annotated_file_path: str
+    annotated_url: Optional[str] = None
+    width: int
+    height: int
+    # The annotations as drawn, with boxes converted to absolute pixel xyxy so the
+    # host doesn't have to re-derive them.
+    annotations: List[dict]
+
+
+class ReadImageResult(BaseModel):
+    source_path: str
+    image_file_path: str
+    image_url: Optional[str] = None
+    width: int
+    height: int
+
+
+class UploadArtifactResult(BaseModel):
+    source_path: str
+    s3_key: str
+    s3_uri: str
+    url: Optional[str] = None
+    size_bytes: int
+
+
 class TileEntry(BaseModel):
     index: int
     start: float
@@ -436,6 +481,23 @@ class PrepareYoutubeResult(BaseModel):
     height: Optional[int] = None
     source_kind: str = "youtube"
     download_info: dict[str, Any]
+
+
+class ProbeYoutubeResult(BaseModel):
+    video_id: str
+    title: Optional[str] = None
+    duration: Optional[float] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    webpage_url: Optional[str] = None
+    extractor: Optional[str] = None
+
+
+class UploadSourceResult(BaseModel):
+    video_id: str
+    r2_key: str
+    s3_uri: str
+    size_bytes: int
 
 
 class ResultError(BaseModel):
@@ -479,11 +541,17 @@ class VideoFrameTools:
     OVERVIEW_MAX_FRAMES = 75
     MAX_CLIP_DURATION_SEC = 600
 
-    def __init__(self, video_id: str, max_frame_dimension: Optional[int] = None):
+    def __init__(self, video_id: str, max_frame_dimension: Optional[int] = None,
+                 source_path: Optional[str] = None):
         self.video_id = video_id
         # `video_path` is a local file path or a presigned URL; `is_url` selects
         # the ffmpeg backend + reconnect flags for remote (range-read) sources.
-        self.video_path, self.is_url = resolve_video_source(video_id)
+        # An explicit `source_path` (external-video path passed by the agent) is a
+        # box-local file, so it wins over video_id resolution (no S3/glob lookup).
+        if source_path:
+            self.video_path, self.is_url = source_path, False
+        else:
+            self.video_path, self.is_url = resolve_video_source(video_id)
         # Mirror ambient/tools/video_tools.py: VIDEO_FOLDER/<video_id>/frames/
         self.frame_dir = os.path.join(VIDEO_FOLDER, video_id, "frames")
         os.makedirs(self.frame_dir, exist_ok=True)
@@ -791,7 +859,7 @@ class VideoFrameTools:
             if self.max_frame_dimension is not None:
                 cmd += [
                     "-vf",
-                    f"scale={self.max_frame_dimension}:{self.max_frame_dimension}:force_original_aspect_ratio=decrease",
+                    _scale_even_filter(self.max_frame_dimension),
                 ]
             cmd.append(out_path)
             try:
@@ -854,7 +922,7 @@ class VideoFrameTools:
         vf_parts = [f"fps={effective_fps}"]
         if self.max_frame_dimension is not None:
             vf_parts.append(
-                f"scale={self.max_frame_dimension}:{self.max_frame_dimension}:force_original_aspect_ratio=decrease"
+                _scale_even_filter(self.max_frame_dimension)
             )
         cmd += ["-vf", ",".join(vf_parts)]
         cmd.append(output_pattern)
@@ -883,14 +951,19 @@ class VideoFrameTools:
         frame_items = self._ensure_frames_cache(fps, start_time_sec, duration_sec, max_frames)
         if not frame_items:
             return []
+        # Key the id (and thus the S3 upload key `<video_id>/frames/<id>.png`) on the
+        # frame's true timestamp, NOT a within-window index. Different grab_frames
+        # windows produce frame_0, frame_1, ... with identical indices, so an
+        # index-based id gave colliding S3 keys — concurrent windows overwrote each
+        # other and every result resolved to the last-uploaded window's frames.
         frames = [
             Frame(
                 frame_file_path=p,
                 timestamp=timestamp,
                 video_id=self.video_id,
-                id=f"{self.video_id}_fps{fps}_frame_{idx}",
+                id=f"{self.video_id}_fps{fps}_t{timestamp:.3f}",
             )
-            for idx, (p, timestamp) in enumerate(frame_items)
+            for (p, timestamp) in frame_items
         ]
         return frames
 
@@ -937,7 +1010,7 @@ class VideoFrameTools:
         vf_parts = []
         if self.max_frame_dimension is not None:
             vf_parts.append(
-                f"scale={self.max_frame_dimension}:{self.max_frame_dimension}:force_original_aspect_ratio=decrease"
+                _scale_even_filter(self.max_frame_dimension)
             )
         if fps is not None:
             vf_parts.append(f"fps={fps}")
@@ -953,6 +1026,29 @@ class VideoFrameTools:
             video_id=self.video_id,
             id=f"{self.video_id}_clip_{start_time}_{duration_sec}secs",
         )
+
+    def extract_frame_at(self, timestamp: float, out_path: str) -> str:
+        """Decode a single frame at ``timestamp`` seconds to ``out_path`` (PNG).
+
+        A one-shot ``-ss`` seek (input seek + ``-frames:v 1``) — the nearest frame
+        to the requested time, at the source resolution unless ``max_frame_dimension``
+        is set. Used by the annotate-frame path, where we want a full-res still to
+        draw boxes on (the model's normalized coords apply at any resolution).
+        """
+        self._ensure_backend()  # resolves is_url / reconnect flags
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", str(timestamp), *self._reconnect_flags(),
+            "-i", self.video_path, "-frames:v", "1",
+        ]
+        if self.max_frame_dimension is not None:
+            cmd += ["-vf", _scale_even_filter(self.max_frame_dimension)]
+        cmd.append(out_path)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if not os.path.isfile(out_path):
+            raise RuntimeError(f"no frame decoded at {timestamp}s for {self.video_id}")
+        return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -1070,20 +1166,43 @@ def _canonicalize_youtube_file(video_id: str, work_dir: str) -> str:
     return canonical
 
 
-def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
+def _youtube_format_selector(max_height: int) -> str:
+    """Build the yt-dlp -f selector, optionally capping height.
+
+    Downstream never uses more than 768px (tiles, description frames, provider
+    quality), so a 720p proxy downloads 3-10x less while losing nothing. Prefers
+    H.264 (avc1) over AV1/VP9 (YouTube's AV1 is SABR-gated and 403s mid-download,
+    and H.264 decodes faster downstream). The final "/b" stays unfiltered so odd
+    videos with no height-capped format still import. max_height <= 0 = uncapped.
+    """
+    h = f"[height<={max_height}]" if max_height > 0 else ""
+    return (
+        f"bv*[vcodec^=avc1]{h}[ext=mp4]+ba[ext=m4a]"
+        f"/bv*{h}[ext=mp4]+ba[ext=m4a]"
+        f"/b{h}[ext=mp4]"
+        f"/bv*{h}+ba"
+        "/b"
+    )
+
+
+def _probe_youtube_info(url: str) -> dict[str, Any]:
+    """Fetch yt-dlp metadata (no download) and enforce the duration limit."""
     if not _is_youtube_url(url):
         raise ValueError("url must be a YouTube URL")
     if shutil.which("yt-dlp") is None:
         raise RuntimeError("yt-dlp is not installed in the sandbox template")
-
-    meta_cmd = ["yt-dlp", "--dump-single-json", "--no-playlist", url]
-    info = _run_json(meta_cmd, timeout=120)
+    info = _run_json(["yt-dlp", "--dump-single-json", "--no-playlist", url], timeout=120)
     duration = info.get("duration")
     if duration is not None and float(duration) > YOUTUBE_MAX_DURATION_SECONDS:
         raise ValueError(
             f"YouTube video duration {duration}s exceeds limit "
             f"{YOUTUBE_MAX_DURATION_SECONDS}s"
         )
+    return info
+
+
+def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
+    info = _probe_youtube_info(url)
 
     work_dir = os.path.join(VIDEO_FOLDER, video_id)
     os.makedirs(work_dir, exist_ok=True)
@@ -1094,13 +1213,14 @@ def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
             except OSError:
                 pass
 
+    fmt = _youtube_format_selector(YOUTUBE_MAX_HEIGHT)
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--restrict-filenames",
         # Prefer H.264 (avc1) over AV1/VP9: the AV1 formats YouTube serves are
         # SABR-gated and 403 mid-download, and H.264 also decodes faster downstream.
-        "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "-f", fmt,
         # Survive transient 403s / format drops within this one invocation instead
         # of relying on the job-level retry (which re-boots an entire sandbox).
         "--retries", "10",
@@ -1138,6 +1258,50 @@ def _download_youtube(video_id: str, url: str) -> tuple[str, dict[str, Any]]:
         _normalize_faststart(local_path)
 
     return local_path, info
+
+
+def cmd_probe_youtube(args: argparse.Namespace) -> None:
+    """Metadata-only probe (no download): title/duration/dimensions, in ~seconds.
+
+    Lets the host seed a session with title + duration immediately while the full
+    download proceeds in the background (see docs/session-startup-latency-plan.md).
+    """
+    start = time.time()
+    info = _probe_youtube_info(args.url)
+    print(f"[youtube] probe-youtube time: {time.time() - start} seconds", file=sys.stderr)
+    emit(data=ProbeYoutubeResult(
+        video_id=args.video_id,
+        title=info.get("title"),
+        duration=info.get("duration"),
+        width=info.get("width"),
+        height=info.get("height"),
+        webpage_url=info.get("webpage_url") or args.url,
+        extractor=info.get("extractor"),
+    ))
+
+
+def cmd_upload_source(args: argparse.Namespace) -> None:
+    """Upload the already-downloaded local source MP4 to S3.
+
+    Split out of prepare-youtube so the (slow) S3 upload runs concurrently with
+    description + tiling instead of gating them. Resolves the local file the same
+    way the tiling path does.
+    """
+    start = time.time()
+    s3 = _make_s3_client()
+    if s3 is None:
+        emit(error=ResultError(code="S3NotConfigured", message="S3 is required for upload-source"))
+        return
+    local_path = _download_source_local(s3, args.video_id)  # local cache hit (no re-download)
+    r2_key = f"{S3_VIDEO_BASE_KEY}/{args.video_id}.mp4"
+    s3_uri = s3.upload_file(local_path, r2_key, "video/mp4")
+    print(f"[s3] uploaded source {s3_uri} in {time.time() - start:.1f}s", file=sys.stderr)
+    emit(data=UploadSourceResult(
+        video_id=args.video_id,
+        r2_key=r2_key,
+        s3_uri=s3_uri,
+        size_bytes=os.path.getsize(local_path),
+    ))
 
 
 def cmd_prepare_youtube(args: argparse.Namespace) -> None:
@@ -1184,7 +1348,8 @@ def cmd_prepare_youtube(args: argparse.Namespace) -> None:
 
 def cmd_extract_frames(args: argparse.Namespace) -> None:
     start_time = time.time()
-    tools = VideoFrameTools(args.video_id, max_frame_dimension=args.max_dim)
+    tools = VideoFrameTools(args.video_id, max_frame_dimension=args.max_dim,
+                            source_path=getattr(args, "source_path", None))
     frames = tools.fetch_frames(
         fps=args.fps,
         start_time_sec=args.start,
@@ -1205,7 +1370,8 @@ def cmd_extract_frames(args: argparse.Namespace) -> None:
 
 def cmd_fetch_clip(args: argparse.Namespace) -> None:
     start_time = time.time()
-    tools = VideoFrameTools(args.video_id, max_frame_dimension=args.max_dim)
+    tools = VideoFrameTools(args.video_id, max_frame_dimension=args.max_dim,
+                            source_path=getattr(args, "source_path", None))
     clip = tools.fetch_clip(
         start_time=args.start,
         end_time=args.end,
@@ -1220,6 +1386,226 @@ def cmd_fetch_clip(args: argparse.Namespace) -> None:
         _upload_clip(clip, s3, args.s3_presigned_expires)
         print(f"[fetch-clip] [s3] upload time: {time.time() - start_s3_upload_time} seconds", file=sys.stderr)
     emit(data=ClipResult(clip=ClipOut(**clip.to_dict())))
+
+
+# ---------------------------------------------------------------------------
+# Frame annotation (draw model bounding boxes onto a still)
+# ---------------------------------------------------------------------------
+
+# Colors cycled per-annotation so overlapping boxes stay distinguishable.
+_ANNOTATION_COLORS = [
+    (255, 59, 48), (52, 199, 89), (0, 122, 255), (255, 149, 0),
+    (175, 82, 222), (255, 214, 10), (255, 45, 146), (48, 209, 209),
+]
+
+
+def _denorm_box(box: List[float], coord_scale: float, width: int, height: int) -> Tuple[int, int, int, int]:
+    """Convert a model box ``[y_min, x_min, y_max, x_max]`` to pixel ``(x0, y0, x1, y1)``.
+
+    The grab-frames model (Gemini convention) emits ``[y_min, x_min, y_max, x_max]``
+    normalized to a ``0..coord_scale`` grid (default 1000), independent of the frame's
+    pixel size. When ``coord_scale <= 0`` the values are treated as absolute pixels.
+    Note the y/x order is swapped relative to the ``(x, y)`` most draw APIs expect.
+    """
+    y_min, x_min, y_max, x_max = box
+    if coord_scale and coord_scale > 0:
+        x0 = x_min / coord_scale * width
+        y0 = y_min / coord_scale * height
+        x1 = x_max / coord_scale * width
+        y1 = y_max / coord_scale * height
+    else:
+        x0, y0, x1, y1 = x_min, y_min, x_max, y_max
+    # Model may emit min/max out of order; normalize and clamp to the frame.
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    x0 = max(0, min(int(round(x0)), width))
+    x1 = max(0, min(int(round(x1)), width))
+    y0 = max(0, min(int(round(y0)), height))
+    y1 = max(0, min(int(round(y1)), height))
+    return x0, y0, x1, y1
+
+
+def _draw_annotations(
+    image_path: str, annotations: List[dict], coord_scale: float, out_path: str
+) -> Tuple[int, int, List[dict]]:
+    """Draw each annotation's box + label onto the still; return (w, h, drawn).
+
+    ``drawn`` echoes back each annotation with a ``pixel_box`` (absolute xyxy) added,
+    so the host has the resolved coordinates without redoing the math.
+    """
+    PIL_Image = importlib.import_module("PIL.Image")
+    PIL_ImageDraw = importlib.import_module("PIL.ImageDraw")
+    PIL_ImageFont = importlib.import_module("PIL.ImageFont")
+
+    img = PIL_Image.open(image_path).convert("RGB")
+    width, height = img.size
+    draw = PIL_ImageDraw.Draw(img)
+
+    # Scale line/text to the frame so boxes read on both 480p and 1080p stills.
+    line_w = max(2, round(min(width, height) / 300))
+    font_size = max(12, round(min(width, height) / 40))
+    try:
+        font = PIL_ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except Exception:  # font file not in the base image → bitmap default
+        font = PIL_ImageFont.load_default()
+
+    def _text_size(text: str) -> Tuple[int, int]:
+        if hasattr(draw, "textbbox"):
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            return right - left, bottom - top
+        return draw.textsize(text, font=font)  # Pillow < 8
+
+    drawn: List[dict] = []
+    for i, ann in enumerate(annotations):
+        box = ann.get("bounding_box")
+        label = ann.get("label")
+        if not box or len(box) != 4:
+            continue
+        color = _ANNOTATION_COLORS[i % len(_ANNOTATION_COLORS)]
+        x0, y0, x1, y1 = _denorm_box(box, coord_scale, width, height)
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=line_w)
+
+        if label:
+            tw, th = _text_size(label)
+            pad = max(2, line_w)
+            # Sit the label bar above the box; drop it inside if it'd clip the top.
+            ty1 = y0
+            ty0 = ty1 - th - 2 * pad
+            if ty0 < 0:
+                ty0, ty1 = y0, y0 + th + 2 * pad
+            draw.rectangle([x0, ty0, x0 + tw + 2 * pad, ty1], fill=color)
+            draw.text((x0 + pad, ty0 + pad), label, fill=(255, 255, 255), font=font)
+
+        entry = dict(ann)
+        entry["pixel_box"] = [x0, y0, x1, y1]
+        drawn.append(entry)
+
+    img.save(out_path, format="PNG")
+    return width, height, drawn
+
+
+def cmd_annotate_frame(args: argparse.Namespace) -> None:
+    """Extract the frame at a timestamp, draw model bounding boxes, upload the PNG.
+
+    ``--annotations`` is a JSON list like the grab-frames tool produces:
+        [{"bounding_box": [y_min, x_min, y_max, x_max], "label": "..."}, ...]
+    Boxes are normalized to ``--coord-scale`` (default 1000, Gemini convention);
+    pass ``--coord-scale 0`` for absolute-pixel boxes.
+    """
+    start = time.time()
+    try:
+        annotations = json.loads(args.annotations)
+    except json.JSONDecodeError as exc:
+        emit(error=ResultError(code="BadAnnotations", message=f"--annotations is not valid JSON: {exc}"))
+        return
+    if not isinstance(annotations, list):
+        emit(error=ResultError(code="BadAnnotations", message="--annotations must be a JSON list of {bounding_box,label}"))
+        return
+
+    tools = VideoFrameTools(args.video_id, max_frame_dimension=args.max_dim,
+                            source_path=getattr(args, "source_path", None))
+    out_dir = os.path.join(VIDEO_FOLDER, args.video_id, "annotated")
+    raw_path = os.path.join(out_dir, f"frame_{args.timestamp}.png")
+    tools.extract_frame_at(args.timestamp, raw_path)
+
+    annotated_path = os.path.join(out_dir, f"annotated_{args.timestamp}.png")
+    width, height, drawn = _draw_annotations(raw_path, annotations, args.coord_scale, annotated_path)
+    print(f"[annotate-frame] drew {len(drawn)} boxes in {time.time() - start:.2f}s", file=sys.stderr)
+
+    annotated_url: Optional[str] = None
+    if args.upload_s3:
+        s3 = S3Client()
+        key = f"{args.video_id}/annotated/frame_{args.timestamp}.png"
+        _, annotated_url = s3.upload_and_presign(annotated_path, key, "image/png", args.s3_presigned_expires)
+        print(f"[annotate-frame] [s3] uploaded → {annotated_url}", file=sys.stderr)
+
+    emit(data=AnnotatedFrameResult(
+        video_id=args.video_id,
+        timestamp=args.timestamp,
+        annotated_file_path=annotated_path,
+        annotated_url=annotated_url,
+        width=width,
+        height=height,
+        annotations=drawn,
+    ))
+
+
+def cmd_read_image(args: argparse.Namespace) -> None:
+    """Read a standalone image file, downscale it, and (optionally) upload it.
+
+    Unlike the frame/clip commands this takes a raw ``--path`` (not a ``--video-id``):
+    it's for images that already exist in the box — e.g. a screenshot the agent
+    produced via the bash tool — so the agent model can inspect them directly.
+    """
+    start = time.time()
+    path = args.path
+    if not os.path.isfile(path):
+        emit(error=ResultError(code="ImageNotFound", message=f"image not found: {path!r}"))
+        return
+
+    PIL_Image = importlib.import_module("PIL.Image")
+    img = PIL_Image.open(path).convert("RGB")
+    w, h = img.size
+    max_dim = args.max_dim or 768
+    longest = max(w, h)
+    if longest > max_dim and longest > 0:
+        scale = max_dim / longest
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))))
+        w, h = img.size
+
+    out_dir = os.path.join(VIDEO_FOLDER, "_reads")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(path))[0] or "image"
+    out_path = os.path.join(out_dir, f"{stem}_{int(start)}.jpg")
+    img.save(out_path, format="JPEG", quality=85)
+    print(f"[read-image] {path} -> {w}x{h} in {time.time() - start:.2f}s", file=sys.stderr)
+
+    image_url: Optional[str] = None
+    if args.upload_s3:
+        s3 = S3Client()
+        key = f"reads/{stem}_{int(start)}.jpg"
+        _, image_url = s3.upload_and_presign(out_path, key, "image/jpeg", args.s3_presigned_expires)
+        print(f"[read-image] [s3] uploaded → {image_url}", file=sys.stderr)
+
+    emit(data=ReadImageResult(
+        source_path=path,
+        image_file_path=out_path,
+        image_url=image_url,
+        width=w,
+        height=h,
+    ))
+
+
+def cmd_upload_artifact(args: argparse.Namespace) -> None:
+    """Upload a box-local file to S3 under the given key and presign a download URL.
+
+    For files the agent produced in the sandbox (via the bash tool) that the user
+    needs to retrieve. Takes a raw ``--path`` (not a ``--video-id``); the host tool
+    computes the ``--key`` (namespaced under artifacts/<video_id>/)."""
+    start = time.time()
+    path = args.path
+    if not os.path.isfile(path):
+        emit(error=ResultError(code="ArtifactNotFound", message=f"file not found: {path!r}"))
+        return
+    size = os.path.getsize(path)
+    if args.max_size_mb and size > args.max_size_mb * 1024 * 1024:
+        emit(error=ResultError(
+            code="ArtifactTooLarge",
+            message=f"file is {size / 1024 / 1024:.1f} MB, over the {args.max_size_mb} MB limit"))
+        return
+
+    s3 = S3Client()
+    content_type = args.content_type or "application/octet-stream"
+    s3_uri, url = s3.upload_and_presign(path, args.key, content_type, args.s3_presigned_expires)
+    print(f"[upload-artifact] {path} ({size} B) → {s3_uri} in {time.time() - start:.2f}s", file=sys.stderr)
+
+    emit(data=UploadArtifactResult(
+        source_path=path,
+        s3_key=args.key,
+        s3_uri=s3_uri,
+        url=url,
+        size_bytes=size,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -1340,7 +1726,7 @@ def cmd_transcode_tiles(args: argparse.Namespace) -> None:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-ss", str(r_start), "-t", str(r_len), "-i", src,
-            "-vf", f"scale={args.max_dim}:{args.max_dim}:force_original_aspect_ratio=decrease,fps={args.fps}",
+            "-vf", f"{_scale_even_filter(args.max_dim)},fps={args.fps}",
             "-c:v", "libx264", "-preset", "veryfast",
             # Force a keyframe at every tile boundary so tiles are independently
             # decodable AND concat-able with `-c copy` later.
@@ -1461,6 +1847,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── extract-frames ───────────────────────────────────────────────────────
     p_ef = sub.add_parser("extract-frames", help="Extract frames from a video file and write them to disk")
     p_ef.add_argument("--video-id", required=True, help="Video ID; resolved from VIDEO_FOLDER or downloaded from S3")
+    p_ef.add_argument("--source-path", default=None, help="Box-local video file to read directly (external video); bypasses --video-id resolution")
     p_ef.add_argument("--fps", type=int, default=1, help="Frames per second to extract (default: 1)")
     p_ef.add_argument("--start", type=float, default=0.0, help="Start time in seconds (default: 0)")
     p_ef.add_argument("--end", type=float, default=None, help="End time in seconds (default: full video)")
@@ -1473,6 +1860,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── fetch-clip ────────────────────────────────────────────────────────────
     p_fc = sub.add_parser("fetch-clip", help="Extract a video clip between two timestamps")
     p_fc.add_argument("--video-id", required=True, help="Video ID; resolved from VIDEO_FOLDER or downloaded from S3")
+    p_fc.add_argument("--source-path", default=None, help="Box-local video file to read directly (external video); bypasses --video-id resolution")
     p_fc.add_argument("--start", type=float, required=True, help="Start time in seconds")
     p_fc.add_argument("--end", type=float, required=True, help="End time in seconds")
     p_fc.add_argument("--fps", type=int, default=5, help="Output clip fps (default: 5)")
@@ -1483,12 +1871,52 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fc.add_argument("--s3-presigned-expires", type=int, default=3600, metavar="SECS", help="Presigned URL TTL in seconds (default: 3600)")
     p_fc.set_defaults(func=cmd_fetch_clip)
 
+    # ── annotate-frame ────────────────────────────────────────────────────────
+    p_af = sub.add_parser("annotate-frame", help="Draw model bounding boxes on the frame at a timestamp and upload the PNG")
+    p_af.add_argument("--video-id", required=True, help="Video ID; resolved from VIDEO_FOLDER or downloaded from S3")
+    p_af.add_argument("--source-path", default=None, help="Box-local video file to read directly (external video); bypasses --video-id resolution")
+    p_af.add_argument("--timestamp", type=float, required=True, help="Frame time in seconds (global video time)")
+    p_af.add_argument("--annotations", required=True, help='JSON list: [{"bounding_box":[y_min,x_min,y_max,x_max],"label":"..."}]')
+    p_af.add_argument("--coord-scale", type=float, default=1000.0, help="Normalization grid of the boxes (default: 1000; 0 = absolute pixels)")
+    p_af.add_argument("--max-dim", type=int, default=None, help="Resize the still so longest edge ≤ this value (default: source resolution)")
+    p_af.add_argument("--upload-s3", action="store_true", help="Upload the annotated PNG to S3/R2 and include a presigned URL")
+    p_af.add_argument("--s3-presigned-expires", type=int, default=3600, metavar="SECS", help="Presigned URL TTL in seconds (default: 3600)")
+    p_af.set_defaults(func=cmd_annotate_frame)
+
+    # ── read-image ────────────────────────────────────────────────────────────
+    p_ri = sub.add_parser("read-image", help="Read a standalone image file, downscale it, and upload the JPEG")
+    p_ri.add_argument("--path", required=True, help="Box-local absolute path to the image file")
+    p_ri.add_argument("--max-dim", type=int, default=None, help="Resize so longest edge ≤ this value (default: 768)")
+    p_ri.add_argument("--upload-s3", action="store_true", help="Upload the image to S3/R2 and include a presigned URL")
+    p_ri.add_argument("--s3-presigned-expires", type=int, default=3600, metavar="SECS", help="Presigned URL TTL in seconds (default: 3600)")
+    p_ri.set_defaults(func=cmd_read_image)
+
+    # ── upload-artifact ───────────────────────────────────────────────────────
+    p_ua = sub.add_parser("upload-artifact", help="Upload a box-local file to S3 and presign a download URL")
+    p_ua.add_argument("--path", required=True, help="Box-local absolute path to the file to upload")
+    p_ua.add_argument("--key", required=True, help="Destination S3 object key")
+    p_ua.add_argument("--content-type", default=None, help="MIME type (default: application/octet-stream)")
+    p_ua.add_argument("--max-size-mb", type=int, default=None, help="Reject uploads larger than this many MB")
+    p_ua.add_argument("--s3-presigned-expires", type=int, default=3600, metavar="SECS", help="Presigned URL TTL in seconds (default: 3600)")
+    p_ua.set_defaults(func=cmd_upload_artifact)
+
     # ── prepare-youtube ──────────────────────────────────────────────────────
     p_yt = sub.add_parser("prepare-youtube", help="Download a YouTube URL into the sandbox video cache")
     p_yt.add_argument("--video-id", required=True, help="Video ID to materialize into VIDEO_FOLDER")
     p_yt.add_argument("--url", required=True, help="YouTube URL to download")
     p_yt.add_argument("--upload-s3", action="store_true", help="Upload the prepared source MP4 to S3/R2")
     p_yt.set_defaults(func=cmd_prepare_youtube)
+
+    # ── probe-youtube ─────────────────────────────────────────────────────────
+    p_py = sub.add_parser("probe-youtube", help="Fetch YouTube metadata only (title/duration), no download")
+    p_py.add_argument("--video-id", required=True, help="Video ID the metadata belongs to")
+    p_py.add_argument("--url", required=True, help="YouTube URL to probe")
+    p_py.set_defaults(func=cmd_probe_youtube)
+
+    # ── upload-source ─────────────────────────────────────────────────────────
+    p_us = sub.add_parser("upload-source", help="Upload the already-downloaded local source MP4 to S3")
+    p_us.add_argument("--video-id", required=True, help="Video ID whose local source to upload")
+    p_us.set_defaults(func=cmd_upload_source)
 
     # ── transcode-tiles ──────────────────────────────────────────────────────
     p_tt = sub.add_parser("transcode-tiles", help="Transcode the whole video into fixed target-quality tiles + manifest (ingestion)")

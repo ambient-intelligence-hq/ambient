@@ -253,7 +253,7 @@ class Store:
         rec.setdefault("updated_at", _now())
         return await self._put_record("files", rec)
 
-    async def get_file(self, file_id: str) -> Optional[dict[str, Any]]:
+    async def get_file(self, file_id: str | None) -> Optional[dict[str, Any]]:
         return await self._get_record("files", file_id)
 
     async def update_file(self, file_id: str, mutator) -> dict[str, Any]:

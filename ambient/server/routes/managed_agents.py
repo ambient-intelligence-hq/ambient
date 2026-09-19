@@ -40,13 +40,13 @@ from fastapi import APIRouter, Body, Depends, Query, Request
 from sse_starlette.sse import EventSourceResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from ambient.config import settings
+from ambient.config import settings, self_video_analysis_enabled
 from ambient.server.auth import require_api_key
 from ambient.server.errors import bad_request, conflict, not_found
-from ambient.server.runner import SandboxNotReady, SessionRunner
+from ambient.server.runner import SandboxNotReady, SessionRunner, _empty_usage
 from ambient.server.sandbox import SandboxLimits
 from ambient.server.store import _new_id, _now
-from ambient.server.video_store import create_youtube_video, store_video
+from ambient.server.video_store import content_video_id, create_youtube_video, store_video
 import logging
 
 log = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
 # these when the client omits `agent` / `environment_id`, so callers can skip the
 # agents.create / environments.create steps entirely.
 DEFAULT_AGENT_ID = "ambient_v1"
+DEFAULT_FAST_AGENT_ID = "ambient_fast"
 DEFAULT_ENV_ID = "default"
 
 
@@ -72,10 +73,27 @@ async def seed_defaults(store) -> None:
             "id": DEFAULT_AGENT_ID,
             "version": 1,
             "name": settings.default_agent_name,
-            "description": "Default video-analysis agent (auto-seeded).",
+            "description": "Default video-analysis agent — agent mode (tool loop).",
             "model": settings.agent_model,
             "system": settings.default_agent_system,
-            "tools": [{"type": "agent_toolset_20260401"}],
+            "tools": [{"type": "video_agent_20260825"}],
+            "skills": [],
+            "mcp_servers": [],
+            "metadata": {},
+            "created_at": now,
+            "updated_at": now,
+        })
+    if await store.get_agent(DEFAULT_FAST_AGENT_ID) is None:
+        now = _now()
+        await store.put_agent({
+            "id": DEFAULT_FAST_AGENT_ID,
+            "version": 1,
+            "name": "Video Analyst (Fast)",
+            "description": "Fast mode — single dense-frame vision pass, no tools.",
+            # Fast mode is a single call on the vision model directly.
+            "model": settings.llm_model,
+            "system": settings.default_agent_system,
+            "tools": [{"type": "video_fast_20260825"}],
             "skills": [],
             "mcp_servers": [],
             "metadata": {},
@@ -235,6 +253,13 @@ async def upload_file(request: Request) -> dict:
     data = await upload.read()
     if not data:
         raise bad_request("uploaded file is empty")
+    # Content-addressed video_id: if the same bytes were ingested before, reuse
+    # that row (and its ready/in-flight description) instead of re-writing the
+    # file, re-uploading to R2, resetting status, or re-enqueueing ingestion.
+    existing = await request.app.state.store.get_file(content_video_id(data))
+    if existing is not None:
+        log.info("Reusing existing file %s for duplicate upload", existing["video_id"])
+        return _file_metadata(existing)
     meta = store_video(data, upload.filename, upload.content_type)
     # Kick off background description ingestion only when the video reached R2 —
     # the ephemeral ingest sandbox fetches it from there. Without an R2 copy
@@ -272,6 +297,13 @@ async def import_file(request: Request, body: dict[str, Any] = Body(...)) -> dic
         meta = create_youtube_video(url.strip(), filename=body.get("filename"))
     except ValueError as exc:
         raise bad_request(str(exc))
+
+    # Content-addressed video_id (keyed on the YouTube URL): reuse a prior import
+    # of the same video rather than re-preparing the source and description.
+    existing = await request.app.state.store.get_file(meta["video_id"])
+    if existing is not None:
+        log.info("Reusing existing file %s for duplicate YouTube import", meta["video_id"])
+        return _file_metadata(existing)
 
     metadata = body.get("metadata") or {}
     if metadata and isinstance(metadata, dict):
@@ -377,6 +409,23 @@ def _session_status(ambient_status: Optional[str]) -> str:
     }.get(ambient_status or "", "idle")
 
 
+def _mode_from_agent(agent_rec: dict, metadata: dict) -> str:
+    """Select the track: 'agent' (tool loop) vs 'fast' (single dense-frame call).
+
+    An explicit metadata.mode wins; otherwise it's read from the agent's declared
+    tools — a `video_agent_*` (or legacy `agent_toolset_*`) marker means agent
+    mode, and anything else (a `video_fast_*` marker or no tools) means fast mode.
+    """
+    m = (metadata or {}).get("mode")
+    if m in ("fast", "agent"):
+        return m
+    for t in agent_rec.get("tools") or []:
+        typ = (t or {}).get("type", "") if isinstance(t, dict) else ""
+        if typ.startswith("video_agent") or typ.startswith("agent_toolset"):
+            return "agent"
+    return "fast"
+
+
 async def build_session_record(body: dict, store) -> dict:
     agent_rec = await _resolve_agent_ref(body.get("agent") or DEFAULT_AGENT_ID, store)
     if agent_rec is None:
@@ -406,18 +455,21 @@ async def build_session_record(body: dict, store) -> dict:
         "wall_seconds": settings.sandbox_wall_seconds,
     }
     ma_agent = {"type": "agent", "id": agent_rec["id"], "version": agent_rec["version"]}
+    mode = _mode_from_agent(agent_rec, meta)
     return {
         "session_id": session_id,
         "status": "created",
         "video_id": video_id,
         "model": model,
+        "mode": mode,
+        "agent_system": agent_rec.get("system"),
         "title": body.get("title"),
         "metadata": body.get("metadata") or {},
         "permission_policy": {"type": "always_allow", "tools": None},
         "sandbox": {"backend": backend, "id": None, "status": "starting",
                     "boot_ms": None, "limits": limits_dict, "region": None},
         "quota": {},
-        "usage": {"input_tokens": 0, "output_tokens": 0, "turns": 0, "runs": 0},
+        "usage": _empty_usage(),
         "max_turns_per_run": max_turns,
         "subtitle_path": None,
         # Managed-Agents echo-back fields:
@@ -445,12 +497,17 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
         limits=SandboxLimits(**record["sandbox"]["limits"]),
         store=store,
         broker=broker,
+        mode=record.get("mode", "agent"),
+        system=record.get("agent_system"),
     )
     request.app.state.runners[record["session_id"]] = runner
 
     async def _boot() -> None:
         try:
-            await runner.start_sandbox()
+            # fast mode or self-video-analysis (vision-capable agent model) does not
+            # need a pre-booted sandbox. and only if backend is e2b
+            if (not record.get("mode") == "fast") and settings.sandbox_backend == "e2b":
+                await runner.start_sandbox()
             await store.update_session(record["session_id"], lambda r: {
                 **r, "status": "ready",
                 "sandbox": {**(r.get("sandbox") or {}), "id": runner.sandbox_id, "status": "ready"},
@@ -523,6 +580,8 @@ async def _get_or_rehydrate_runner(session_id: str, request: Request) -> Optiona
         store=store,
         broker=request.app.state.broker,
         messages=messages or None,
+        mode=record.get("mode", "agent"),
+        system=record.get("agent_system"),
     )
     await runner.attach_sandbox(sandbox)
     request.app.state.runners[session_id] = runner
@@ -577,12 +636,15 @@ def _to_managed_events(ev: dict) -> list[dict]:
     data `type` discriminator) is in its allowlist, and constructs each into a
     member of BetaManagedAgentsStreamSessionEvents. So we emit exactly those
     shapes:
-        run.started   -> session.status_running
-        tool.scheduled-> agent.tool_use
-        tool.result   -> agent.tool_result
-        tool.failed   -> agent.tool_result (is_error)
-        run.completed -> agent.message (the answer) + session.status_idle
-        user.message  -> user.message
+        run.started            -> session.status_running
+        agent.reasoning        -> agent.thinking (reasoning text attached)
+        tool.scheduled         -> agent.tool_use
+        tool.result            -> agent.tool_result
+        tool.failed            -> agent.tool_result (is_error)
+        span.model_request_end -> span.model_request_end (per-request token usage)
+        error                  -> session.error
+        run.completed          -> agent.message (the answer) + session.status_idle
+        user.message           -> user.message
     Everything else (turn.*, tool.started/progress, per-token chunks,
     status_changed) is dropped — it has no SDK-visible counterpart.
     """
@@ -592,6 +654,52 @@ def _to_managed_events(ev: dict) -> list[dict]:
 
     if etype == "run.started":
         return [{"type": "session.status_running", "id": _new_id("evt"), "processed_at": ts}]
+
+    if etype == "agent.reasoning":
+        # `agent.thinking` is a progress signal in the SDK schema (no content
+        # field), but the SDK's models allow extra fields, so we attach the
+        # reasoning text as `content` for clients that want to render it.
+        text = str(p.get("reasoning") or "")
+        if not text:
+            return []
+        return [{
+            "type": "agent.thinking",
+            "id": _new_id("evt"),
+            "content": [{"type": "text", "text": text}],
+            "processed_at": ts,
+        }]
+
+    if etype == "span.model_request_end":
+        usage = p.get("usage") or {}
+        return [{
+            "type": "span.model_request_end",
+            "id": _new_id("evt"),
+            "model_request_start_id": p.get("run_id") or _new_id("evt"),
+            "is_error": False,
+            "model_usage": {
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+            },
+            # Extra (non-schema) fields for richer clients.
+            "source": p.get("source"),
+            "model": p.get("model"),
+            "cost": p.get("cost"),
+            "processed_at": ts,
+        }]
+
+    if etype == "error":
+        return [{
+            "type": "session.error",
+            "id": _new_id("evt"),
+            "error": {
+                "type": "unknown_error",
+                "message": str(p.get("message") or p.get("code") or "error"),
+                "retry_status": {"type": "terminal"},
+            },
+            "processed_at": ts,
+        }]
 
     if etype == "tool.scheduled":
         return [{
@@ -637,6 +745,9 @@ def _to_managed_events(ev: dict) -> list[dict]:
             "type": "session.status_idle",
             "id": _new_id("evt"),
             "stop_reason": "end_turn" if stop in (None, "end_turn") else stop,
+            # Extra (non-schema) field: cumulative session usage snapshot so the
+            # client can render totals without a separate session fetch.
+            "usage": p.get("usage") or {},
             "processed_at": ts,
         })
         return out
@@ -648,6 +759,28 @@ def _to_managed_events(ev: dict) -> list[dict]:
             "content": [{"type": "text", "text": str(p.get("content") or "")}],
             "processed_at": ts,
         }]
+
+    if etype == "chat.completion.chunk":
+        # Forward incremental reasoning + answer text so clients can render
+        # token-by-token. (The official SDK ignores unknown event names; the demo
+        # UI renders them.)
+        content_delta = ""
+        reasoning_delta = ""
+        for ch in (p.get("choices") or []):
+            d = ch.get("delta") or {}
+            if isinstance(d.get("content"), str):
+                content_delta += d["content"]
+            r = d.get("reasoning") or d.get("reasoning_content")
+            if isinstance(r, str):
+                reasoning_delta += r
+        out: list[dict] = []
+        if reasoning_delta:
+            out.append({"type": "agent.reasoning.delta", "id": _new_id("evt"),
+                        "reasoning": reasoning_delta, "processed_at": ts})
+        if content_delta:
+            out.append({"type": "agent.message.delta", "id": _new_id("evt"),
+                        "content": [{"type": "text", "text": content_delta}], "processed_at": ts})
+        return out
 
     return []
 
@@ -676,10 +809,20 @@ async def stream_events(
         # When the SDK opens a fresh stream (no cursor), scope the replay to the
         # latest run only — otherwise the replay loop hits an earlier run's
         # run.completed and returns before ever reaching the current run's events.
+        #
+        # Anchor on the latest `user.message` as well as `run.started`. The client
+        # sends its message (persisted synchronously) and *then* opens the stream,
+        # but the run task that emits `run.started` may not have run yet. Anchoring
+        # only on run.started would race: we'd pick the *previous* run's start,
+        # replay that whole run (and stop at its run.completed) instead of the new
+        # one — surfacing prior tool calls/results again. The current run's
+        # user.message always has the highest seq at stream-open, so it's the
+        # reliable boundary.
         if not last_event_id and after_seq == 0:
             all_events = await store.list_events(session_id, after_seq=0, limit=10000)
             last_start = max(
-                (e["seq"] for e in all_events if e["type"] == "run.started"),
+                (e["seq"] for e in all_events
+                 if e["type"] in ("run.started", "user.message")),
                 default=0,
             )
             replay_after = max(replay_after, last_start - 1)
