@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -309,12 +310,18 @@ class IngestWorker:
     async def _run_job(self, video_id: str) -> None:
         if not await self._claim(video_id):
             return  # ready, actively processing elsewhere, or over attempts
+        # The whole ingest pipeline runs in an ephemeral e2b box, EXCEPT when the
+        # backend is the host range proxy ("inprocess"): then there is no e2b, so
+        # we prepare the source and describe it on the host (yt-dlp/ffmpeg + local
+        # ffmpeg) and read/write settings.video_folder directly.
+        use_host = settings.sandbox_backend != "e2b"
         box = None
         try:
-            from ambient.sandboxes.e2b.media_sandbox import E2BMediaSandbox
+            if not use_host:
+                from ambient.sandboxes.e2b.media_sandbox import E2BMediaSandbox
 
-            box = E2BMediaSandbox()
-            await asyncio.to_thread(box.create, template=settings.e2b_template)
+                box = E2BMediaSandbox()
+                await asyncio.to_thread(box.create, template=settings.e2b_template)
             rec = await self.store.get_file(video_id)
             is_youtube = bool(
                 rec
@@ -330,8 +337,12 @@ class IngestWorker:
                 source_url = (rec or {}).get("source_url")
                 if not source_url:
                     raise SourcePreparationError("YouTube source row is missing source_url")
-                await self._probe_youtube_metadata(video_id, source_url, box)
-                await self._download_youtube_source(video_id, source_url, box)
+                if use_host:
+                    # Downloads to settings.video_folder and marks source ready.
+                    await self._prepare_youtube_host(video_id, source_url)
+                else:
+                    await self._probe_youtube_metadata(video_id, source_url, box)
+                    await self._download_youtube_source(video_id, source_url, box)
 
             # Concurrent stage — all read the LOCAL source already in the box.
             # Each task flips its own row status the moment IT finishes (not after
@@ -372,9 +383,11 @@ class IngestWorker:
                 log.info("tiles ready for %s (%d tiles)", video_id, n_tiles)
 
             tasks = [asyncio.create_task(_desc_job())]
-            if is_youtube:
+            # The host path already has the source ready in video_folder (no S3
+            # push) and lets fetch_clip transcode on demand (no pre-tiling).
+            if is_youtube and not use_host:
                 tasks.append(asyncio.create_task(_upload_job()))
-            if settings.tiling_enabled:
+            if settings.tiling_enabled and not use_host:
                 tasks.append(asyncio.create_task(_tiling_job()))
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -465,6 +478,88 @@ class IngestWorker:
 
         await self.store.update_file(video_id, set_downloaded)
         log.info("source downloaded (local) for %s", video_id)
+
+    async def _prepare_youtube_host(self, video_id: str, source_url: str) -> None:
+        """Host equivalent of probe + download (no e2b, no S3): materialize the
+        source MP4 in ``settings.video_folder`` and flip the row to ready so the
+        inprocess tools and the /content endpoint serve it locally."""
+        from ambient.server.youtube_host import download_youtube, probe_youtube
+
+        def mark_processing(row: dict) -> dict:
+            if row.get("source_status") != "ready":
+                row["source_status"] = "processing"
+                row["source_error"] = None
+                row["source_updated_at"] = _now_iso()
+            return row
+
+        await self.store.update_file(video_id, mark_processing)
+
+        try:
+            info = await asyncio.to_thread(probe_youtube, source_url)
+        except Exception as exc:  # noqa: BLE001
+            raise SourcePreparationError(str(exc)) from exc
+
+        def set_meta(row: dict) -> dict:
+            yt = dict(row.get("youtube") or {})
+            yt["webpage_url"] = info.get("webpage_url") or yt.get("webpage_url")
+            yt["title"] = info.get("title") or yt.get("title")
+            yt["extractor"] = info.get("extractor") or yt.get("extractor")
+            if info.get("duration") is not None:
+                yt["duration"] = info.get("duration")
+            yt["width"] = info.get("width") or yt.get("width")
+            yt["height"] = info.get("height") or yt.get("height")
+            row["youtube"] = yt
+            return row
+
+        await self.store.update_file(video_id, set_meta)
+        log.info("metadata ready (host) for %s (title=%r)", video_id, info.get("title"))
+
+        try:
+            local_path, _ = await asyncio.to_thread(
+                download_youtube, video_id, source_url
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise SourcePreparationError(str(exc)) from exc
+
+        size = os.path.getsize(local_path)
+
+        # When S3/R2 is configured, also upload the source so remote consumers can
+        # reach it — notably a vision provider fetching the whole-video `video_url`
+        # for self-analysis, which can't read a host-local file. The host path is
+        # otherwise local-only; without this the presigned URL 404s. Best-effort:
+        # a failed upload still leaves the local file usable (source_video_url then
+        # verifies existence and falls back to inline frames).
+        r2_key: str | None = None
+        s3_uri: str | None = None
+        if settings.s3_bucket:
+            from ambient.utils.s3 import get_s3_client
+
+            candidate_key = f"{settings.s3_video_base_key}/{video_id}.mp4"
+            try:
+                s3_uri = await asyncio.to_thread(
+                    get_s3_client().upload_file, local_path, candidate_key
+                )
+                r2_key = candidate_key
+                log.info("uploaded host youtube source for %s -> %s", video_id, s3_uri)
+            except Exception as exc:  # noqa: BLE001 - local file still works; A path falls back
+                log.warning("host youtube R2 upload failed for %s: %s", video_id, exc)
+
+        def set_ready(row: dict) -> dict:
+            row["source_status"] = "ready"
+            row["source_error"] = None
+            row["source_updated_at"] = _now_iso()
+            row["local_path"] = local_path
+            row["size_bytes"] = size
+            row["mime_type"] = "video/mp4"
+            row["filename"] = row.get("filename") or f"{video_id}.mp4"
+            if r2_key:
+                row["r2_key"] = r2_key
+            if s3_uri:
+                row["s3_uri"] = s3_uri
+            return row
+
+        await self.store.update_file(video_id, set_ready)
+        log.info("source ready (host local) for %s -> %s", video_id, local_path)
 
     async def _claim(self, video_id: str) -> bool:
         """Atomically take a claimable row to `processing`. True if we own it."""

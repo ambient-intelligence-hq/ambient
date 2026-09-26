@@ -32,11 +32,13 @@ The `?beta=true` query param the SDK appends is ignored by FastAPI routing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import re
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Depends, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, Query, Request
 from sse_starlette.sse import EventSourceResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -143,16 +145,21 @@ def _agent_resource(rec: dict) -> dict:
 
 @router.post("/agents")
 async def create_agent(request: Request, body: dict[str, Any] = Body(...)) -> dict:
-    if not body.get("model"):
-        raise bad_request("agent.model is required")
     now = _now()
+    # Model is optional: a definition may override only the endpoint or system
+    # prompt. Fall back to the engine's default agent model when omitted.
+    model = body.get("model") or settings.agent_model
     rec = {
         "id": _new_id("agt"),
         "version": 1,
         "name": body.get("name"),
         "description": body.get("description"),
-        "model": body.get("model"),
+        "model": model,
         "system": body.get("system"),
+        # Optional per-agent LLM endpoint override (Studio agent definitions).
+        # None -> the runner falls back to the engine's global settings.
+        "base_url": body.get("base_url"),
+        "api_key": body.get("api_key"),
         "tools": body.get("tools") or [],
         "skills": body.get("skills") or [],
         "mcp_servers": body.get("mcp_servers") or [],
@@ -299,11 +306,33 @@ async def import_file(request: Request, body: dict[str, Any] = Body(...)) -> dic
         raise bad_request(str(exc))
 
     # Content-addressed video_id (keyed on the YouTube URL): reuse a prior import
-    # of the same video rather than re-preparing the source and description.
+    # of the same video rather than re-preparing the source and description —
+    # UNLESS that prior import failed, in which case reset it and retry (otherwise
+    # a one-off failure, e.g. a stale yt-dlp, would be permanently stuck).
     existing = await request.app.state.store.get_file(meta["video_id"])
     if existing is not None:
-        log.info("Reusing existing file %s for duplicate YouTube import", meta["video_id"])
-        return _file_metadata(existing)
+        failed = (
+            existing.get("source_status") == "failed"
+            or existing.get("description_status") == "failed"
+        )
+        if not failed:
+            log.info("Reusing existing file %s for duplicate YouTube import", meta["video_id"])
+            return _file_metadata(existing)
+
+        def _reset_for_retry(row: dict) -> dict:
+            row["source_status"] = "pending"
+            row["source_error"] = None
+            row["source_attempts"] = 0
+            row["description_status"] = "pending"
+            row["description_error"] = None
+            row["description_attempts"] = 0
+            return row
+
+        await request.app.state.store.update_file(meta["video_id"], _reset_for_retry)
+        await request.app.state.ingest.enqueue(meta["video_id"])
+        log.info("Retrying previously-failed YouTube import %s", meta["video_id"])
+        rec = await request.app.state.store.get_file(meta["video_id"])
+        return _file_metadata(rec or meta)
 
     metadata = body.get("metadata") or {}
     if metadata and isinstance(metadata, dict):
@@ -340,6 +369,82 @@ async def delete_file(file_id: str, request: Request) -> dict:
         except OSError:
             pass
     return {"type": "file_deleted", "id": file_id}
+
+
+def _resolve_local_video(rec: dict) -> Optional[str]:
+    """Local file backing a video record, if present on this host.
+
+    Prefers the exact `local_path` the store wrote; falls back to the range-proxy
+    convention (`VIDEO_FOLDER/<video_id><ext>`) so a record without local_path
+    (or a stale one) still resolves when the file is where the media tools look.
+    """
+    lp = rec.get("local_path")
+    if lp and os.path.exists(lp):
+        return lp
+    ext = os.path.splitext(rec.get("local_path") or rec.get("r2_key") or "")[1] or ".mp4"
+    cand = os.path.join(settings.video_folder, f"{rec['video_id']}{ext}")
+    return cand if os.path.exists(cand) else None
+
+
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+@router.get("/files/{file_id}/content")
+async def file_content(
+    file_id: str,
+    request: Request,
+    range: Optional[str] = Header(default=None),
+):
+    """Stream the raw video bytes for Studio's player, with HTTP Range support so
+    the browser can seek. Serves the host-local file; 404 when the source only
+    lives on S3 / hasn't been ingested locally (e.g. a pending youtube import).
+    Auth accepts `?api_key=` (see require_api_key) so a bare `<video src>` works.
+    """
+    from fastapi.responses import Response, StreamingResponse
+    import mimetypes
+
+    rec = await request.app.state.store.get_file(file_id)
+    if rec is None:
+        raise not_found("file", file_id)
+    path = _resolve_local_video(rec)
+    if path is None:
+        raise not_found("file content", file_id)
+
+    file_size = os.path.getsize(path)
+    mime = rec.get("mime_type") or mimetypes.guess_type(path)[0] or "video/mp4"
+
+    start, end = 0, file_size - 1
+    status = 200
+    headers = {"Accept-Ranges": "bytes", "Content-Type": mime}
+    if range:
+        m = _RANGE_RE.fullmatch(range.strip())
+        if m:
+            g1, g2 = m.group(1), m.group(2)
+            if g1:
+                start = int(g1)
+                end = int(g2) if g2 else file_size - 1
+            elif g2:  # suffix range: last N bytes
+                start = max(0, file_size - int(g2))
+            start, end = max(0, start), min(end, file_size - 1)
+            if start > end:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    length = end - start + 1
+    headers["Content-Length"] = str(length)
+
+    def _iter():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                data = f.read(min(512 * 1024, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    return StreamingResponse(_iter(), status_code=status, headers=headers, media_type=mime)
 
 
 # --------------------------------------------------------------------------
@@ -463,6 +568,8 @@ async def build_session_record(body: dict, store) -> dict:
         "model": model,
         "mode": mode,
         "agent_system": agent_rec.get("system"),
+        "base_url": agent_rec.get("base_url"),
+        "api_key": agent_rec.get("api_key"),
         "title": body.get("title"),
         "metadata": body.get("metadata") or {},
         "permission_policy": {"type": "always_allow", "tools": None},
@@ -499,6 +606,8 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
         broker=broker,
         mode=record.get("mode", "agent"),
         system=record.get("agent_system"),
+        base_url=record.get("base_url"),
+        api_key=record.get("api_key"),
     )
     request.app.state.runners[record["session_id"]] = runner
 
@@ -517,6 +626,15 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
 
     asyncio.create_task(_boot(), name=f"sandbox-boot-{record["session_id"]}")
     return _session_resource(record)
+
+
+@router.get("/sessions")
+async def list_sessions(request: Request, limit: int = Query(50)) -> dict:
+    """List sessions (newest first) so Studio can show real, server-side history
+    across browsers/reinstalls instead of localStorage. Not part of the Managed
+    Agents SDK surface; Studio-facing."""
+    recs = await request.app.state.store.list_sessions(limit=limit)
+    return {"data": [_session_resource(r) for r in recs], "has_more": False}
 
 
 @router.get("/sessions/{session_id}")
@@ -582,6 +700,8 @@ async def _get_or_rehydrate_runner(session_id: str, request: Request) -> Optiona
         messages=messages or None,
         mode=record.get("mode", "agent"),
         system=record.get("agent_system"),
+        base_url=record.get("base_url"),
+        api_key=record.get("api_key"),
     )
     await runner.attach_sandbox(sandbox)
     request.app.state.runners[session_id] = runner
@@ -717,6 +837,9 @@ def _to_managed_events(ev: dict) -> list[dict]:
             "tool_use_id": p.get("tool_use_id"),
             "content": [{"type": "text", "text": str(p.get("analysis") or "")}],
             "is_error": False,
+            # Extra (non-SDK) field: clip/frame media the tool produced, so Studio
+            # can expand a tool chip into previews. The official SDK ignores it.
+            "attachments": p.get("attachments") or [],
             "processed_at": ts,
         }]
 
@@ -785,6 +908,42 @@ def _to_managed_events(ev: dict) -> list[dict]:
     return []
 
 
+# Page size for replaying a session's durable event log over SSE. A run persists
+# one event per streamed LLM chunk, so a single long run is tens of thousands of
+# events — replay must page through the log, not read one fixed-size window.
+_REPLAY_PAGE = 2000
+
+
+async def _replay_anchor(store, session_id: str) -> int:
+    """`after_seq` for a fresh (cursor-less) stream: just before the latest run's
+    start, so the replay covers the current run only.
+
+    Anchors on the latest `user.message` as well as `run.started`: the client
+    sends its message (persisted synchronously) and *then* opens the stream, but
+    the run task that emits `run.started` may not have run yet. Anchoring only on
+    run.started would race and replay the *previous* run instead.
+
+    This must look at the newest boundary in the whole log. It used to scan only
+    the first 10,000 events, so once an earlier run exceeded that, a follow-up's
+    stream anchored on turn 1 and replayed it before the new turn."""
+    return max(0, await store.latest_run_start_seq(session_id) - 1)
+
+
+async def _iter_event_log(store, session_id: str, after_seq: int, page_size: int = _REPLAY_PAGE):
+    """Yield every persisted event after `after_seq`, in seq order, paging through
+    the log. (A single page used to truncate any run longer than it: the replay
+    stopped mid-run and fell into a live tail that never re-sends history, so a
+    resumed run came back partial and the stream never closed.)"""
+    cursor = after_seq
+    while True:
+        page = await store.list_events(session_id, after_seq=cursor, limit=page_size)
+        for ev in page:
+            yield ev
+        if len(page) < page_size:
+            return
+        cursor = page[-1]["seq"]
+
+
 @router.get("/sessions/{session_id}/events/stream")
 async def stream_events(
     session_id: str,
@@ -807,25 +966,9 @@ async def stream_events(
                 pass
 
         # When the SDK opens a fresh stream (no cursor), scope the replay to the
-        # latest run only — otherwise the replay loop hits an earlier run's
-        # run.completed and returns before ever reaching the current run's events.
-        #
-        # Anchor on the latest `user.message` as well as `run.started`. The client
-        # sends its message (persisted synchronously) and *then* opens the stream,
-        # but the run task that emits `run.started` may not have run yet. Anchoring
-        # only on run.started would race: we'd pick the *previous* run's start,
-        # replay that whole run (and stop at its run.completed) instead of the new
-        # one — surfacing prior tool calls/results again. The current run's
-        # user.message always has the highest seq at stream-open, so it's the
-        # reliable boundary.
+        # latest run only — see _replay_anchor.
         if not last_event_id and after_seq == 0:
-            all_events = await store.list_events(session_id, after_seq=0, limit=10000)
-            last_start = max(
-                (e["seq"] for e in all_events
-                 if e["type"] in ("run.started", "user.message")),
-                default=0,
-            )
-            replay_after = max(replay_after, last_start - 1)
+            replay_after = max(replay_after, await _replay_anchor(store, session_id))
 
         def emit(ev: dict):
             out = []
@@ -839,13 +982,15 @@ async def stream_events(
         sub = await broker.subscribe(session_id)
         try:
             seen_max = replay_after
-            # Replay from the durable log, closing on run end (run-scoped).
-            for ev in await store.list_events(session_id, after_seq=replay_after, limit=10000):
-                seen_max = max(seen_max, ev["seq"])
-                for frame in emit(ev):
-                    yield frame
-                if ev["type"] == "run.completed":
-                    return
+            # Replay from the durable log, closing on run end (run-scoped). Pages
+            # through the whole log: a run is often far longer than one page.
+            async with contextlib.aclosing(_iter_event_log(store, session_id, replay_after)) as log_events:
+                async for ev in log_events:
+                    seen_max = max(seen_max, ev["seq"])
+                    for frame in emit(ev):
+                        yield frame
+                    if ev["type"] == "run.completed":
+                        return
 
             # Live tail from Redis pub/sub.
             while True:
@@ -881,6 +1026,13 @@ async def list_events(
         raise not_found("session", session_id)
     raw = await store.list_events(session_id, after_seq=after_seq, limit=limit)
     data = []
+    max_seq = after_seq
     for ev in raw:
-        data.extend(_to_managed_events(ev))
-    return {"data": data, "has_more": False}
+        # Attach the raw event seq to each mapped event so pollers (Studio) can
+        # page with `after_seq` and fetch only new events instead of re-reading
+        # the whole (reasoning-heavy) log each tick.
+        for me in _to_managed_events(ev):
+            me["seq"] = ev["seq"]
+            data.append(me)
+        max_seq = max(max_seq, ev["seq"])
+    return {"data": data, "has_more": len(raw) >= limit, "last_seq": max_seq}

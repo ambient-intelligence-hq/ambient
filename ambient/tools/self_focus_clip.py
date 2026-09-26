@@ -55,9 +55,19 @@ async def self_focus_clip(
             frame_url = frame.frame_url or video_to_data_url(frame.frame_file_path, "image/jpeg")
             user_message_contents.append({"type": "image_url", "image_url": {"url": frame_url}})
     else:
+        # Label every clip in ABSOLUTE video time. A window may come back as several
+        # consecutive tiles whose own start/end ride a 0-based per-window timeline
+        # (see sandbox_video_tools._tiles_as_local_clips), so `clip.start_time` is
+        # NOT absolute and repeats window-to-window. Anchor on the window's true
+        # global offset (`_clip_start`) and walk each segment's duration instead —
+        # duration is convention-independent, so this is correct for both the tiled
+        # and single-clip paths and never emits misleading/duplicated 0-based labels.
+        base = float(_clip_start) if _clip_start is not None else float(start_time)
+        local = 0.0
+        n = len(media)
         # The e2b backend already uploaded clips and set clip_url; only the local
         # backend returns local files that still need uploading.
-        for clip in media:
+        for idx, clip in enumerate(media):
             if clip.clip_url is None:
                 if settings.inline_clips:
                     # No S3: leave clip_url unset so construct_payload embeds the clip
@@ -67,10 +77,26 @@ async def self_focus_clip(
                 s3_client.upload_file(clip.clip_file_path, key)
                 clip.clip_url = s3_client.get_presigned_url(key, expires_in=7200)
 
+            dur = None
+            if clip.start_time is not None and clip.end_time is not None:
+                dur = max(float(clip.end_time) - float(clip.start_time), 0.0)
+            seg_start = base + local
+            seg_end = seg_start + dur if dur is not None else float(end_time)
+            if dur is not None:
+                local += dur
+            if n == 1:
+                label = f"Clip of the video between {seg_start:.1f} and {seg_end:.1f} seconds"
+            else:
+                label = (
+                    f"Segment {idx + 1} of {n} (consecutive) — video between "
+                    f"{seg_start:.1f} and {seg_end:.1f} seconds; together these segments "
+                    f"cover the {float(start_time):.1f}-{float(end_time):.1f}s window"
+                )
+
             user_message_contents.extend([
                 {
                     "type": "text",
-                    "text": f"Clip of the video between {clip.start_time} seconds and {clip.end_time} seconds",
+                    "text": label,
                 },
                 {
                     "type": "video_url",

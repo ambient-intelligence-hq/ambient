@@ -6,12 +6,15 @@ Yields parsed chunk dicts. The HTTP route relays each as
 from __future__ import annotations
 
 import json
+import logging
 from typing import AsyncIterator, Optional
 
 import aiohttp
 
 from ambient.config import settings
 from ambient.llm import get_provider_params
+
+logger = logging.getLogger(__name__)
 
 
 async def stream_chat_completion(
@@ -70,7 +73,19 @@ async def stream_chat_completion(
         "Accept": "text/event-stream",
     }
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+    # A long agent turn (a big multimodal prompt + a multi-minute reasoning pass +
+    # a long answer) can stream healthily for well over any fixed budget, so a
+    # `total` timeout would abort a perfectly live request mid-stream and surface as
+    # a spurious `llm_error`. Use an *idle* timeout instead: `sock_read` bounds the
+    # gap between chunks (and prefill before the first byte) and resets on every
+    # read, so we only give up when the provider actually goes silent. `total=None`
+    # lifts the wall-clock cap; the run is already bounded by max_turns and the
+    # session lease.
+    client_timeout = aiohttp.ClientTimeout(
+        total=None, sock_connect=30, sock_read=timeout,
+    )
+    logger.info(f"Making LLM call to Agent - {model}")
+    async with aiohttp.ClientSession(timeout=client_timeout) as session:
         async with session.post(endpoint, headers=headers, json=body) as resp:
             if resp.status != 200:
                 err = await resp.text()

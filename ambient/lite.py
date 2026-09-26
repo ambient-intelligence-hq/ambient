@@ -87,6 +87,16 @@ class LiteStore:
         self._events.setdefault(session_id, []).append(ev)
         return ev
 
+    async def list_events(self, session_id: str, after_seq: int = 0, limit: int = 1000) -> list[dict[str, Any]]:
+        return [e for e in self._events.get(session_id, []) if e["seq"] > after_seq][:limit]
+
+    async def latest_run_start_seq(self, session_id: str) -> int:
+        return max(
+            (e["seq"] for e in self._events.get(session_id, [])
+             if e["type"] in ("user.message", "run.started")),
+            default=0,
+        )
+
     # --- files ------------------------------------------------------------
     async def put_file(self, record: dict[str, Any]) -> dict[str, Any]:
         self._files[record["video_id"]] = dict(record)

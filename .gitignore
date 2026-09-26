@@ -15,6 +15,7 @@ local_db/
 tests/test_images/
 trajectories/
 
+
 .git
 .venv
 **/__pycache__/
@@ -31,3 +32,37 @@ tests/
 *.mp3
 *.srt
 ambient/trajectories/
+.cursor/
+
+# Ambient Studio — Next.js console (ambient/studio/console) + legacy Vite web
+# (ambient/studio/web). Mirrors the console's own .gitignore so the root rules
+# hold on their own.
+# Dependencies + build output (the web build lands in dist/, covered above)
+ambient/studio/**/node_modules/
+ambient/studio/console/.next/
+ambient/studio/console/out/
+ambient/studio/console/.turbo/
+ambient/studio/console/.vercel/
+ambient/studio/console/next-env.d.ts
+ambient/studio/**/*.tsbuildinfo
+# Env files with real values — commit only the .env.example templates
+ambient/studio/**/.env
+ambient/studio/**/.env*.local
+ambient/studio/**/*.pem
+# Test / coverage output
+ambient/studio/console/coverage/
+ambient/studio/console/test-results/
+ambient/studio/console/playwright-report/
+ambient/studio/console/blob-report/
+ambient/studio/console/playwright/.cache/
+# Package-manager debug logs
+ambient/studio/**/npm-debug.log*
+ambient/studio/**/yarn-debug.log*
+ambient/studio/**/yarn-error.log*
+ambient/studio/**/.pnpm-debug.log*
+# Upstream vercel/ai-chatbot CI workflows. GitHub only runs workflows from the
+# repo-root .github/, so these never execute here — keep them out to avoid
+# implying Studio CI exists.
+ambient/studio/console/.github/
+site/
+ambient/studio/web/
