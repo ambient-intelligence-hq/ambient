@@ -238,6 +238,12 @@ async def source_video_url(video_id: str, store, expires_in: int = 7200) -> Opti
         pass
     if not key:
         key = f"{settings.s3_video_base_key}/{video_id}.mp4"
+    # Only advertise a URL a remote consumer can actually fetch. A YouTube import
+    # prepared on the host (sandbox_backend != "e2b") never uploads to R2, so the
+    # conventional key 404s — verify existence and return None so the caller falls
+    # back to inline frames instead of attaching a dead URL (which 422s the run).
+    if not await asyncio.to_thread(s3.object_exists, key):
+        return None
     try:
         return s3.get_presigned_url(key, expires_in=expires_in)
     except Exception:  # noqa: BLE001

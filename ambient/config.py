@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     video_clip_duration: int = 60 # secs
     video_clip_fps: int = 5
     video_clip_max_dimentions: Optional[int] = 768
+    # Video-capable LLM providers cap how many video attachments a single prompt
+    # may carry (observed: "At most 20 video(s) may be provided in one prompt").
+    # The runner windows retained clips (plus the whole-video self-analysis block)
+    # to stay under this before every completion, so a long, clip-heavy session
+    # never dies with a provider HTTP 400. Keep a small margin under the real cap.
+    max_clips_per_prompt: int = 18
+    max_frames_per_prompt: int = 500
 
     # Server / agent API
     api_key: str = "dev-token"

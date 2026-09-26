@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS events_session_seq_idx ON events(session_id, seq);
 
+-- Run boundaries only (each turn's user.message + run.started). A run persists one
+-- event per streamed LLM chunk, so a session's log is tens of thousands of rows;
+-- this tiny partial index lets the SSE endpoint find the latest run's start without
+-- scanning it (see latest_run_start_seq). The predicate must match that query's.
+CREATE INDEX IF NOT EXISTS events_session_run_boundary_idx
+    ON events(session_id, seq) WHERE type IN ('user.message', 'run.started');
+
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     payload_json JSONB NOT NULL,
@@ -182,6 +189,17 @@ class Store:
             "payload": payload,
             "ts": ts,
         }
+
+    async def latest_run_start_seq(self, session_id: str) -> int:
+        """Seq of the session's newest run boundary (`user.message` / `run.started`),
+        or 0 if it has none. Served by events_session_run_boundary_idx, so it stays
+        cheap no matter how many chunk events the session's runs have logged."""
+        seq = await self._pool.fetchval(
+            "SELECT seq FROM events WHERE session_id = $1 "
+            "AND type IN ('user.message', 'run.started') ORDER BY seq DESC LIMIT 1",
+            session_id,
+        )
+        return int(seq or 0)
 
     async def list_events(
         self,

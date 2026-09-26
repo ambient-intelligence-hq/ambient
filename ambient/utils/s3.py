@@ -71,6 +71,18 @@ class S3Client:
         except Exception:  # missing key / access error -> treat as absent
             return None
 
+    def object_exists(self, key: str) -> bool:
+        """True if an object exists at `key` (cheap HEAD). False on 404 or any
+        error — callers use this to avoid handing out a presigned URL for a
+        missing object (which a remote consumer would then 404 on)."""
+        if not self.bucket:
+            return False
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:  # noqa: BLE001 - 404 / access error -> treat as absent
+            return False
+
     def get_presigned_url(self, key: str, expires_in: int = 300) -> str:
         return self.s3.generate_presigned_url(
             "get_object",

@@ -36,8 +36,11 @@ import logging
 
 log = logging.getLogger(__name__)
 
-MAX_CLIPS = 25
-MAX_FRAMES = 3000
+# Cap the number of video clips carried into a single completion. Providers hard-
+# limit videos per prompt (observed: "At most 20 video(s) may be provided in one
+# prompt"), so without this a long, clip-heavy session eventually 400s and dies.
+MAX_CLIPS = settings.max_clips_per_prompt
+MAX_FRAMES = settings.max_frames_per_prompt
 
 _TOKEN_FIELDS = (
     "input_tokens",
@@ -81,7 +84,7 @@ def _retain_last_n_by_type(messages: list[dict], content_type: str, n: int) -> l
             for content in message["content"]:
                 if isinstance(content, dict) and content.get("type") == content_type:
                     seen += 1
-                    if seen >= n:
+                    if seen > n:
                         continue
                 kept.append(content)
             new_msg = dict(message)
@@ -157,6 +160,8 @@ class SessionRunner:
         messages: Optional[list[dict]] = None,
         mode: str = "agent",
         system: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
     ):
         self.session_id = session_id
         self.video_id = video_id
@@ -165,6 +170,11 @@ class SessionRunner:
         self.mode = mode
         # Optional per-agent task prompt appended to the mode's base system prompt.
         self.agent_system = system
+        # Optional per-agent LLM endpoint override. None -> fall back to the
+        # engine's global settings (agent_base_url / llm_base_url) in the LLM
+        # client. Lets a Studio agent definition point at its own provider.
+        self.base_url = base_url
+        self.api_key = api_key
         # Response schema for the current run (set by submit_user_message).
         self.output_structure: Optional[dict] = None
         self._fast_frames_loaded = False
@@ -503,12 +513,18 @@ class SessionRunner:
                         model=model,
                         messages=prepared,
                         tools=TOOLS,
+                        base_url=self.base_url,
+                        api_key=self.api_key,
                     ):
                         chunks.append(chunk)
                         await self._emit("chat.completion.chunk", chunk)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    log.exception(
+                        "agent completion failed (session=%s turn=%s): %s",
+                        self.session_id, turn, exc,
+                    )
                     await self._emit("error", {"code": "llm_error", "message": str(exc), "fatal": False})
                     stop_reason = "error"
                     break
@@ -558,10 +574,12 @@ class SessionRunner:
                     break
             else:
                 stop_reason = "max_turns"
-                # The loop hit the turn cap mid tool-use. Fall back to the last
-                # non-empty assistant text so the client still gets something
-                # rather than an empty "no response".
-                final_answer = final_answer or last_assistant_text
+                # The loop hit the turn cap mid tool-use. Force one tool-free
+                # completion so the client still gets a real, synthesized answer
+                # (from everything gathered) instead of trailing off mid-investigation.
+                # Fall back to the last non-empty assistant text only if that fails.
+                forced = await self._synthesize_final_answer(run_id, model)
+                final_answer = forced or final_answer or last_assistant_text
 
             await self._emit("run.completed", {
                 "run_id": run_id,
@@ -581,6 +599,65 @@ class SessionRunner:
             await self._set_status("ready")
             # Release the run-ownership lease so any worker can serve the next turn.
             await self.broker.release(self.session_id)
+
+    async def _synthesize_final_answer(self, run_id: str, model: str) -> str:
+        """Force one tool-free completion so a run that hit the turn cap still ends
+        with a real answer instead of trailing off mid tool-use.
+
+        The agent has spent its whole turn budget calling tools; those tool results
+        are already in ``self.messages``. We nudge it to stop calling tools and
+        synthesize everything gathered into a final answer, stream that answer to the
+        client exactly like a normal turn (via ``chat.completion.chunk``), and return
+        its text. On failure we surface a non-fatal ``llm_error`` and return "" so the
+        caller falls back to the last assistant text.
+        """
+        self.messages.append({"role": "user", "content": [{
+            "type": "text",
+            "text": (
+                "You have reached the tool-use limit for this run, so no more tools "
+                "are available. Do not attempt to call any tool. Using everything you "
+                "have already gathered, write your complete final answer now."
+            ),
+        }]})
+
+        prepared = _normalize_for_openai(self.messages)
+        prepared = _retain_last_n_by_type(prepared, "video_url", MAX_CLIPS)
+        prepared = _retain_last_n_by_type(prepared, "image_url", MAX_FRAMES)
+
+        chunks: list[dict] = []
+        try:
+            async for chunk in stream_chat_completion(
+                model=model,
+                messages=prepared,
+                tools=[],  # no tools -> the model must answer with text
+                base_url=self.base_url,
+                api_key=self.api_key,
+            ):
+                chunks.append(chunk)
+                await self._emit("chat.completion.chunk", chunk)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception(
+                "final-answer synthesis failed (session=%s): %s", self.session_id, exc,
+            )
+            await self._emit("error", {"code": "llm_error", "message": str(exc), "fatal": False})
+            return ""
+
+        assistant_msg, _finish, _tools, reasoning, agent_usage = (
+            assemble_assistant_message(chunks)
+        )
+        self.messages.append(assistant_msg)
+        self.usage["turns"] = int(self.usage.get("turns", 0)) + 1
+        forced_turn = self.max_turns_per_run + 1
+        await self._record_usage(run_id, forced_turn, model, agent_usage, "agent")
+        if settings.expose_thinking and reasoning:
+            await self._emit("agent.reasoning", {
+                "run_id": run_id,
+                "turn": forced_turn,
+                "reasoning": reasoning,
+            })
+        return self._extract_answer_text(assistant_msg)
 
     # --- fast mode --------------------------------------------------------
 
@@ -664,7 +741,9 @@ class SessionRunner:
             return
         # Media tools / the video URL read the source from S3 for youtube imports.
         await self._await_source_ready()
-        await self._attach_video_context(settings.llm_base_url, self.model)
+        await self._attach_video_context(
+            self.base_url or settings.llm_base_url, self.model
+        )
         self._fast_frames_loaded = True
 
     async def _run_fast(self, model: str) -> None:
@@ -704,14 +783,19 @@ class SessionRunner:
                     reasoning_enabled=reasoning_enabled, max_tokens=settings.fast_max_tokens,
                     extra_body=extra_body,
                     # Fast mode is a direct vision call -> use the LLM (vision)
-                    # endpoint, not the agent-orchestrator endpoint.
-                    base_url=settings.llm_base_url, api_key=settings.llm_api_key,
+                    # endpoint, not the agent-orchestrator endpoint. A per-agent
+                    # override (Studio agent definition) wins when set.
+                    base_url=self.base_url or settings.llm_base_url,
+                    api_key=self.api_key or settings.llm_api_key,
                 ):
                     chunks.append(chunk)
                     await self._emit("chat.completion.chunk", chunk)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                log.exception(
+                    "fast completion failed (session=%s): %s", self.session_id, exc,
+                )
                 await self._emit("error", {"code": "llm_error", "message": str(exc), "fatal": False})
                 stop_reason = "error"
                 chunks = []
