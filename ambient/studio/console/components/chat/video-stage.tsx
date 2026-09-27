@@ -8,10 +8,10 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import useSWR from "swr";
-import { useActiveChat } from "@/hooks/use-active-chat";
-import { useSelectedVideo } from "@/hooks/use-selected-video";
+import { useActiveVideo } from "@/hooks/use-active-chat";
 import { cn, fetcher } from "@/lib/utils";
 import { onSeek } from "./seek";
+import { VideoEmptyState } from "./video-empty-state";
 
 type EngineFile = {
   id: string;
@@ -28,12 +28,9 @@ const contentPath = (id: string) => `/api/ambient/files/${id}/content`;
 // The center "stage": the video is the hero (reference layout). Citation clicks
 // in the chat seek it via the `ambient:seek` event.
 export function VideoStage() {
-  // A chat page shows its own video. The global selection (shared across tabs
-  // via localStorage) only decides the video for a new chat — reading it here
-  // made a session page play whatever was selected last, in any tab.
-  const { chatVideoId } = useActiveChat();
-  const selectedVideo = useSelectedVideo();
-  const videoId = chatVideoId ?? selectedVideo;
+  // The page's video: the chat's own, or the one picked for a new chat. Null
+  // until one is picked — every new chat starts on the empty state.
+  const { videoId } = useActiveVideo();
   const vref = useRef<HTMLVideoElement>(null);
   const [flash, setFlash] = useState(false);
   const { data } = useSWR<{ data: EngineFile[] }>("/api/ambient/files", fetcher, {
@@ -65,20 +62,7 @@ export function VideoStage() {
   );
 
   if (!videoId) {
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
-        <div className="flex size-16 items-center justify-center rounded-3xl bg-muted">
-          <FileVideoIcon className="size-7 text-muted-foreground" />
-        </div>
-        <div>
-          <h2 className="font-semibold text-lg">Pick a video to begin</h2>
-          <p className="mt-1 max-w-sm text-muted-foreground text-sm">
-            Choose one from the selector above or upload a new video, then ask
-            anything about it on the right.
-          </p>
-        </div>
-      </div>
-    );
+    return <VideoEmptyState />;
   }
 
   return (

@@ -40,6 +40,14 @@ export const chat = pgTable("Chat", {
   // not whichever one was selected last. Null for chats created before this
   // was recorded (resolved from the engine session on load, then backfilled).
   videoId: varchar("videoId", { length: 64 }),
+  // The engine session this chat maps to (one per chat). Lets any request — a
+  // follow-up after a restart, a resume from a reload — find the run.
+  engineSessionId: varchar("engineSessionId", { length: 64 }),
+  // Binds the chat's latest user message to the exact engine run answering it
+  // ({messageId, sessionId, state, afterSeq}; see TurnAnchor in
+  // lib/ambient/session-map.ts). Resume replays that run, never "the engine's
+  // latest run". Previously both of these lived in Redis.
+  turnAnchor: json("turnAnchor"),
 });
 
 export type Chat = InferSelectModel<typeof chat>;

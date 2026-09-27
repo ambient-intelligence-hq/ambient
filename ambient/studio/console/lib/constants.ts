@@ -10,6 +10,21 @@ export const isTestEnvironment = Boolean(
 
 export const guestRegex = /^guest-\d+$/;
 
+// Whether the session cookie for this request is the HTTPS-only
+// (`__Secure-`) variant. Must match Auth.js's own rule — it issues the secure
+// cookie only when the request URL is https (behind a TLS proxy, per
+// X-Forwarded-Proto). Keying this off NODE_ENV instead (the upstream template)
+// breaks a production build served over plain http, e.g. a self-hosted
+// http://localhost:3000: the cookie is set under one name and read under the
+// other, so every request bounces to guest sign-in in an endless loop.
+export function isSecureRequest(request: Request): boolean {
+  const forwarded = request.headers.get("x-forwarded-proto");
+  const proto = forwarded
+    ? `${forwarded.split(",")[0].trim()}:`
+    : new URL(request.url).protocol;
+  return proto === "https:";
+}
+
 export const DUMMY_PASSWORD = generateDummyPassword();
 
 export const suggestions = [

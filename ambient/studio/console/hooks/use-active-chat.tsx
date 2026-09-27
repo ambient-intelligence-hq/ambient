@@ -3,14 +3,16 @@
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import {
   createContext,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
+  useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -18,16 +20,16 @@ import {
 import useSWR, { useSWRConfig } from "swr";
 import { unstable_serialize } from "swr/infinite";
 import { useDataStream } from "@/components/chat/data-stream-provider";
-import { getActiveAgentDef } from "@/lib/ai/agent-defs";
-import { getMode } from "@/lib/ai/mode";
 import { getChatHistoryPaginationKey } from "@/components/chat/sidebar-history";
 import { toast } from "@/components/chat/toast";
 import type { VisibilityType } from "@/components/chat/visibility-selector";
 import { useAutoResume } from "@/hooks/use-auto-resume";
-import { setSelectedVideo } from "@/hooks/use-selected-video";
+import { getActiveAgentDef } from "@/lib/ai/agent-defs";
+import { getMode } from "@/lib/ai/mode";
 import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import type { Vote } from "@/lib/db/schema";
 import { ChatbotError } from "@/lib/errors";
+import { NEW_CHAT_EVENT } from "@/lib/new-chat";
 import type { ChatMessage } from "@/lib/types";
 import { fetcher, fetchWithErrorHandlers, generateUUID } from "@/lib/utils";
 
@@ -48,14 +50,29 @@ type ActiveChatContextValue = {
   votes: Vote[] | undefined;
   currentModelId: string;
   setCurrentModelId: (id: string) => void;
-  // The video the open chat is about (null for a new chat, or an old chat whose
-  // video can't be resolved).
-  chatVideoId: string | null;
   showCreditCardAlert: boolean;
   setShowCreditCardAlert: Dispatch<SetStateAction<boolean>>;
 };
 
 const ActiveChatContext = createContext<ActiveChatContextValue | null>(null);
+
+// The page's video, kept in its own context so the stage, the video selector and
+// the drop zone don't re-render on every streamed token (the chat context
+// changes with each message update).
+type ActiveVideoContextValue = {
+  // What this page is about: the open chat's own video, or — on a new chat — the
+  // video picked for it. Null until one is picked: every new chat starts empty.
+  videoId: string | null;
+  // Pick a video for this page. A new chat takes it as its video; a chat that
+  // has already started is bound to its own video (its engine session reads only
+  // that one), so picking a different one opens a new chat about it instead.
+  selectVideo: (id: string) => void;
+  // True once the chat has started (so its video is fixed and picking another
+  // opens a new chat).
+  boundToVideo: boolean;
+};
+
+const ActiveVideoContext = createContext<ActiveVideoContextValue | null>(null);
 
 function extractChatId(pathname: string): string | null {
   const match = pathname.match(/\/chat\/([^/]+)/);
@@ -64,6 +81,7 @@ function extractChatId(pathname: string): string | null {
 
 export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const pathname = usePathname();
+  const router = useRouter();
   const { setDataStream, setWaitingStatus } = useDataStream();
   const { mutate } = useSWRConfig();
 
@@ -72,10 +90,26 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const newChatIdRef = useRef(generateUUID());
   const prevPathnameRef = useRef(pathname);
 
-  if (isNewChat && prevPathnameRef.current !== pathname) {
+  // Bumped by "New chat" (see lib/new-chat.ts). Forces a fresh chat id even when
+  // already on "/", where navigating changes nothing — so a new chat always
+  // starts clean, with no video picked.
+  const [newChatNonce, setNewChatNonce] = useState(0);
+  const prevNewChatNonceRef = useRef(newChatNonce);
+  useEffect(() => {
+    const onNewChat = () => setNewChatNonce((n) => n + 1);
+    window.addEventListener(NEW_CHAT_EVENT, onNewChat);
+    return () => window.removeEventListener(NEW_CHAT_EVENT, onNewChat);
+  }, []);
+
+  if (
+    isNewChat &&
+    (prevPathnameRef.current !== pathname ||
+      prevNewChatNonceRef.current !== newChatNonce)
+  ) {
     newChatIdRef.current = generateUUID();
   }
   prevPathnameRef.current = pathname;
+  prevNewChatNonceRef.current = newChatNonce;
 
   const chatId = chatIdFromUrl ?? newChatIdRef.current;
 
@@ -102,20 +136,38 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const visibility: VisibilityType = isNewChat
     ? "private"
     : (chatData?.visibility ?? "private");
+  // The video recorded for this chat (see Chat.videoId); fixed once set.
   const chatVideoId: string | null = isNewChat
     ? null
     : (chatData?.videoId ?? null);
 
-  // A session page shows its own video. The selection is global (the player,
-  // the selector and the new-chat transport all read it), so switch it to this
-  // chat's video whenever a chat is opened — otherwise the page kept showing
-  // whichever video was selected last. A chat's video never changes, so even a
-  // stale cached copy of the chat is safe to act on.
-  useEffect(() => {
-    if (chatVideoId) {
-      setSelectedVideo(chatVideoId);
+  // The video picked for a chat that has none recorded yet — i.e. a new chat.
+  // Keyed by chat id, so every new chat starts empty. Once the first message
+  // creates the chat, the server's `chatVideoId` takes over (the same value).
+  const [draftVideo, setDraftVideo] = useState<{
+    chatId: string;
+    videoId: string;
+  } | null>(null);
+  const videoId =
+    chatVideoId ?? (draftVideo?.chatId === chatId ? draftVideo.videoId : null);
+  // Read by the chat transport at send time and by selectVideo.
+  const videoIdRef = useRef(videoId);
+  videoIdRef.current = videoId;
+  const chatIdRef = useRef(chatId);
+  chatIdRef.current = chatId;
+  const chatVideoIdRef = useRef(chatVideoId);
+  chatVideoIdRef.current = chatVideoId;
+
+  // A video picked while viewing a chat bound to a different one: handed to the
+  // new chat that picking it opens. Applied before paint so that chat never
+  // flashes the empty screen.
+  const pendingNewChatVideoRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (isNewChat && pendingNewChatVideoRef.current) {
+      setDraftVideo({ chatId, videoId: pendingNewChatVideoRef.current });
+      pendingNewChatVideoRef.current = null;
     }
-  }, [chatId, chatVideoId]);
+  }, [chatId, isNewChat]);
 
   const {
     messages,
@@ -189,22 +241,20 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
             })
           );
 
-        // Ambient: the currently-selected video (set by the video selector).
-        const videoId =
-          typeof window !== "undefined"
-            ? localStorage.getItem("ambient.videoId") || undefined
-            : undefined;
+        // Ambient: this page's video (the chat's own, or the one picked for a
+        // new chat). The server uses an existing chat's recorded video anyway.
+        const pageVideoId = videoIdRef.current ?? undefined;
         // Ambient: the active Studio agent definition (LLM setup) + the global
         // run mode (top-center toggle) — separate concerns now.
         const isClient = typeof window !== "undefined";
         const activeDef = isClient ? getActiveAgentDef() : undefined;
         const agentDef = activeDef
           ? {
+              apiKey: activeDef.apiKey,
+              baseUrl: activeDef.baseUrl,
               id: activeDef.id,
               model: activeDef.model,
               system: activeDef.system,
-              baseUrl: activeDef.baseUrl,
-              apiKey: activeDef.apiKey,
             }
           : undefined;
 
@@ -214,11 +264,11 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
             ...(isToolApprovalContinuation
               ? { messages: request.messages }
               : { message: lastMessage }),
+            agentDef,
+            ambientMode: isClient ? getMode() : undefined,
             selectedChatModel: currentModelIdRef.current,
             selectedVisibilityType: visibility,
-            videoId,
-            ambientMode: isClient ? getMode() : undefined,
-            agentDef,
+            videoId: pageVideoId,
             ...request.body,
           },
         };
@@ -229,6 +279,32 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   // Read inside effects without re-running them on every status change.
   const statusRef = useRef(status);
   statusRef.current = status;
+  const hasMessagesRef = useRef(false);
+  hasMessagesRef.current = messages.length > 0;
+
+  const selectVideo = useCallback(
+    (id: string) => {
+      if (id === videoIdRef.current) {
+        return;
+      }
+      // A chat that has started is bound to its video. Picking another would
+      // show one video while follow-ups are answered about the other, so open a
+      // new chat about the picked video instead.
+      if (hasMessagesRef.current || chatVideoIdRef.current !== null) {
+        pendingNewChatVideoRef.current = id;
+        router.push("/");
+        return;
+      }
+      setDraftVideo({ chatId: chatIdRef.current, videoId: id });
+    },
+    [router]
+  );
+
+  const boundToVideo = messages.length > 0 || chatVideoId !== null;
+  const videoValue = useMemo<ActiveVideoContextValue>(
+    () => ({ boundToVideo, selectVideo, videoId }),
+    [boundToVideo, selectVideo, videoId]
+  );
 
   useEffect(() => {
     if (status === "submitted" || status === "ready" || status === "error") {
@@ -379,7 +455,6 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
     () => ({
       addToolApprovalResponse,
       chatId,
-      chatVideoId,
       currentModelId,
       input,
       isLoading: !isNewChat && isLoading,
@@ -399,7 +474,6 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
     }),
     [
       chatId,
-      chatVideoId,
       messages,
       setMessages,
       sendMessage,
@@ -420,7 +494,9 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
 
   return (
     <ActiveChatContext.Provider value={value}>
-      {children}
+      <ActiveVideoContext.Provider value={videoValue}>
+        {children}
+      </ActiveVideoContext.Provider>
     </ActiveChatContext.Provider>
   );
 }
@@ -429,6 +505,14 @@ export function useActiveChat() {
   const context = useContext(ActiveChatContext);
   if (!context) {
     throw new Error("useActiveChat must be used within ActiveChatProvider");
+  }
+  return context;
+}
+
+export function useActiveVideo() {
+  const context = useContext(ActiveVideoContext);
+  if (!context) {
+    throw new Error("useActiveVideo must be used within ActiveChatProvider");
   }
   return context;
 }

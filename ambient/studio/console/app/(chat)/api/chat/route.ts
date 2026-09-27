@@ -1,18 +1,14 @@
-import { geolocation, ipAddress } from "@vercel/functions";
+import { geolocation } from "@vercel/functions";
 import {
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
-  generateId,
   isStepCount,
   streamText,
   toUIMessageStream,
 } from "ai";
 import { checkBotId } from "botid/server";
-import { after } from "next/server";
-import { createResumableStreamContext } from "resumable-stream";
-import { auth, type UserType } from "@/app/(auth)/auth";
-import { entitlementsByUserType } from "@/lib/ai/entitlements";
+import { auth } from "@/app/(auth)/auth";
 import {
   allowedModelIds,
   chatModels,
@@ -29,7 +25,6 @@ import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
-  createStreamId,
   deleteChatById,
   getChatById,
   getMessageCountByUserId,
@@ -42,7 +37,6 @@ import {
 } from "@/lib/db/queries";
 import type { DBMessage } from "@/lib/db/schema";
 import { ChatbotError } from "@/lib/errors";
-import { checkIpRateLimit } from "@/lib/ratelimit";
 import type { ChatMessage, WaitingStatusData } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
@@ -51,13 +45,11 @@ import {
   createSession as createEngineSession,
   DEFAULT_AGENT_IDS,
 } from "@/lib/ambient/engine";
-import { getChatSessionId, setChatSession } from "@/lib/ambient/session-map";
+import { setChatSession } from "@/lib/ambient/session-map";
 import { resolveChatVideoId } from "@/lib/ambient/chat-video";
 import { ambientMessageMetadata } from "@/lib/ambient/turn";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
-// chatId -> engine sessionId. In-memory (dev); survives the server process.
-const engineSessionForChat = new Map<string, string>();
 // Agent-definition signature (model|system|mode) -> engine agent id, so a custom
 // Studio agent definition is created on the engine once and reused across chats.
 const engineAgentForDef = new Map<string, string>();
@@ -121,15 +113,6 @@ function isModelStreamActivity(chunk: { type: string }) {
   );
 }
 
-function getStreamContext() {
-  try {
-    return createResumableStreamContext({ waitUntil: after });
-  } catch {
-    return null;
-  }
-}
-
-export { getStreamContext };
 
 export async function POST(request: Request) {
   let requestBody: PostRequestBody;
@@ -167,31 +150,6 @@ export async function POST(request: Request) {
       videoId ??
       undefined;
 
-    // Resolve (once per chat) the engine session this chat maps to, so follow-up
-    // questions keep the agent's context. The in-memory map is a cache; the
-    // Redis pointer is the durable copy — without it, a follow-up after a server
-    // restart / HMR module reload / another worker silently started a fresh
-    // engine session and lost the conversation.
-    let ambientSessionId = turnVideoId
-      ? (engineSessionForChat.get(id) ?? (await getChatSessionId(id)) ?? undefined)
-      : undefined;
-    if (ambientSessionId) {
-      engineSessionForChat.set(id, ambientSessionId);
-    }
-    if (turnVideoId && !ambientSessionId) {
-      // Bind the session to a custom engine agent when the active definition
-      // sets a model; otherwise the engine uses its default seeded agent.
-      const engineAgentId = await resolveEngineAgentId(agentDef, ambientMode);
-      const s = await createEngineSession(turnVideoId, ambientMode, engineAgentId);
-      ambientSessionId = s.id;
-      engineSessionForChat.set(id, ambientSessionId);
-    }
-    // Persist the chat → engine-session pointer so the resume endpoint can find
-    // this run from a different request (reload / Fast-Refresh remount / worker).
-    if (ambientSessionId) {
-      await setChatSession(id, ambientSessionId);
-    }
-
     const [botIdResult, session] = await Promise.all([
       checkBotId().catch(() => null),
       auth(),
@@ -209,17 +167,19 @@ export async function POST(request: Request) {
       ? selectedChatModel
       : DEFAULT_CHAT_MODEL;
 
-    await checkIpRateLimit(ipAddress(request));
-
-    const userType: UserType = session.user.type;
-
-    const messageCount = await getMessageCountByUserId({
-      differenceInHours: 1,
-      id: session.user.id,
-    });
-
-    if (messageCount > entitlementsByUserType[userType].maxMessagesPerHour) {
-      return new ChatbotError("rate_limit:chat").toResponse();
+    // Optional per-user message quota. The upstream template hard-coded 10/hour
+    // (plus a Redis per-IP limit) — right for a public demo on shared keys, wrong
+    // for a self-hosted, bring-your-own-key install. Off unless
+    // STUDIO_MAX_MESSAGES_PER_HOUR is set.
+    const maxMessagesPerHour = Number(process.env.STUDIO_MAX_MESSAGES_PER_HOUR || 0);
+    if (maxMessagesPerHour > 0) {
+      const messageCount = await getMessageCountByUserId({
+        differenceInHours: 1,
+        id: session.user.id,
+      });
+      if (messageCount > maxMessagesPerHour) {
+        return new ChatbotError("rate_limit:chat").toResponse();
+      }
     }
 
     const isToolApprovalFlow = Boolean(messages);
@@ -242,6 +202,23 @@ export async function POST(request: Request) {
         visibility: selectedVisibilityType,
       });
       titlePromise = generateTitleFromUserMessage({ message });
+    }
+
+    // Resolve the engine session this chat maps to (created on the chat's first
+    // turn), so follow-ups keep the agent's context. It's stored on the chat row,
+    // so any request — a follow-up after a restart, another worker, a resume —
+    // finds it. Resolved only now: after auth (an unauthenticated request never
+    // creates engine sessions) and once the chat row exists to record it on.
+    let ambientSessionId: string | undefined = turnVideoId
+      ? (existingChat?.engineSessionId ?? undefined)
+      : undefined;
+    if (turnVideoId && !ambientSessionId) {
+      // Bind the session to a custom engine agent when the active definition
+      // sets a model; otherwise the engine uses its default seeded agent.
+      const engineAgentId = await resolveEngineAgentId(agentDef, ambientMode);
+      const s = await createEngineSession(turnVideoId, ambientMode, engineAgentId);
+      ambientSessionId = s.id;
+      await setChatSession(id, ambientSessionId);
     }
 
     let uiMessages: ChatMessage[];
@@ -579,27 +556,7 @@ export async function POST(request: Request) {
       originalMessages: isToolApprovalFlow ? uiMessages : undefined,
     });
 
-    return createUIMessageStreamResponse({
-      async consumeSseStream({ stream: sseStream }) {
-        if (!process.env.REDIS_URL) {
-          return;
-        }
-        try {
-          const streamContext = getStreamContext();
-          if (streamContext) {
-            const streamId = generateId();
-            await createStreamId({ chatId: id, streamId });
-            await streamContext.createNewResumableStream(
-              streamId,
-              () => sseStream
-            );
-          }
-        } catch {
-          /* non-critical */
-        }
-      },
-      stream,
-    });
+    return createUIMessageStreamResponse({ stream });
   } catch (error) {
     const vercelId = request.headers.get("x-vercel-id");
 
