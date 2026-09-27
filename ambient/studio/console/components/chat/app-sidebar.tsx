@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  MessageSquareIcon,
   PanelLeftIcon,
   PenSquareIcon,
   TrashIcon,
@@ -17,6 +16,7 @@ import {
   getChatHistoryPaginationKey,
   SidebarHistory,
 } from "@/components/chat/sidebar-history";
+import { AmbientAvatar } from "@/components/chat/ambient-mark";
 import { SidebarUserNav } from "@/components/chat/sidebar-user-nav";
 import {
   Sidebar,
@@ -32,6 +32,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
+import { NEW_CHAT_EVENT, startNewChat } from "@/lib/new-chat";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -54,13 +55,20 @@ export function AppSidebar({ user }: { user: User | undefined }) {
     setOpenMobile(false);
   }, [setOpenMobile]);
 
+  // The logo links to "/": treat it as "New chat" so it also starts clean when
+  // already on a new chat (see lib/new-chat.ts).
+  const handleLogoClick = useCallback(() => {
+    setOpenMobile(false);
+    window.dispatchEvent(new Event(NEW_CHAT_EVENT));
+  }, [setOpenMobile]);
+
   const handleToggleSidebar = useCallback(() => {
     toggleSidebar();
   }, [toggleSidebar]);
 
   const handleNewChat = useCallback(() => {
     setOpenMobile(false);
-    router.push("/");
+    startNewChat(router);
   }, [router, setOpenMobile]);
 
   const handleShowDeleteAllDialog = useCallback(() => {
@@ -84,17 +92,20 @@ export function AppSidebar({ user }: { user: User | undefined }) {
   return (
     <>
       <Sidebar collapsible="icon">
-        <SidebarHeader className="pb-0 pt-3">
+        <SidebarHeader className="pt-3 pb-3">
           <SidebarMenu>
             <SidebarMenuItem className="flex flex-row items-center justify-between">
               <div className="group/logo relative flex items-center justify-center">
                 <SidebarMenuButton
                   asChild
-                  className="size-8 !px-0 items-center justify-center group-data-[collapsible=icon]:group-hover/logo:opacity-0"
-                  tooltip="Chatbot"
+                  className="h-8 gap-2 px-1.5 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:p-0! group-data-[collapsible=icon]:group-hover/logo:opacity-0"
+                  tooltip="Ambient"
                 >
-                  <Link href="/" onClick={closeMobile}>
-                    <MessageSquareIcon className="size-4 text-sidebar-foreground/50" />
+                  <Link href="/" onClick={handleLogoClick}>
+                    <AmbientAvatar className="size-7 rounded-lg" />
+                    <span className="font-semibold text-base tracking-tight group-data-[collapsible=icon]:hidden">
+                      Ambient
+                    </span>
                   </Link>
                 </SidebarMenuButton>
                 <Tooltip>

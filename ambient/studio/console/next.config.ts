@@ -20,6 +20,9 @@ const nextConfig: NextConfig = {
     : {}),
   cacheComponents: true,
   devIndicators: false,
+  // Self-contained server build (.next/standalone: server.js + only the
+  // node_modules it traces) for the Docker image. No effect on `next dev`.
+  output: "standalone",
   env: {
     NEXT_PUBLIC_BASE_PATH: basePath,
   },

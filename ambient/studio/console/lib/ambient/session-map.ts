@@ -1,47 +1,32 @@
-// Durable chat → engine pointers (Redis).
+import "server-only";
+
+// Durable chat → engine pointers, stored on the chat row (Postgres).
 //
 // Resume needs to find the engine run for a chat from a *different* request than
 // the one that started it (a page reload, a Fast-Refresh remount, another Next
-// worker). An in-memory Map doesn't survive those, so we persist the pointers in
-// Redis. The engine run + its events are already durable on the engine side;
-// these are just the pointers to them.
+// worker), and a follow-up after a restart needs the chat's engine session. The
+// engine run + its events are already durable on the engine side; these are just
+// the pointers to them:
 //
-//   ambient:chat-session:<chatId>  -> engine session id (one per chat)
-//   ambient:chat-turn:<chatId>     -> TurnAnchor for the chat's latest turn
+//   Chat.engineSessionId  -> the engine session (one per chat)
+//   Chat.turnAnchor       -> TurnAnchor for the chat's latest turn
+//
+// These used to live in Redis (with 24h/7d TTLs). Keeping them on the chat row
+// makes them permanent and means the Studio needs no Redis at all. Writes are
+// no-ops until the chat row exists (it's created before the engine is called).
 
-import { createClient, type RedisClientType } from "redis";
-
-const SESSION_TTL_SECONDS = 60 * 60 * 24; // 24h — matches the engine's run retention window
-// Turn anchors outlive a browser session so a chat reopened days later can still
-// be repaired from the engine's (durable) event log if its last turn was cut.
-const TURN_TTL_SECONDS = 60 * 60 * 24 * 7;
-const sessionKey = (chatId: string) => `ambient:chat-session:${chatId}`;
-const turnKey = (chatId: string) => `ambient:chat-turn:${chatId}`;
-
-let clientPromise: Promise<RedisClientType> | null = null;
-
-function getClient(): Promise<RedisClientType> | null {
-  const url = process.env.REDIS_URL;
-  if (!url) {
-    return null;
-  }
-  if (!clientPromise) {
-    const client = createClient({ url }) as RedisClientType;
-    client.on("error", () => {
-      /* swallow — resume is best-effort */
-    });
-    clientPromise = client.connect().then(() => client);
-  }
-  return clientPromise;
-}
+import {
+  getChatEnginePointers,
+  setChatEngineSessionId,
+  setChatTurnAnchor,
+} from "@/lib/db/queries";
 
 export async function setChatSession(
   chatId: string,
   sessionId: string
 ): Promise<void> {
   try {
-    const client = await getClient();
-    await client?.set(sessionKey(chatId), sessionId, { EX: SESSION_TTL_SECONDS });
+    await setChatEngineSessionId({ id: chatId, engineSessionId: sessionId });
   } catch {
     /* best-effort */
   }
@@ -49,8 +34,7 @@ export async function setChatSession(
 
 export async function getChatSessionId(chatId: string): Promise<string | null> {
   try {
-    const client = await getClient();
-    return (await client?.get(sessionKey(chatId))) ?? null;
+    return (await getChatEnginePointers({ id: chatId }))?.engineSessionId ?? null;
   } catch {
     return null;
   }
@@ -78,10 +62,7 @@ export async function setTurnAnchor(
   anchor: TurnAnchor
 ): Promise<void> {
   try {
-    const client = await getClient();
-    await client?.set(turnKey(chatId), JSON.stringify(anchor), {
-      EX: TURN_TTL_SECONDS,
-    });
+    await setChatTurnAnchor({ id: chatId, turnAnchor: anchor });
   } catch {
     /* best-effort */
   }
@@ -89,9 +70,8 @@ export async function setTurnAnchor(
 
 export async function getTurnAnchor(chatId: string): Promise<TurnAnchor | null> {
   try {
-    const client = await getClient();
-    const raw = await client?.get(turnKey(chatId));
-    return raw ? (JSON.parse(raw) as TurnAnchor) : null;
+    const anchor = (await getChatEnginePointers({ id: chatId }))?.turnAnchor;
+    return anchor ? (anchor as TurnAnchor) : null;
   } catch {
     return null;
   }

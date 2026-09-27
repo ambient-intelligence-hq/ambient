@@ -17,7 +17,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { useActiveChat } from "@/hooks/use-active-chat";
+import { useActiveChat, useActiveVideo } from "@/hooks/use-active-chat";
 import {
   initialArtifactData,
   useArtifact,
@@ -33,6 +33,7 @@ import { submitEditedMessage } from "./message-editor";
 import { Messages } from "./messages";
 import { MultimodalInput } from "./multimodal-input";
 import { SandboxTerminal } from "./sandbox-terminal";
+import { StageDropZone } from "./stage-drop-zone";
 import { VideoStage } from "./video-stage";
 
 const CHAT_MIN_WIDTH = 360;
@@ -61,6 +62,7 @@ export function ChatShell() {
     showCreditCardAlert,
     setShowCreditCardAlert,
   } = useActiveChat();
+  const { videoId } = useActiveVideo();
 
   const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(
     null
@@ -178,17 +180,20 @@ export function ChatShell() {
             right beneath it. Both are centered in one scroll column so they read
             as a single stack instead of hugging opposite corners. */}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <ChatHeader
-            chatId={chatId}
-            isReadonly={isReadonly}
-            selectedVisibilityType={visibilityType}
-          />
-          {/* Top-aligned stack: the video starts at the top of the stage (level
-              with the chat panel), the terminal docked right beneath it. */}
-          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pt-3 pb-6 md:px-6">
-            <VideoStage />
-            <SandboxTerminal messages={messages} />
-          </div>
+          <ChatHeader />
+          {/* The whole stage accepts a dropped video file. */}
+          <StageDropZone className="flex min-h-0 flex-1 flex-col">
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-6 md:px-6">
+              {/* Video with the terminal docked beneath it, centered vertically
+                  when it fits (my-auto rather than justify-center, so a taller
+                  stack still scrolls from its top instead of being clipped). */}
+              <div className="my-auto flex w-full flex-col gap-4">
+                <VideoStage />
+                {/* Nothing to show in the terminal until there's a video. */}
+                {videoId ? <SandboxTerminal messages={messages} /> : null}
+              </div>
+            </div>
+          </StageDropZone>
         </div>
 
         {/* Draggable grip to resize the conversation panel. */}
@@ -248,6 +253,7 @@ export function ChatShell() {
                   setMessages={setMessages}
                   status={status}
                   stop={stop}
+                  videoReady={videoId !== null}
                 />
               )}
             </div>

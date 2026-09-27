@@ -101,6 +101,48 @@ export async function saveChat({
   }
 }
 
+// Chat → engine pointers (Chat.engineSessionId / Chat.turnAnchor). Accessed via
+// lib/ambient/session-map.ts. Updates are no-ops until the chat row exists.
+export async function getChatEnginePointers({ id }: { id: string }) {
+  try {
+    const [row] = await db
+      .select({ engineSessionId: chat.engineSessionId, turnAnchor: chat.turnAnchor })
+      .from(chat)
+      .where(eq(chat.id, id));
+    return row ?? null;
+  } catch (error) {
+    throw new ChatbotError("bad_request:database", { cause: error });
+  }
+}
+
+export async function setChatEngineSessionId({
+  id,
+  engineSessionId,
+}: {
+  id: string;
+  engineSessionId: string;
+}) {
+  try {
+    return await db.update(chat).set({ engineSessionId }).where(eq(chat.id, id));
+  } catch (error) {
+    throw new ChatbotError("bad_request:database", { cause: error });
+  }
+}
+
+export async function setChatTurnAnchor({
+  id,
+  turnAnchor,
+}: {
+  id: string;
+  turnAnchor: unknown;
+}) {
+  try {
+    return await db.update(chat).set({ turnAnchor }).where(eq(chat.id, id));
+  } catch (error) {
+    throw new ChatbotError("bad_request:database", { cause: error });
+  }
+}
+
 // Record a chat's video (backfill for chats created before Chat.videoId existed).
 // Only fills an empty value: a chat's video never changes once set.
 export async function setChatVideoIdIfMissing({
