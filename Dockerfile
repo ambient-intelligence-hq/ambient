@@ -16,11 +16,11 @@ WORKDIR /app
 # solvers), which the host backend (SANDBOX_BACKEND != e2b) shells out to for
 # YouTube imports — no e2b sandbox or S3 needed. /app/.venv/bin is on PATH below.
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --extra youtube --no-install-project
+RUN uv sync --locked --no-dev --extra youtube --no-install-project
 
 # Then the project itself.
 COPY ambient ./ambient
-RUN uv sync --frozen --no-dev --extra youtube
+RUN uv sync --locked --no-dev --extra youtube
 
 ############################  runtime  ############################
 FROM python:3.13-slim-bookworm AS runtime
