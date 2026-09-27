@@ -17,3 +17,8 @@ ambient/trajectories/
 *.srt
 audio.mp3
 TODO.md
+
+# The Studio (ambient/studio/console, and the legacy Vite web app) ships as its own
+# image — keep it out of the engine image. Without this the engine image carried
+# the Studio's node_modules/.next caches (~3.5 GB of a ~4 GB image).
+ambient/studio/

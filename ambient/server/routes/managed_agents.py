@@ -268,10 +268,13 @@ async def upload_file(request: Request) -> dict:
         log.info("Reusing existing file %s for duplicate upload", existing["video_id"])
         return _file_metadata(existing)
     meta = store_video(data, upload.filename, upload.content_type)
-    # Kick off background description ingestion only when the video reached R2 —
-    # the ephemeral ingest sandbox fetches it from there. Without an R2 copy
-    # (local inprocess dev) there's no job; the session computes live instead.
-    if meta.get("r2_key"):
+    # Kick off background description ingestion. With the e2b backend the
+    # ephemeral ingest sandbox fetches the source from S3/R2, so it needs the R2
+    # copy. With the host backend the worker describes the local file directly
+    # (see IngestWorker._run_job), so no S3 is needed — previously uploads without
+    # S3 got no background job and the first question waited on a live description.
+    ingest = bool(meta.get("r2_key")) or settings.sandbox_backend != "e2b"
+    if ingest:
         meta.update(
             {
                 "description": None,
@@ -281,7 +284,7 @@ async def upload_file(request: Request) -> dict:
             }
         )
     await request.app.state.store.put_file(meta)
-    if meta.get("r2_key"):
+    if ingest:
         log.info(f"Enqueuing video {meta['video_id']} for description ingestion")
         await request.app.state.ingest.enqueue(meta["video_id"])
     return _file_metadata(meta)

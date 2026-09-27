@@ -11,21 +11,36 @@ ENV UV_PYTHON_DOWNLOADS=0
 
 WORKDIR /app
 
-# everything uv needs to build the venv
+# Dependencies first, in their own layer, so a source change doesn't reinstall
+# every package. The `youtube` extra adds yt-dlp (+ its YouTube challenge
+# solvers), which the host backend (SANDBOX_BACKEND != e2b) shells out to for
+# YouTube imports — no e2b sandbox or S3 needed. /app/.venv/bin is on PATH below.
 COPY pyproject.toml uv.lock README.md ./
-COPY ambient ./ambient
+RUN uv sync --frozen --no-dev --extra youtube --no-install-project
 
-# create /app/.venv with the locked deps + the project
-RUN uv sync --frozen --no-dev
+# Then the project itself.
+COPY ambient ./ambient
+RUN uv sync --frozen --no-dev --extra youtube
 
 ############################  runtime  ############################
 FROM python:3.13-slim-bookworm AS runtime
+
+# Links the published image (ghcr.io/ambient-intelligence-hq/ambient-engine)
+# to its repository on GitHub.
+LABEL org.opencontainers.image.source="https://github.com/ambient-intelligence-hq/ambient" \
+      org.opencontainers.image.description="Ambient engine — video-understanding agent (Managed Agents API)"
 
 # ffmpeg/ffprobe are needed only by the in-process media backend
 # (SANDBOX_BACKEND=inprocess). Drop this layer entirely if you run e2b.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno: the JavaScript runtime yt-dlp uses to solve YouTube's challenges (with the
+# yt-dlp-ejs scripts from the `youtube` extra). Without it yt-dlp warns that
+# YouTube extraction is deprecated and formats may be missing. Single static
+# binary from the official image; pinned for reproducible builds.
+COPY --from=denoland/deno:bin-2.9.7 /deno /usr/local/bin/deno
 
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /data && chown appuser:appuser /data
