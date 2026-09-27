@@ -528,7 +528,23 @@ ENV
   cd "$dir"
   if [ "${AMBIENT_SKIP_PULL:-0}" != 1 ]; then
     step "Pulling images (first time: a few minutes)"
-    docker compose pull || die "Could not pull the images. Check your connection, then re-run the installer."
+    local pull_log
+    pull_log="$(mktemp)"
+    if ! docker compose pull 2>&1 | tee "$pull_log"; then
+      # GHCR answers "unauthorized"/"denied" both for a private package and for
+      # an image or tag that doesn't exist, so name the exact refs.
+      if grep -qiE 'unauthorized|denied|manifest unknown|not found' "$pull_log"; then
+        rm -f "$pull_log"
+        die "The registry refused these images:
+    $engine_image:$version
+    $studio_image:$version
+  Either the tag doesn't exist, or the images aren't public. Try a published
+  tag (--version <tag>), or log in first: docker login ghcr.io"
+      fi
+      rm -f "$pull_log"
+      die "Could not pull the images. Check your connection, then re-run the installer."
+    fi
+    rm -f "$pull_log"
   fi
 
   step "Starting Ambient"

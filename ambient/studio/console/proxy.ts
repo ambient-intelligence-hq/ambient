@@ -39,13 +39,15 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
+  // `api/ambient/files$` (the video upload) is left out on purpose: a matched
+  // request's body is buffered in memory and truncated at 10MB before the route
+  // sees it. That route checks sign-in itself. Its subpaths stay matched.
   matcher: [
     "/",
     "/chat/:id",
-    "/api/:path*",
     "/login",
     "/register",
 
-    "/((?!_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)",
+    "/((?!_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt|api/ambient/files$).*)",
   ],
 };
