@@ -1,0 +1,95 @@
+name: Publish images to GHCR
+
+# Builds the Ambient container images and publishes them to GitHub Container
+# Registry as ghcr.io/<owner>/<image>, for linux/amd64 and linux/arm64 (Apple
+# Silicon + most servers). Authenticates with the workflow's own GITHUB_TOKEN —
+# no personal access token needed.
+#
+# Both images are always built together from the same commit, so they share
+# every tag — install.sh pins engine and Studio to one AMBIENT_VERSION.
+#
+# Tags:
+#   push to main  -> :main, :sha-<short>, :latest
+#   tag v1.2.3    -> :1.2.3, :1.2, :sha-<short>, :latest
+#   manual run    -> :<branch>, :sha-<short>
+#
+# The first publish creates the package PRIVATE (it inherits the repo's
+# visibility). To let `install.sh` pull without logging in, make it public once:
+# org -> Packages -> <image> -> Package settings -> Change visibility -> Public.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "ambient/**"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ambient-engine
+            context: .
+            dockerfile: Dockerfile
+          - image: ambient-studio
+            context: ambient/studio/console
+            dockerfile: ambient/studio/console/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU lets the amd64 runner build the arm64 image too.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags + OCI labels. The org.opencontainers.image.source label links the
+      # package to this repository.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layers between runs (dependency layers rarely change).
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

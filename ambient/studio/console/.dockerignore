@@ -1,0 +1,28 @@
+# Build context for the Studio image (ambient/studio/console/Dockerfile).
+# Installed/built inside the image instead:
+node_modules
+.next
+out
+build
+coverage
+*.tsbuildinfo
+next-env.d.ts
+.turbo
+.vercel
+# Local secrets / env — the container gets its config from the environment
+.env
+.env*.local
+*.pem
+# Dev / test tooling
+.git
+.github
+.husky
+.vscode
+.cursor
+test-results
+playwright-report
+blob-report
+playwright
+*.log
+Dockerfile
+.dockerignore

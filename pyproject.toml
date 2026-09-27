@@ -33,8 +33,12 @@ dependencies = [
 ambient = "ambient.cli:app"
 
 [project.optional-dependencies]
-# Fetch YouTube / http(s) URLs from the CLI.
-youtube = ["yt-dlp"]
+# YouTube / http(s) imports — the CLI, and the server's host backend
+# (SANDBOX_BACKEND != e2b), which shells out to yt-dlp.
+# `default` pulls in yt-dlp-ejs, the YouTube challenge-solver scripts yt-dlp runs
+# on a JS runtime (Deno, installed in the Docker image). Without both, YouTube
+# extraction is deprecated and formats can go missing.
+youtube = ["yt-dlp[default]"]
 # Accelerated local frame decode (decord/torchcodec). ffmpeg covers the media
 # path without these; this only speeds up frame decode on long videos.
 accel = ["torch>=2.13.0", "torchcodec>=0.14.0"]
