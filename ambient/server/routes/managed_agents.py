@@ -64,44 +64,60 @@ DEFAULT_ENV_ID = "default"
 
 
 async def seed_defaults(store) -> None:
-    """Idempotently ensure a default agent + environment exist in the store.
+    """Ensure the built-in agents + default environment exist in the store.
 
-    Called once at server startup. Uses get-then-put so a later edit to either
-    record (via the API) is never clobbered on restart.
+    Called once at server startup. The built-in agents (`ambient_v1`,
+    `ambient_fast`) are the engine's configured defaults (Studio's "Vanilla"), so
+    their model + system prompt are re-synced from settings on every start:
+    otherwise an .env change (AGENT_MODEL / LLM_MODEL) never reaches new sessions,
+    which copy the model from the stored agent while the endpoint is read from the
+    current settings (a model/endpoint mismatch). Custom agents are untouched.
+    The environment is get-then-put so an API edit to it is never clobbered.
     """
-    if await store.get_agent(DEFAULT_AGENT_ID) is None:
-        now = _now()
-        await store.put_agent({
+    builtins = [
+        {
             "id": DEFAULT_AGENT_ID,
-            "version": 1,
             "name": settings.default_agent_name,
             "description": "Default video-analysis agent — agent mode (tool loop).",
             "model": settings.agent_model,
             "system": settings.default_agent_system,
             "tools": [{"type": "video_agent_20260825"}],
-            "skills": [],
-            "mcp_servers": [],
-            "metadata": {},
-            "created_at": now,
-            "updated_at": now,
-        })
-    if await store.get_agent(DEFAULT_FAST_AGENT_ID) is None:
-        now = _now()
-        await store.put_agent({
+        },
+        {
             "id": DEFAULT_FAST_AGENT_ID,
-            "version": 1,
             "name": "Video Analyst (Fast)",
             "description": "Fast mode — single dense-frame vision pass, no tools.",
             # Fast mode is a single call on the vision model directly.
             "model": settings.llm_model,
             "system": settings.default_agent_system,
             "tools": [{"type": "video_fast_20260825"}],
-            "skills": [],
-            "mcp_servers": [],
-            "metadata": {},
-            "created_at": now,
-            "updated_at": now,
-        })
+        },
+    ]
+    for spec in builtins:
+        now = _now()
+        existing = await store.get_agent(spec["id"])
+        if existing is None:
+            await store.put_agent({
+                **spec,
+                "version": 1,
+                "skills": [],
+                "mcp_servers": [],
+                "metadata": {},
+                "created_at": now,
+                "updated_at": now,
+            })
+        elif (existing.get("model"), existing.get("system")) != (spec["model"], spec["system"]):
+            log.info(
+                "Re-syncing built-in agent %s: model %s -> %s",
+                spec["id"], existing.get("model"), spec["model"],
+            )
+            await store.put_agent({
+                **existing,
+                "model": spec["model"],
+                "system": spec["system"],
+                "version": int(existing.get("version") or 1) + 1,
+                "updated_at": now,
+            })
     if await store.get_environment(DEFAULT_ENV_ID) is None:
         now = _now()
         await store.put_environment({

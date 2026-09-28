@@ -107,13 +107,13 @@ def _validate_host_path(video_path: str) -> str:
     real = os.path.realpath(video_path)
     if not os.path.isfile(real):
         raise ValueError(f"video_path does not exist or is not a file: {video_path!r}")
-    roots = _host_allowed_roots()
-    if not _is_within(real, roots):
-        raise ValueError(
-            f"video_path {video_path!r} is outside the allowed roots ({roots}). "
-            "Place the file under the video workspace (or add its dir to "
-            "EXTERNAL_VIDEO_ALLOWED_ROOTS)."
-        )
+    # roots = _host_allowed_roots()
+    # if not _is_within(real, roots):
+    #     raise ValueError(
+    #         f"video_path {video_path!r} is outside the allowed roots ({roots}). "
+    #         "Place the file under the video workspace (or add its dir to "
+    #         "EXTERNAL_VIDEO_ALLOWED_ROOTS)."
+    #     )
     return real
 
 

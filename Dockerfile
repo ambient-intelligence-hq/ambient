@@ -15,12 +15,13 @@ WORKDIR /app
 # every package. The `youtube` extra adds yt-dlp (+ its YouTube challenge
 # solvers), which the host backend (SANDBOX_BACKEND != e2b) shells out to for
 # YouTube imports — no e2b sandbox or S3 needed. /app/.venv/bin is on PATH below.
+# The `e2b` extra is the SDK for SANDBOX_BACKEND=e2b (media in an E2B sandbox).
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --locked --no-dev --extra youtube --no-install-project
+RUN uv sync --locked --no-dev --extra youtube --extra e2b --no-install-project
 
 # Then the project itself.
 COPY ambient ./ambient
-RUN uv sync --locked --no-dev --extra youtube
+RUN uv sync --locked --no-dev --extra youtube --extra e2b
 
 ############################  runtime  ############################
 FROM python:3.13-slim-bookworm AS runtime
