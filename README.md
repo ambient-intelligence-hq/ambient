@@ -1,7 +1,13 @@
 <h1 align="center"><img src="demo/web/logo.jpg" alt="" width="28" style="vertical-align:-6px; border-radius:6px; margin-right:6px;" /> Ambient</h1>
 
+<p align="center">
+  <img src="docs/assets/ambient-prompts.gif" alt="Ambient: turn video into … — a cycle of five example outcomes" width="800" />
+</p>
 
-Ambient is a video understanding and research agent that can reason over long-form videos, interpret complex visual events, and return structured responses for advanced questions, analysis, and insights.
+
+<p align="center"><b>One video. Any outcome.</b></p>
+
+Ambient is a video agent that reasons over your footage, short clips or hours long, and turns it into what you need: a structured reports, datasets,  processed clips with bounding boxannotations , GIFs and more.
 
 <div align="center">
 
