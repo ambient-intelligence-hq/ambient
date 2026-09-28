@@ -3,44 +3,103 @@
 
 Ambient is a video understanding and research agent that can reason over long-form videos, interpret complex visual events, and return structured responses for advanced questions, analysis, and insights.
 
+<div align="center">
+
+## 🏆 Ambient wins at ECCV 2026
+
+Ambient won **2 tracks** and placed **runner-up in a third** at the<br>
+**Meta Wearable AI Challenge, ECCV 2026**.
+
+🥇 **EgoProactive — Large Model** &nbsp;·&nbsp;
+🥇 **EgoLongQA — Small Model** &nbsp;·&nbsp;
+🥈 **EgoProactive — Small Model**
+
+[Leaderboard](https://huggingface.co/spaces/facebook/wearable-ai-leaderboard) ·
+[EgoProactive Report](https://arxiv.org/abs/2609.07099) ·
+[EgoLongQA Report](https://arxiv.org/abs/2609.07154) ·
+[Models & Datasets](https://huggingface.co/collections/ambient-intelligence-labs/wearables-ai-workshop-eccv-2026)
+
+</div>
+
 ---
 
-## Try it in 60 seconds (CLI)
+## Quick start (local)
 
-No server, database, S3, or sandbox — just [ffmpeg](https://ffmpeg.org/) on your
-PATH and an LLM key. The CLI runs the *same* agent loop the server uses, driven
-by in-memory adapters, and produces clips locally with ffmpeg (the range-proxy
-backend reads windows straight off your file).
+The fastest way to try Ambient on your own machine: one command installs the
+engine and the Studio (web UI) with Postgres and Redis, all in Docker. No S3, no
+cloud sandbox — videos are processed locally with ffmpeg inside the engine
+container.
+
+**You need:** Docker ([Docker Desktop](https://www.docker.com/products/docker-desktop/)
+on macOS/Windows; Docker Engine + the compose plugin on Linux) and an API key for
+an OpenAI-compatible LLM endpoint ([OpenRouter](https://openrouter.ai/keys) by
+default).
 
 ```bash
-# 1. install ffmpeg (macOS: `brew install ffmpeg`, Debian/Ubuntu: `apt install ffmpeg`)
-# 2. bring your own LLM key (OpenRouter shown; any OpenAI-compatible endpoint works)
-export OPENROUTER_API_KEY=sk-or-...
-
-# interactive chat over a video — ask many questions with context, streamed live:
-uv run ambient chat trip.mp4
-
-# or one-shot:
-uv run ambient analyze trip.mp4 "when do they reach the summit?"
-# point at a URL (needs yt-dlp):
-uv run ambient analyze "https://youtu.be/…" "summarize the itinerary"
-
-ambient doctor          # check ffmpeg / key / config
-ambient --help
+curl -fsSL https://raw.githubusercontent.com/ambient-intelligence-hq/ambient/main/install/install.sh | bash
 ```
 
-`chat` opens a REPL (Ctrl-D or `/exit` to quit); each answer streams token by
-token and renders as markdown, with tool calls shown inline as the agent works.
+The installer:
 
-Useful flags (both `chat` and `analyze`): `--model <id>` (sets the agent + vision
-model), `--fast` (one dense-frame pass, no tools), `--show-thinking` (stream the
-reasoning), `--subtitles file.srt`. `analyze` also takes `--schema out.json`
-(steer the answer to a JSON Schema) and `--json` (machine-readable stdout).
-Persist a key with `ambient config set OPENROUTER_API_KEY sk-or-...`.
+1. checks Docker is installed and running;
+2. asks for the LLM endpoint, the **agent model** (plans and answers), the
+   **video model** (watches clips; must accept video input) and your API key;
+3. writes `~/.ambient/` — `docker-compose.yml`, a private `.env` with generated
+   secrets, and `bin/ambientctl` (also linked into `~/.local/bin`);
+4. pulls the images, starts everything, waits until it's healthy and opens the
+   Studio.
+
+| | URL |
+|---|---|
+| Studio (web UI) | http://localhost:3000 |
+| API (Anthropic SDK `base_url`) | http://localhost:8080 — key: `ambientctl config get ENGINE_API_KEY` |
+
+If a port is taken, the next free one is used and printed at the end.
+
+**First run:** open the Studio, click **Add video** (or drop a file on the stage,
+or paste a YouTube URL), then ask a question. **Agent** mode works step by step
+with tools; **Fast** mode answers in one quick pass.
+
+**Day to day:**
+
+```bash
+ambientctl status                 # containers + URLs
+ambientctl logs [engine|studio]   # follow logs
+ambientctl stop | start | restart
+ambientctl update                 # pull newer images and restart
+ambientctl config show            # settings (secrets redacted)
+ambientctl config set AGENT_MODEL google/gemini-3.1-pro-preview   # applies immediately
+ambientctl config set LLM_API_KEY sk-or-...
+ambientctl uninstall              # remove containers, keep data (--purge deletes it)
+```
+
+Re-running the install command upgrades in place and keeps your settings and
+data. Installer options (`--dir`, `--version`, `--no-start`, …) and environment
+knobs are listed in `bash install/install.sh --help`.
+
+> Working from a clone? `bash install/install.sh` does the same thing.
 
 ---
 
-## Full server setup
+## Self-hosting
+
+Running Ambient for a team or on a server? See the
+**[self-hosting guide](docs/self-hosting.md)**. It covers:
+
+- the layers (Studio, engine, Postgres, Redis, media sandbox, object storage,
+  LLM endpoint) and what each needs;
+- three ways to deploy: the install script, Docker Compose, or external managed
+  Postgres / Redis / S3;
+- running media in an **e2b sandbox** (recommended for shared installs: it
+  isolates the agent's shell and ffmpeg work from your server);
+- HTTPS, access control, upgrades, backups and a configuration reference.
+
+---
+
+## Development: run from source
+
+For working on Ambient itself. The installer above runs the published images;
+this runs the engine from your checkout.
 
 ### 1. Prerequisites
 - [uv](https://docs.astral.sh/uv/) and Python 3.13
@@ -55,7 +114,7 @@ Create a `.env` in the repo root:
 # --- LLM (OpenAI-compatible chat-completions gateway) ---
 LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_API_KEY=sk-...
-AGENT_MODEL=z-ai/glm-5.2          # any model your gateway serves
+AGENT_MODEL=deepseek/deepseek-v4.1-flash          # any model your gateway serves
 
 # --- server ---
 API_KEY=dev-token                    # clients send this as x-api-key
@@ -121,7 +180,7 @@ agent = client.beta.agents.create(
 )
 
 session = client.beta.sessions.create(
-    agent=DEFAULT_AGENT_ID
+    agent=DEFAULT_AGENT_ID,
     environment_id=DEFAULT_ENV_ID,
     metadata={"video_id": video.id},   # where the video lives
 )
@@ -153,21 +212,3 @@ print(answer)
 
 Follow-up questions reuse the same `session.id` (the conversation + analysis are
 preserved). A runnable version is in [`notebooks/test_sdk.ipynb`](notebooks/test_sdk.ipynb).
-
----
-
-## Demo UI
-
-A single-file web UI ([`demo/web/index.html`](demo/web/index.html)) — upload a video or paste a YouTube URL, start a session, and chat with live streaming tool calls and agent responses.
-
-**1. Start the agent server** (from repo root):
-```bash
-docker compose up -d            # API + Postgres + Redis on :8080
-```
-
-**2. Open the UI:**
-```bash
-open demo/web/index.html        # or serve it with any static file server
-```
-
-Configure the server URL and API key via the **Settings** panel in the UI.

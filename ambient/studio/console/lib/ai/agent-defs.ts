@@ -101,8 +101,19 @@ export function deleteAgentDef(id: string) {
 
 // The active definition doubles as "last used" — set on selection, defaulted on
 // the next session.
+// Stored as a bare string (setActiveAgentDefId), so it's read raw rather than
+// through read()'s JSON.parse — which throws on a bare id and silently fell back
+// to Vanilla, so no custom definition ever took effect. Tolerates a
+// JSON-quoted value too.
 export function getActiveAgentDefId(): string {
-  return read<string>(ACTIVE_KEY, VANILLA_ID);
+  if (typeof window === "undefined") return VANILLA_ID;
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_KEY);
+    if (!raw) return VANILLA_ID;
+    return raw.startsWith('"') ? (JSON.parse(raw) as string) : raw;
+  } catch {
+    return VANILLA_ID;
+  }
 }
 
 export function setActiveAgentDefId(id: string) {

@@ -52,10 +52,22 @@ export const deleteFile = (id: string) => json("DELETE", `/files/${id}`);
 // Ranged content URL, proxied through the Studio (keeps the engine key server-side).
 export const contentPath = (id: string) => `/api/ambient/files/${id}/content`;
 
-export async function uploadFile(file: Blob, filename: string): Promise<EngineFile> {
-  const form = new FormData();
-  form.append("file", file, filename);
-  const res = await fetch(`${ENGINE_URL}/v1/files`, { method: "POST", headers: headers(), body: form });
+// Forwards the browser's multipart body to the engine as a stream — never
+// parsed or held in memory here, so video size isn't bounded by the Studio.
+// `contentType` must be the original header (it carries the multipart boundary).
+export async function uploadFileStream(
+  body: ReadableStream<Uint8Array>,
+  contentType: string,
+  signal?: AbortSignal
+): Promise<EngineFile> {
+  const res = await fetch(`${ENGINE_URL}/v1/files`, {
+    method: "POST",
+    headers: { ...headers(), "content-type": contentType },
+    body,
+    // Required by Node's fetch for a streamed request body.
+    duplex: "half",
+    signal,
+  } as RequestInit & { duplex: "half" });
   if (!res.ok) throw new Error(`upload -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
