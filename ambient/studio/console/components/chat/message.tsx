@@ -1,6 +1,6 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
-import { useCallback } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
@@ -24,9 +24,55 @@ import { PreviewAttachment } from "./preview-attachment";
 import { UsageCard } from "./usage-card";
 import { Weather } from "./weather";
 
+// Playful, video-themed filler shown while the engine is between steps (first
+// turn, or after a tool call while the model prefills its next move). A real
+// engine status (e.g. "attaching video") always wins; these only fill the gaps.
+const VIDEO_WAITING_MESSAGES = [
+  "Scrubbing the timeline...",
+  "Reading between the frames...",
+  "Decoding pixels into prose...",
+  "Chasing keyframes...",
+  "Enhance... enhance... ENHANCE...",
+  "Rewinding for a closer look...",
+  "Interrogating the frames...",
+  "Teaching pixels to talk...",
+  "Untangling the timecodes...",
+  "Pondering the scene...",
+  "Squinting at frame 404...",
+  "Asking the footage politely...",
+  "Consulting the director's cut...",
+  "Sifting through the b-roll...",
+  "Cueing up the next scene...",
+];
+
 function WaitingText() {
   const { waitingStatus } = useDataStream();
-  const waitingText = waitingStatus?.message ?? "Waiting...";
+  const status = waitingStatus?.message;
+
+  // Shuffle once per mount so the lines vary between runs without repeating
+  // back-to-back, then cycle one per second while there's no real status.
+  const messages = useMemo(() => {
+    const arr = [...VIDEO_WAITING_MESSAGES];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }, []);
+  const [idx, setIdx] = useState(0);
+
+  useEffect(() => {
+    if (status) {
+      return; // a real engine status is showing; don't rotate over it
+    }
+    const id = setInterval(
+      () => setIdx((i) => (i + 1) % messages.length),
+      8000
+    );
+    return () => clearInterval(id);
+  }, [status, messages.length]);
+
+  const waitingText = status ?? messages[idx];
 
   return (
     <div className="flex min-h-[calc(13px*1.65)] min-w-0 items-center text-[13px] leading-[1.65]">
@@ -125,6 +171,18 @@ const PurePreviewMessage = ({
       part.type === "dynamic-tool"
   );
   const isThinking = isAssistant && isLoading && !hasAnyContent;
+
+  // After a tool call finishes, the engine goes quiet while the model prefills
+  // its next turn (often many seconds on big multimodal prompts). Nothing streams
+  // in that window, so without this the UI shows finished tool chips and no sign
+  // of progress. Show a trailing loader whenever the live assistant message's
+  // last part is a tool in a terminal state — i.e. tool done, next response pending.
+  const lastPart = message.parts?.[message.parts.length - 1];
+  const isAwaitingNextStep =
+    isAssistant &&
+    isLoading &&
+    lastPart?.type === "dynamic-tool" &&
+    (lastPart.state === "output-available" || lastPart.state === "output-error");
 
   const attachments = attachmentsFromMessage.length > 0 && (
     <div
@@ -415,6 +473,7 @@ const PurePreviewMessage = ({
     <>
       {attachments}
       {parts}
+      {isAwaitingNextStep && <WaitingText />}
       {isAssistant && message.metadata?.usage && (
         <UsageCard usage={message.metadata.usage} />
       )}
