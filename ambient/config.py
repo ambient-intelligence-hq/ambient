@@ -184,7 +184,15 @@ class Settings(BaseSettings):
     stream_source_video: bool = True
     source_url_ttl: int = 7200                  # presigned source-URL lifetime (s)
     stream_min_bytes: int = 100 * 1024 * 1024   # below this, download instead
-    overview_seek_concurrency: int = 16         # parallel seeks for overview sampling
+    overview_seek_concurrency: int = 8          # parallel seeks for overview sampling
+    # Parallel S3 uploads per media command inside the box. Injected into the
+    # sandbox via _media_env (the box reads UPLOAD_CONCURRENCY from os.environ), so
+    # it's tunable from .env without rebuilding the template. Kept modest because
+    # several media commands run concurrently per box (_MAX_CONCURRENT_CMDS): the
+    # product bounds in-box threads, and too high a value exhausts them (EAGAIN /
+    # "no result envelope"). 8 also stays under botocore's default pool of 10,
+    # avoiding connection-pool churn.
+    upload_concurrency: int = 8
 
     # Pre-transcoded clip tiles (removes fetch_clip latency). At ingestion the
     # whole video is transcoded once into fixed, GOP-aligned tiles at the target
