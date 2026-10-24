@@ -95,6 +95,8 @@ class EndpointProfile:
 
 ENDPOINT_PROFILES: dict[str, EndpointProfile] = {
     "self_hosted": EndpointProfile("self_hosted", video_frame_control=True,  image_block_cap=1000),
+    # model.com endpopints
+    "modal": EndpointProfile("modal", video_frame_control=True, image_block_cap=100),
     # OpenRouter's cap is a per-*upstream* lottery (0-250), so the real cap comes from
     # the preferred-provider lookup (image_block_cap()); this is only the unmapped floor.
     "openrouter":  EndpointProfile("openrouter",  video_frame_control=False, image_block_cap=100),
@@ -106,6 +108,7 @@ ENDPOINT_PROFILES: dict[str, EndpointProfile] = {
 _SERVICE_PATTERNS: list[tuple[str, str]] = [
     ("openrouter", "openrouter"),
     ("vercel", "vercel"),
+    ("modal", "modal"),
 ]
 
 
