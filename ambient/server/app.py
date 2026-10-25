@@ -1,8 +1,6 @@
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 
 from ambient.server.broker import Broker
 from ambient.server.ingest import IngestWorker
@@ -51,14 +49,5 @@ app = FastAPI(title="Ambient Agent API", version="0.1.0", lifespan=_lifespan)
 app.include_router(health.router)
 # Anthropic Managed Agents protocol (the Anthropic SDK talks to these routes).
 app.include_router(managed_agents.router)
-
-# Studio SPA, served same-origin so its fetch/SSE calls hit the /v1 routes without
-# CORS and the api key travels as a normal header. Prefer the built Studio
-# (ambient/studio/web/dist, shipped in the wheel/image); fall back to the legacy
-# demo/web during development. Mounted last so it never shadows /v1; `html=True`
-# serves index.html for "/".
-_STUDIO_DIST = Path(__file__).resolve().parents[1] / "studio" / "web" / "dist"
-_DEMO_WEB = Path(__file__).resolve().parents[2] / "demo" / "web"
-_WEB_DIR = _STUDIO_DIST if (_STUDIO_DIST / "index.html").exists() else _DEMO_WEB
-if (_WEB_DIR / "index.html").exists():
-    app.mount("/", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
+# No same-origin UI is served here: the Studio console (ambient/studio/console) is
+# the single UI and deploys separately, talking to these /v1 routes over the API.
