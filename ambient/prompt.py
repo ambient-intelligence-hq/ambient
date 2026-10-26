@@ -1,22 +1,32 @@
-from ambient.config import settings
+from ambient.config import settings, self_video_analysis_enabled
 
 
 def get_system_prompt(model_modalities: list[str]) -> str:
 
-    tool_prompt = """
-## Tools
 
-- search_clip: Ask a vision model whether a portion of the
-video is relevant to a query and to answer it. Best for LOCATING evidence and
-answering "does X happen here / where does X happen / what is the value of X".
-The window (end − start) must be ≤ 5 minutes. Fire several in parallel to cover
-multiple candidate regions at once.
-
-- focus_clip: Ask a vision model for a DETAILED description of
-a specific portion. Best once you have localized the region and need the full
-picture of what happens there. Window ≤ 5 minutes.
-    """
     escalation_ladder = ""
+    if self_video_analysis_enabled():
+        tool_prompt = """
+    ## Tools
+
+    - focus_clip: Focus a specific portion of the video. The end time should be within 5 mins from the start_time. You will receive a high fidelity clip of the video between the start and end time for detailed inspection. Carefully review the clip and decide next actions.Best once you have localized the region and need the full
+    picture of what happens there. Window ≤ 5 minutes.
+        """
+    else:
+        tool_prompt = """
+    ## Tools
+
+    - search_clip: Ask a vision model whether a portion of the
+    video is relevant to a query and to answer it. Best for LOCATING evidence and
+    answering "does X happen here / where does X happen / what is the value of X".
+    The window (end − start) must be ≤ 5 minutes. Fire several in parallel to cover
+    multiple candidate regions at once.
+
+    - focus_clip: Ask a vision model for a DETAILED description of
+    a specific portion. Best once you have localized the region and need the full
+    picture of what happens there. Window ≤ 5 minutes.
+        """
+    
 
     if "image" in model_modalities:
         tool_prompt += """
@@ -38,16 +48,12 @@ you rely on them.
 path (e.g. a screenshot/chart/frame you saved via the bash tool). For frames of
 the video itself use grab_frames instead.
         """
-        escalation_ladder += """
-Escalation ladder: overview → search_clip (locate) → focus_clip (understand) →
-grab_frames (verify at frame level) / draw_bounding_box or draw_point . Only descend as far as the
-question actually requires.
+        search_clip_prompt = "→ search_clip (locate)" if not self_video_analysis_enabled() else ""
+        escalation_ladder += (f"Escalation ladder: overview {search_clip_prompt} → focus_clip (understand) → grab_frames (verify at frame level) / draw_bounding_box or draw_point . Only descend as far as the question actually requires."
+"Important: For tasks, that require you to predict point coordinates / bounding boxes. Use the grab_frames tool to grab the required frame(s) and"
+"then use the draw_bounding_box / draw_point tool to draw the bounding box or coordinate on the frame "
+"to verify your prediction.")
 
-Important: For tasks, that require you to predict point coordinates / bounding boxes. 
-Use the grab_frames tool to grab the required frame(s) and 
-then use the draw_bounding_box / draw_point tool to draw the bounding box or coordinate on the frame 
-to verify your prediction.
-"""
     else:
         tool_prompt += """
 - annotate_frames(description, start, end): Ask a grounding model to return the
@@ -55,14 +61,12 @@ bounding box for ONE described UI element / object in a short span (≤ 5
 seconds). Use this when your answer requires coordinates and you cannot inspect
 frames yourself.
         """
-        escalation_ladder += """
-Escalation ladder: overview → search_clip (locate) → focus_clip (understand) →
-annotate_frames (only if the answer requires coordinates). Only descend as far as the
-question actually requires."""
+        search_clip_prompt = "→ search_clip (locate)" if not self_video_analysis_enabled() else ""
+        escalation_ladder += (f"Escalation ladder: overview {search_clip_prompt} → focus_clip (understand) → annotate_frames (only if the answer requires coordinates). Only descend as far as the question actually requires.")
     
     other_videos_prompt = """
 ## Working with other videos
-Every video tool (search_clip, focus_clip, grab_frames, draw_bounding_box,
+Every video tool ( focus_clip, grab_frames, draw_bounding_box,
 draw_point) takes an optional `video_path`. Omit it to work on the session's
 initial video (referred to by `video_id`). To analyze a DIFFERENT video, pass the
 ABSOLUTE path of a local video file as `video_path` — the tool then reads that
@@ -106,7 +110,7 @@ a tool before you commit to it.
    sequentially clip-by-clip from the start.
 3. INVESTIGATE IN PARALLEL. When you want to check several regions, several
    sub-questions, or competing candidate answers, issue MULTIPLE
-   search_clip / focus_clip calls IN THE SAME TURN. The tools run concurrently,
+   focus_clip / grab_frames calls IN THE SAME TURN. The tools run concurrently,
    so examining 3–5 windows at once costs about as much time as one. This is the
    default mode of working — reach for it whenever the next steps are
    independent.
@@ -153,19 +157,6 @@ def get_fast_system_prompt() -> str:
     )
 
 
-SYSTEM_PROMPT_PARALLEL = """
-You are a helpful video research assistant that can answer questions about a long video. You have access to tools to search the video and get the highlevel description of the video.
-
-Use the tools to answer the user's question. You are provided with a partial highlevel overview of the video (generated by an LLM with uniformly sampled < 100 frames). You can use this to get a bird's eye view of the video.
-
-The overview also should give you a grouped timestamped description of the video to give you a understanding of the video. You can use these timestamps to look for specific information in the corresponding portions with search_clip and focus_clip tools. The overview is approximate (sparse frames, approximate timestamps), so confirm the deciding detail with the tools before answering.
-
-If the question has multiple parts to it, break down the question into sub questions and answer each sub question with the tools. Then finally answer the main question with the sub questions.
-
-IMPORTANT — investigate in PARALLEL to stay fast: whenever you want to check several regions, sub-questions, or competing answer options, issue MULTIPLE search_clip/focus_clip calls IN THE SAME TURN. The tools run concurrently, so checking 3-5 windows at once costs about the same time as checking one. Do NOT call a tool on a time window you have already examined, and do NOT scan the video sequentially clip-by-clip — jump straight to the regions the overview points to (and, for "how it ends / which remained" questions, the actual end of the video).
-
-When you are sure about the answer, answer the user's question with citation of the timestamps of the video.
-"""
 
 FOCUS_CLIP_TOOL_PROMPT = """You are video analysis expert, your are given a few clips from a video (with equal interval sampling), create a detailed description of the video (not less than 50 words):
     
