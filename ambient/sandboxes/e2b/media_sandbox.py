@@ -47,6 +47,7 @@ def _media_env() -> dict[str, str]:
         "SOURCE_URL_TTL": str(settings.source_url_ttl),
         "STREAM_MIN_BYTES": str(settings.stream_min_bytes),
         "OVERVIEW_SEEK_CONCURRENCY": str(settings.overview_seek_concurrency),
+        "UPLOAD_CONCURRENCY": str(settings.upload_concurrency),
         "YOUTUBE_MAX_HEIGHT": str(settings.youtube_max_height),
         "YOUTUBE_MAX_DURATION_SECONDS": str(settings.youtube_max_duration_seconds),
         "YOUTUBE_MAX_SIZE_BYTES": str(settings.youtube_max_size_bytes),

@@ -192,6 +192,15 @@ class SessionRunner:
         self._dispatcher = ToolDispatcher(video_id=self.video_id)
         self._media_box: Optional[object] = None
         self.sandbox_id: Optional[str] = None
+        # Signals the per-session media box has finished booting. For "e2b" the box
+        # is booted by start_sandbox() in a *separate* task (create_session._boot),
+        # so a run that starts before the boot completes would use a half-created box
+        # ("Sandbox not created or killed"). A run awaits this before touching the box
+        # (attach / tool calls). Inprocess has no box -> ready at construction;
+        # attach_sandbox (rehydration) sets it after reconnecting.
+        self._sandbox_ready: asyncio.Event = asyncio.Event()
+        if self.backend != "e2b":
+            self._sandbox_ready.set()
         model_modalities = [m.value for m in get_model_modalities(self.model)]
 
         # On a fresh session `messages` is None -> empty list; seed is built in
@@ -289,6 +298,9 @@ class SessionRunner:
             await self._set_status("failed")
             raise
 
+        # The per-session media box is up; unblock any run waiting on it.
+        self._sandbox_ready.set()
+
         # Resolve the video description in the background: the session is ready to
         # take input as soon as the sandbox boots. `_run_until_done` injects the
         # description into the conversation once it lands.
@@ -352,6 +364,7 @@ class SessionRunner:
         sid = (sandbox_rec or {}).get("id")
         if self.backend != "e2b":
             self.sandbox_id = sid or f"ip_{uuid.uuid4().hex[:12]}"
+            self._sandbox_ready.set()
             if not self_video_analysis_enabled(self.model):
                 self._maybe_start_description()
             return
@@ -363,6 +376,7 @@ class SessionRunner:
         self._media_box = box
         self._dispatcher.media_box = box
         self.sandbox_id = box.id
+        self._sandbox_ready.set()
         self._status = "ready"
         # A rehydrated worker may pick up a session whose description never landed
         # (creator died mid-boot); resolve it here unless it's already in the
@@ -475,22 +489,28 @@ class SessionRunner:
             })
             await self._await_description(settings.first_turn_description_timeout_seconds)
 
-        # Self-video-analysis: attach the whole video as a cacheable prefix on the
-        # first run (streamed here, so submit_user_message stays instant). media_plan
-        # decides video_url vs sampled frames per the AGENT endpoint's capability
-        # (openrouter_providers.json). Skipped on follow-ups/rehydration — the context
-        # is already in the persisted messages.
-        if self_video_analysis_enabled(self.model) and not self._has_video_context():
-            await self._emit("tool.progress", {
-                "run_id": run_id,
-                "turn": 1,
-                "progress": {"message": "attaching video"},
-            })
-            await self._await_source_ready()
-            await self._attach_video_context(
-                settings.agent_base_url or settings.llm_base_url, model)
-
         try:
+            # The per-session e2b media box is booted by start_sandbox() in a separate
+            # task (create_session._boot). A run that starts before the boot finishes
+            # would use a half-created box ("Sandbox not created or killed"), so wait
+            # (bounded) for it here. Inprocess has no box and returns immediately.
+            await self._await_sandbox_ready()
+
+            # Self-video-analysis: attach the whole video as a cacheable prefix on the
+            # first run (streamed here, so submit_user_message stays instant). media_plan
+            # decides video_url vs sampled frames per the AGENT endpoint's capability
+            # (openrouter_providers.json). Skipped on follow-ups/rehydration — the context
+            # is already in the persisted messages.
+            if self_video_analysis_enabled(self.model) and not self._has_video_context():
+                await self._emit("tool.progress", {
+                    "run_id": run_id,
+                    "turn": 1,
+                    "progress": {"message": "attaching video"},
+                })
+                await self._await_source_ready()
+                await self._attach_video_context(
+                    settings.agent_base_url or settings.llm_base_url, model)
+
             for turn in range(1, self.max_turns_per_run + 1):
                 # Keep the ownership lease alive for the duration of the run.
                 await self.broker.renew(self.session_id)
@@ -988,6 +1008,25 @@ class SessionRunner:
                 if self._DESC_INJECT_MARKER in text:
                     return True
         return False
+
+    async def _await_sandbox_ready(self, timeout: float = 120.0) -> None:
+        """Block until the per-session media box has finished booting.
+
+        For `e2b` the box is booted by `start_sandbox()` in a separate task
+        (`create_session._boot`), so a run that starts first must wait or it would
+        touch a half-created box. Inprocess (and rehydrated) runners set the event
+        up front, so this returns immediately. Bounded: on timeout we proceed and
+        let the first box operation surface a real error rather than hang — which,
+        with the run loop inside the try/finally, closes the run cleanly."""
+        if self._sandbox_ready.is_set():
+            return
+        try:
+            await asyncio.wait_for(self._sandbox_ready.wait(), timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "sandbox not ready after %ss for session %s; proceeding",
+                timeout, self.session_id,
+            )
 
     async def _await_description(self, timeout: float) -> None:
         """Wait (bounded) for the background description task to finish.

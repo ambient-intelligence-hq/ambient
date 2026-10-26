@@ -39,6 +39,7 @@ from redis.exceptions import (
 )
 
 from ambient.config import settings
+from ambient.config import self_video_analysis_enabled
 from ambient.server.store import Store
 
 log = logging.getLogger(__name__)
@@ -382,7 +383,10 @@ class IngestWorker:
                 await self.store.update_file(video_id, _set_tiles_status("ready"))
                 log.info("tiles ready for %s (%d tiles)", video_id, n_tiles)
 
-            tasks = [asyncio.create_task(_desc_job())]
+            tasks = []
+            if not self_video_analysis_enabled(settings.agent_model):
+                tasks.append(asyncio.create_task(_desc_job()))
+
             # The host path already has the source ready in video_folder (no S3
             # push) and lets fetch_clip transcode on demand (no pre-tiling).
             if is_youtube and not use_host:

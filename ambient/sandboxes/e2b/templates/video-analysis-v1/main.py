@@ -134,7 +134,18 @@ class S3Client:
             endpoint_url=endpoint or S3_ENDPOINT,
             aws_access_key_id=access_key or AWS_ACCESS_KEY_ID,
             aws_secret_access_key=secret_key or AWS_SECRET_ACCESS_KEY,
-            config=Config(signature_version="s3v4"),
+            # The upload/seek paths fan out to UPLOAD_CONCURRENCY / OVERVIEW_SEEK_
+            # CONCURRENCY threads sharing this one client. botocore's default pool
+            # is 10, so 16 workers thrash it ("Connection pool is full, discarding
+            # connection") — wasteful churn that stalls uploads and, under several
+            # concurrent commands per box, helps push the process to an abnormal
+            # kill. Size the pool to the busiest fan-out plus headroom.
+            config=Config(
+                signature_version="s3v4",
+                max_pool_connections=max(
+                    UPLOAD_CONCURRENCY, OVERVIEW_SEEK_CONCURRENCY, TILE_WORKERS
+                ) + 4,
+            ),
         )
     
     def exists(self, key: str) -> bool:

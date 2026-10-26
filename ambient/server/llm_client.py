@@ -32,6 +32,12 @@ async def stream_chat_completion(
 ) -> AsyncIterator[dict]:
     endpoint = (base_url or settings.agent_base_url or settings.llm_base_url or "").rstrip("/")
     api_key = api_key or settings.agent_api_key or settings.llm_api_key
+    if not endpoint:
+        raise ValueError(
+            f"No LLM base_url configured for model {model!r}: set AGENT_BASE_URL/LLM_BASE_URL "
+            "in .env (loaded relative to the repo root), or set base_url on the agent record. "
+            "Without it the endpoint resolves to a bare '/chat/completions', which is not a valid URL."
+        )
     if not endpoint.endswith("/chat/completions"):
         endpoint = f"{endpoint}/chat/completions"
 
