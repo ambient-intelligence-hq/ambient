@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dataclasses import dataclass
@@ -8,7 +9,18 @@ import re
 import logging
 from enum import Enum
 
+from dotenv import load_dotenv
+
 log = logging.getLogger(__name__)
+
+# The repo-root .env. Resolved from this file (not the CWD) so the server picks
+# it up no matter where it's launched from.
+_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
+# Load .env into os.environ as well as into Settings below. 
+load_dotenv(_ENV_FILE, override=False)
+
+
 class Settings(BaseSettings):
     """
     Settings for the application. Environment variables are loaded from the .env file and overrides the default values.
@@ -16,7 +28,7 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
