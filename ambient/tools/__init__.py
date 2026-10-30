@@ -9,8 +9,9 @@ from ambient.tools.upload_artifact import upload_artifact, UploadArtifactTool
 from ambient.config import get_model_modalities, settings, model_modalities, self_video_analysis_enabled
 from ambient.tools.self_focus_clip import self_focus_clip, SelfFocusClipTool
 from ambient.tools.bash_tool import bash, BashTool
+import logging
 
-
+logger = logging.getLogger(__name__)
 TOOL_REGISTRY = {}
 
 # TOOL_REGISTRY["get_video_description"] = get_video_description
@@ -102,11 +103,13 @@ agent_modalities = get_model_modalities(settings.agent_model)
 
 # If the agent model does not support images, add the annotate_frames tool
 if agent_modalities and model_modalities.IMAGE not in agent_modalities:
+    logger.info(f"Agent model {settings.agent_model} does not support images, adding annotate_frames tool")
     TOOLS.extend(TEXT_MODALITY_ONLY_TOOLS)
     TOOL_REGISTRY["annotate_frames"] = annotate_frames
 
 # If the agent model supports images, add the grab_frames tool
 if agent_modalities and model_modalities.IMAGE in agent_modalities:
+    logger.info(f"Agent model {settings.agent_model} supports images, adding grab_frames tool")
     TOOLS.extend(IMAGE_MODALITY_ONLY_TOOLS)
     TOOL_REGISTRY["grab_frames"] = grab_frames
     TOOL_REGISTRY["draw_bounding_box"] = draw_bounding_box
