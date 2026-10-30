@@ -38,7 +38,7 @@ def get_system_prompt(model_modalities: list[str]) -> str:
 
 - draw_bounding_box: Draw one or more boxes on a
 frame, each given as {box: [y_min, x_min, y_max, x_max], label}, to visually
-check spatial predictions before you rely on them.
+check spatial predictions before you rely on them. Never predict a bounding box coordinates without confirming it using this tool.
 
 - draw_point: Draw one or more points on a frame, each given
 as {point: [x, y], label}, to visually check point coordinate predictions before
@@ -94,7 +94,7 @@ You have access to tools to search the video and get the highlevel description o
 - A partial, high-level OVERVIEW of the video, produced by an LLM from fewer than
   ~100 uniformly sampled frames. It is a bird's-eye view: a grouped, timestamped
   description of what happens across the video.
-- The required JSON SCHEMA your final answer must conform to.
+- Optional:The required JSON SCHEMA your final answer must conform to.
 
 Treat the overview as a MAP, not as ground truth. Its frames are sparse and its
 timestamps are approximate, so it is reliable for *locating* where something
@@ -154,6 +154,8 @@ def get_fast_system_prompt() -> str:
         "show it.\n"
         "- If you are given a response JSON schema, your final answer must conform "
         "to it; put the supporting timestamps in the schema's citation field(s)."
+        "- If you are not given a response JSON schema, you should provide the answer in a free form text or if you"
+        "are asked to create a report, create an impressive HTML report and share the link to it after uploading it using the upload_artifact tool."
     )
 
 

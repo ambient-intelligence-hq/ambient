@@ -652,11 +652,19 @@ class VideoFrameTools:
             self._duration_sec = len(self._vr) / self._avg_fps
             self._backend = "decord"
             print(f"[backend] decord  fps={self._avg_fps:.2f}  duration={self._duration_sec:.2f}s", file=sys.stderr)
-        except ModuleNotFoundError:
+        except Exception as e:
+            # Not installed, or a codec decord's bundled FFmpeg can't decode
+            # (e.g. AV1 raises DECORDError: AVERROR_DECODER_NOT_FOUND). The system
+            # ffmpeg is built with dav1d/aom, so fall back to it.
+            self._vr = None
             self._duration_sec = duration
             self._avg_fps = fps
             self._backend = "ffmpeg"
-            print(f"[backend] ffmpeg  fps={fps:.2f}  duration={duration:.2f}s", file=sys.stderr)
+            print(
+                f"[backend] ffmpeg  fps={fps:.2f}  duration={duration:.2f}s"
+                f"  (decord unavailable: {type(e).__name__}: {e})",
+                file=sys.stderr,
+            )
 
     def _video_duration_seconds(self) -> float:
         self._ensure_backend()

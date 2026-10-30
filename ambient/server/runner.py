@@ -315,6 +315,27 @@ class SessionRunner:
         })
         self._status = "ready"
 
+    async def _ensure_media_box(self) -> None:
+        """Boot the per-session e2b media box on demand.
+
+        Fast mode skips the eager boot (create_session._boot), so a vision provider
+        that accepts the whole video as a URL needs no sandbox at all. Only when the
+        media plan falls back to frame extraction must that work run in a box — so
+        create one here, once. No-op on inprocess (host range proxy) and when a box
+        already exists (agent mode booted it in start_sandbox, or a prior fast turn).
+        """
+        if self.backend != "e2b" or self._media_box is not None:
+            return
+        from ambient.sandboxes.e2b.media_sandbox import E2BMediaSandbox
+        box = E2BMediaSandbox()
+        await asyncio.to_thread(box.create, template=settings.e2b_template, limits=self.limits)
+        self._media_box = box
+        self._dispatcher.media_box = box
+        self.sandbox_id = box.id
+        self._sandbox_ready.set()
+        log.info("[fast] lazily booted media box %s for frame extraction (session %s)",
+                 box.id, self.session_id)
+
     _DESC_INJECT_MARKER = "[system update] Video description"
 
     def _maybe_start_description(self) -> None:
@@ -745,6 +766,9 @@ class SessionRunner:
         # Frames path (endpoints that can't control video sampling / image-only
         # models): uniformly sample and attach as timestamp-labeled image blocks.
         # MediaPlan is duck-compatible with sample_fast_frames (.max_frames+.max_dim).
+        # On e2b this is the one place fast mode needs a sandbox, so boot it now
+        # (no-op if already up, e.g. agent self-video-analysis, or on inprocess).
+        await self._ensure_media_box()
         frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, plan,
                                                    duration=duration or None)
         print(f"[plan_media] attaching frames context for session {self.session_id}, Number of frames: {len(frames)}")
@@ -760,6 +784,9 @@ class SessionRunner:
         if self._fast_frames_loaded:
             return
         # Media tools / the video URL read the source from S3 for youtube imports.
+        # (No sandbox wait here: fast mode boots the e2b box lazily, and only if the
+        # media plan actually needs frame extraction — see _attach_video_context /
+        # _ensure_media_box. A video-URL-capable provider needs no box at all.)
         await self._await_source_ready()
         await self._attach_video_context(
             self.base_url or settings.llm_base_url, self.model
@@ -777,11 +804,26 @@ class SessionRunner:
         stop_reason = "end_turn"
         try:
             # Sample + insert the frame set on the first run (streamed, so the UI
-            # shows activity); reused across follow-up turns.
+            # shows activity); reused across follow-up turns. A failure here (e.g.
+            # media box / source unavailable) must end the run with an error event
+            # rather than crash the task silently — the outer try only catches
+            # CancelledError, so without this the run leaves no run.completed and
+            # the session hangs on session.status_running.
             if not self._fast_frames_loaded:
                 await self._emit("tool.progress", {"run_id": run_id, "turn": 1,
                                                    "progress": {"message": "sampling frames"}})
-                await self._ensure_fast_frames()
+                try:
+                    await self._ensure_fast_frames()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("fast frame sampling failed (session=%s): %s",
+                                  self.session_id, exc)
+                    await self._emit("error", {"code": "fast_frames_failed",
+                                               "message": str(exc), "fatal": False})
+                    await self._emit("run.completed", {"run_id": run_id, "stop_reason": "error",
+                                                       "answer": "", "usage": self.usage})
+                    return
 
             response_format = None
             if self.output_structure:

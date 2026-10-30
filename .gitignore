@@ -14,7 +14,7 @@ notebooks/
 local_db/
 tests/test_images/
 trajectories/
-
+demo/
 
 .git
 .venv
