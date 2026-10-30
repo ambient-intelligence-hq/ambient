@@ -62,6 +62,14 @@ DEFAULT_AGENT_ID = "ambient_v1"
 DEFAULT_FAST_AGENT_ID = "ambient_fast"
 DEFAULT_ENV_ID = "default"
 
+# Ambient's tools are built in, so an agent's `tools` only carries a marker that
+# selects the session mode. No marker means agent mode (the tool loop).
+AGENT_MODE_TOOL = "video_agent_20260825"
+FAST_MODE_TOOL = "video_fast_20260825"
+_AGENT_MODE_PREFIXES = ("video_agent_", "agent_toolset_")  # agent_toolset_* is legacy
+_FAST_MODE_PREFIXES = ("video_fast_",)
+_MODES = ("agent", "fast")
+
 
 async def seed_defaults(store) -> None:
     """Ensure the built-in agents + default environment exist in the store.
@@ -81,7 +89,7 @@ async def seed_defaults(store) -> None:
             "description": "Default video-analysis agent — agent mode (tool loop).",
             "model": settings.agent_model,
             "system": settings.default_agent_system,
-            "tools": [{"type": "video_agent_20260825"}],
+            "tools": [{"type": AGENT_MODE_TOOL}],
         },
         {
             "id": DEFAULT_FAST_AGENT_ID,
@@ -90,7 +98,7 @@ async def seed_defaults(store) -> None:
             # Fast mode is a single call on the vision model directly.
             "model": settings.llm_model,
             "system": settings.default_agent_system,
-            "tools": [{"type": "video_fast_20260825"}],
+            "tools": [{"type": FAST_MODE_TOOL}],
         },
     ]
     for spec in builtins:
@@ -150,6 +158,9 @@ def _agent_resource(rec: dict) -> dict:
         "model": {"id": _model_id(rec.get("model")), "speed": None},
         "system": rec.get("system"),
         "tools": rec.get("tools") or [],
+        # Not part of the Managed Agents shape; the SDK keeps extra fields, so
+        # `agent.mode` shows which track sessions on this agent will run.
+        "mode": _mode_from_agent(rec, {}),
         "skills": rec.get("skills") or [],
         "mcp_servers": rec.get("mcp_servers") or [],
         "metadata": rec.get("metadata") or {},
@@ -162,9 +173,13 @@ def _agent_resource(rec: dict) -> dict:
 @router.post("/agents")
 async def create_agent(request: Request, body: dict[str, Any] = Body(...)) -> dict:
     now = _now()
+    tools = body.get("tools") or []
+    _validate_mode_tools(tools)
     # Model is optional: a definition may override only the endpoint or system
-    # prompt. Fall back to the engine's default agent model when omitted.
-    model = body.get("model") or settings.agent_model
+    # prompt. Fall back to the engine's default model for the agent's mode, the
+    # same pairing as the built-in agents (fast mode is one call on the vision model).
+    mode = _mode_from_tools(tools) or "agent"
+    model = body.get("model") or (settings.llm_model if mode == "fast" else settings.agent_model)
     rec = {
         "id": _new_id("agt"),
         "version": 1,
@@ -176,7 +191,7 @@ async def create_agent(request: Request, body: dict[str, Any] = Body(...)) -> di
         # None -> the runner falls back to the engine's global settings.
         "base_url": body.get("base_url"),
         "api_key": body.get("api_key"),
-        "tools": body.get("tools") or [],
+        "tools": tools,
         "skills": body.get("skills") or [],
         "mcp_servers": body.get("mcp_servers") or [],
         "metadata": body.get("metadata") or {},
@@ -510,6 +525,8 @@ def _session_resource(record: dict) -> dict:
         "environment_id": record.get("environment_id"),
         "title": record.get("title"),
         "metadata": record.get("metadata") or {},
+        # Extra field (kept by the SDK): the track this session runs, "agent" or "fast".
+        "mode": record.get("mode"),
         "resources": record.get("ma_resources") or [],
         "outcome_evaluations": [],
         "vault_ids": [],
@@ -533,21 +550,52 @@ def _session_status(ambient_status: Optional[str]) -> str:
     }.get(ambient_status or "", "idle")
 
 
+def _mode_from_tools(tools: Any) -> Optional[str]:
+    """'agent' / 'fast' from the first mode marker in `tools`, or None if there is none."""
+    for t in tools or []:
+        typ = t.get("type") if isinstance(t, dict) else None
+        if not isinstance(typ, str):
+            continue
+        if typ.startswith(_AGENT_MODE_PREFIXES):
+            return "agent"
+        if typ.startswith(_FAST_MODE_PREFIXES):
+            return "fast"
+    return None
+
+
+def _validate_mode_tools(tools: Any) -> None:
+    """Reject anything in agents.create `tools` other than one mode marker.
+
+    Without this, a typo'd marker (or an Anthropic tool type Ambient doesn't run)
+    was silently dropped and the agent quietly ran in the wrong mode.
+    """
+    if not isinstance(tools, list):
+        raise bad_request("agent.tools must be a list")
+    hint = (f"Ambient's video tools are built in; pass tools=[{{'type': '{AGENT_MODE_TOOL}'}}] "
+            f"for agent mode (the default when tools is omitted) or "
+            f"tools=[{{'type': '{FAST_MODE_TOOL}'}}] for fast mode")
+    modes = set()
+    for t in tools:
+        typ = t.get("type") if isinstance(t, dict) else None
+        mode = _mode_from_tools([t])
+        if mode is None:
+            raise bad_request(f"unsupported agent tool type {typ!r}. {hint}")
+        modes.add(mode)
+    if len(modes) > 1:
+        raise bad_request(f"agent.tools selects both agent and fast mode; pass only one. {hint}")
+
+
 def _mode_from_agent(agent_rec: dict, metadata: dict) -> str:
     """Select the track: 'agent' (tool loop) vs 'fast' (single dense-frame call).
 
-    An explicit metadata.mode wins; otherwise it's read from the agent's declared
-    tools — a `video_agent_*` (or legacy `agent_toolset_*`) marker means agent
-    mode, and anything else (a `video_fast_*` marker or no tools) means fast mode.
+    An explicit metadata.mode wins; otherwise it's read from the agent's mode
+    marker in `tools` (`video_agent_*` / legacy `agent_toolset_*` -> agent,
+    `video_fast_*` -> fast). No marker means agent mode.
     """
     m = (metadata or {}).get("mode")
-    if m in ("fast", "agent"):
+    if m in _MODES:
         return m
-    for t in agent_rec.get("tools") or []:
-        typ = (t or {}).get("type", "") if isinstance(t, dict) else ""
-        if typ.startswith("video_agent") or typ.startswith("agent_toolset"):
-            return "agent"
-    return "fast"
+    return _mode_from_tools(agent_rec.get("tools")) or "agent"
 
 
 async def build_session_record(body: dict, store) -> dict:
@@ -567,6 +615,8 @@ async def build_session_record(body: dict, store) -> dict:
     # needs ~6 turns, so default well above settings.max_turns_per_run (which
     # exists for the native API). Allow metadata override for tuning.
     meta = body.get("metadata") or {}
+    if meta.get("mode") is not None and meta["mode"] not in _MODES:
+        raise bad_request(f"metadata.mode must be 'agent' or 'fast', got {meta['mode']!r}")
     try:
         max_turns = int(meta.get("max_turns_per_run") or 20)
     except (TypeError, ValueError):
@@ -632,9 +682,12 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
 
     async def _boot() -> None:
         try:
-            # fast mode or self-video-analysis (vision-capable agent model) does not
-            # need a pre-booted sandbox. and only if backend is e2b
-            if (not record.get("mode") == "fast") and settings.sandbox_backend == "e2b":
+            # Agent mode needs the per-session e2b box up front (its clip/frame
+            # tools run in it). Fast mode does NOT boot here: if the vision provider
+            # accepts the whole video as a URL it never needs a box, so we defer and
+            # boot lazily only when the media plan falls back to frame extraction
+            # (runner._ensure_media_box). inprocess needs no box (host range proxy).
+            if record.get("mode") != "fast" and settings.sandbox_backend == "e2b":
                 await runner.start_sandbox()
             await store.update_session(record["session_id"], lambda r: {
                 **r, "status": "ready",
