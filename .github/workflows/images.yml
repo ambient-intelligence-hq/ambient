@@ -18,7 +18,8 @@ name: Publish images to GHCR
 # org -> Packages -> <image> -> Package settings -> Change visibility -> Public.
 #
 # After a push to main, the dev deployment on Railway redeploys its :main images.
-# Needs a RAILWAY_TOKEN repo secret: a project token for the production environment.
+# Needs RAILWAY_TOKEN, a project token for Railway's production environment, stored
+# as a secret on the "intuitive-vision / production" GitHub environment.
 
 on:
   push:
@@ -103,6 +104,7 @@ jobs:
     needs: publish
     if: github.repository == 'ambient-intelligence-hq/ambient' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: intuitive-vision / production
     env:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
     steps:
