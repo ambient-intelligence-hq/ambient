@@ -16,6 +16,9 @@ name: Publish images to GHCR
 # The first publish creates the package PRIVATE (it inherits the repo's
 # visibility). To let `install.sh` pull without logging in, make it public once:
 # org -> Packages -> <image> -> Package settings -> Change visibility -> Public.
+#
+# After a push to main, the dev deployment on Railway redeploys its :main images.
+# Needs a RAILWAY_TOKEN repo secret: a project token for the production environment.
 
 on:
   push:
@@ -93,3 +96,18 @@ jobs:
           # Reuse layers between runs (dependency layers rarely change).
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  deploy:
+    name: Redeploy on Railway
+    # Runs only once both images are pushed. Skipped on forks and release tags.
+    needs: publish
+    if: github.repository == 'ambient-intelligence-hq/ambient' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+    steps:
+      - run: npm install -g @railway/cli@5.71.0
+      # Engine first, so Studio comes back up against the new API. These return
+      # once Railway accepts the redeploy, not when the deploy is healthy.
+      - run: railway redeploy --service ambient --yes
+      - run: railway redeploy --service studio --yes
