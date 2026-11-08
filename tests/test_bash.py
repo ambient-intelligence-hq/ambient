@@ -6,6 +6,7 @@ with a fake media box to confirm routing + argument passing.
 Run: python -m unittest tests.test_bash
 """
 import asyncio
+import tempfile
 import unittest
 
 from ambient.config import settings
@@ -38,9 +39,15 @@ class BashHostTests(unittest.TestCase):
     def setUp(self):
         self._prev = settings.enable_bash_tool
         settings.enable_bash_tool = True
+        # Commands run in a throwaway directory, not the configured video folder.
+        self._prev_cwd = settings.bash_cwd
+        self._cwd = tempfile.TemporaryDirectory()
+        settings.bash_cwd = self._cwd.name
 
     def tearDown(self):
         settings.enable_bash_tool = self._prev
+        settings.bash_cwd = self._prev_cwd
+        self._cwd.cleanup()
 
     def test_echo_and_exit_code(self):
         out, _ = _run(bash("echo hello"))

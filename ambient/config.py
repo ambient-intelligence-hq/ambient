@@ -79,7 +79,9 @@ class Settings(BaseSettings):
     embedding_dimension: int = 1536
     embedding_client: str = "gemini"
 
-    video_folder: str = "/Users/logesh/self/video-llm-tests/videos"
+    # Local video storage when running from source. The Docker image and installer
+    # set VIDEO_FOLDER=/data/videos. Override with VIDEO_FOLDER.
+    video_folder: str = os.path.expanduser("~/.local/share/ambient/videos")
     box_video_folder: str = "/tmp/videos/"
     video_clip_duration: int = 60 # secs
     video_clip_fps: int = 5
