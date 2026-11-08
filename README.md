@@ -8,7 +8,7 @@ Give Ambient a video, from a short clip to hours of footage, and ask for what yo
 
 🏆 Won 2 tracks and placed second in a third at the [Meta Wearable AI Challenge, ECCV 2026](https://huggingface.co/spaces/facebook/wearable-ai-leaderboard).
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE?utm_medium=integration&utm_source=button&utm_campaign=ambient)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/2XoOFp?utm_medium=integration&utm_source=button&utm_campaign=ambient)
 
 ## Install
 

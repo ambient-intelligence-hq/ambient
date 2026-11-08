@@ -367,7 +367,7 @@ AWS_SECRET_ACCESS_KEY=...
 
 ## Option D — Railway
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE?utm_medium=integration&utm_source=button&utm_campaign=ambient)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/2XoOFp?utm_medium=integration&utm_source=button&utm_campaign=ambient)
 
 The template creates four services in one Railway project:
 
