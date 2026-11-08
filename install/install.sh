@@ -425,7 +425,7 @@ main() {
   model="${AMBIENT_MODEL:-$(env_get "$env_file" AGENT_MODEL)}"
   video_model="${AMBIENT_VIDEO_MODEL:-$(env_get "$env_file" LLM_MODEL)}"
   llm_key="${AMBIENT_LLM_KEY:-$(env_get "$env_file" LLM_API_KEY)}"
-  bash_tool="$(env_get "$env_file" ENABLE_BASH_TOOL)"; bash_tool="${bash_tool:-true}"
+  bash_tool="$(env_get "$env_file" ENABLE_BASH_TOOL)"; bash_tool="${bash_tool:-false}"
   pg_pass="$(env_get "$env_file" POSTGRES_PASSWORD)"; pg_pass="${pg_pass:-$(gen_secret)}"
   engine_key="$(env_get "$env_file" ENGINE_API_KEY)"; engine_key="${engine_key:-$(gen_secret)}"
   auth_secret="$(env_get "$env_file" AUTH_SECRET)"; auth_secret="${auth_secret:-$(gen_secret)}"

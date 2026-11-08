@@ -67,8 +67,8 @@ All three run the same published images:
 
 For anything beyond a personal install, set `SANDBOX_BACKEND=e2b`.
 
-- **Isolation.** The agent has a shell tool (`ENABLE_BASH_TOOL`, on by default)
-  and runs ffmpeg on untrusted video files. With `inprocess`, both run **inside
+- **Isolation.** The agent has an optional shell tool (`ENABLE_BASH_TOOL`, off by
+  default) and runs ffmpeg on untrusted video files. With `inprocess`, both run **inside
   the engine container**, with the engine's privileges and access to its
   environment: your LLM key, database URL and S3 credentials. With `e2b`, they
   run in a separate, disposable microVM per session, which only receives S3
@@ -111,8 +111,8 @@ itself down after `SANDBOX_WALL_SECONDS` (default 1800) without activity, so
 idle sessions stop costing money. Ingest (descriptions, YouTube imports) uses
 short-lived sandboxes of its own. Set a spend limit in the e2b dashboard.
 
-> **Caution:** if you keep `inprocess` on a shared install, turn the shell tool
-> off: `ENABLE_BASH_TOOL=false`.
+> **Caution:** if you keep `inprocess` on a shared install, leave the shell tool
+> off (`ENABLE_BASH_TOOL=false`, the default).
 
 ---
 
@@ -451,7 +451,7 @@ Engine settings are read from the environment (or a `.env` file), case-insensiti
 | `SANDBOX_BACKEND` | `inprocess` | `inprocess` (ffmpeg in the engine) or `e2b` |
 | `E2B_API_KEY`, `E2B_TEMPLATE` | —, `video-analysis-v1` | e2b backend |
 | `SANDBOX_WALL_SECONDS` | `1800` | Idle timeout for a session's e2b sandbox |
-| `ENABLE_BASH_TOOL` | `true` | Agent shell tool. Turn off on shared `inprocess` installs |
+| `ENABLE_BASH_TOOL` | `false` | Agent shell tool. Leave off on shared `inprocess` installs |
 | `S3_ENDPOINT`, `S3_BUCKET`, `S3_VIDEO_BASE_KEY` | —, —, `videos` | Object storage |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | — | Object storage credentials |
 | `VIDEO_FOLDER` | `/data/videos` (image) | Local video storage |
