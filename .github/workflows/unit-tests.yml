@@ -1,0 +1,77 @@
+name: Unit tests
+
+# Runs on every PR to main, with no path filter, so it can be a required check.
+# Needs no secrets, services or .env, so it also runs on PRs from forks.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # Modules are listed rather than discovered so one can be left out.
+      # test_inspection_metric needs benchmarks/, which isn't committed yet.
+      - name: Run tests
+        run: |
+          mapfile -t modules < <(
+            find tests -maxdepth 1 -name 'test_*.py' ! -name 'test_inspection_metric.py' \
+              | sed -e 's#/#.#' -e 's#\.py$##' | sort
+          )
+          echo "Running ${#modules[@]} test modules"
+          uv run --locked python -m unittest "${modules[@]}"
+
+  studio:
+    name: Studio
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ambient/studio/console
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ambient/studio/console/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: ambient/studio/console/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          HUSKY: "0"
+
+      - name: Run tests
+        run: pnpm exec tsx --test lib/ambient/turn.test.ts

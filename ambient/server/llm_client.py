@@ -5,6 +5,7 @@ Yields parsed chunk dicts. The HTTP route relays each as
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import AsyncIterator, Optional
@@ -13,8 +14,23 @@ import aiohttp
 
 from ambient.config import settings
 from ambient.llm import get_provider_params
+from ambient.media_plan import classify_service
+
+# Hosted APIs that validate request bodies strictly (Fireworks rejects unknown
+# fields per model), so the OpenRouter-only `usage`/`reasoning` fields are omitted.
+_STRICT_SERVICES = {"fireworks", "together", "openai"}
 
 logger = logging.getLogger(__name__)
+
+# Transient upstream failures are retried, but only before the first chunk: once
+# output has streamed to the client, a retry would duplicate it. One provider 500
+# (seen on OpenRouter/Alibaba) used to end the whole agent run.
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504, 529})
+_RETRY_DELAYS = (2.0, 8.0)
+
+
+class _RetryableStatus(Exception):
+    pass
 
 
 async def stream_chat_completion(
@@ -49,16 +65,23 @@ async def stream_chat_completion(
         # Ask the provider to include a final usage chunk in the stream so the
         # runner can attribute token/cost to the session. `stream_options` is the
         # OpenAI-native switch; `usage.include` is OpenRouter's (which also returns
-        # the actual USD cost). Sending both is harmless and maximizes coverage.
+        # the actual USD cost). Sending both maximizes coverage, except to strict
+        # hosted APIs that reject unknown fields.
         "stream_options": {"include_usage": True},
-        "usage": {"include": True},
     }
+    service = classify_service(endpoint)
+    strict = service in _STRICT_SERVICES
+    if service == "openai":
+        # OpenAI's newer models reject max_tokens on chat completions.
+        body["max_completion_tokens"] = body.pop("max_tokens")
+    if not strict:
+        body["usage"] = {"include": True}
     # Only include tools/tool_choice when there actually are tools — some servers
     # (vLLM) reject an empty `tools` array. Fast mode passes tools=[].
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
-    if reasoning_enabled:
+    if reasoning_enabled and not strict:
         body["reasoning"] = {"enabled": True}
     provider_params = get_provider_params(model, endpoint)
     if response_format:
@@ -91,27 +114,49 @@ async def stream_chat_completion(
         total=None, sock_connect=30, sock_read=timeout,
     )
     logger.info(f"Making LLM call to Agent - {model}")
-    async with aiohttp.ClientSession(timeout=client_timeout) as session:
-        async with session.post(endpoint, headers=headers, json=body) as resp:
-            if resp.status != 200:
-                err = await resp.text()
-                raise RuntimeError(f"HTTP {resp.status} from {endpoint}: {err[:500]}")
-            async for raw in resp.content:
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    return
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                yield chunk
+    for attempt in range(len(_RETRY_DELAYS) + 1):
+        streamed = False
+        try:
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                async with session.post(endpoint, headers=headers, json=body) as resp:
+                    if resp.status != 200:
+                        err = await resp.text()
+                        msg = f"HTTP {resp.status} from {endpoint}: {err[:500]}"
+                        if resp.status in _RETRY_STATUS:
+                            raise _RetryableStatus(msg)
+                        raise RuntimeError(msg)
+                    async for raw in resp.content:
+                        if not raw:
+                            continue
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if not line or line.startswith(":"):
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        # Some providers (vLLM/SGLang gateways, OpenRouter mid-stream) report
+                        # a rejected request as HTTP 200 + an `error` chunk. Raise it like a
+                        # non-200 so the run fails visibly instead of ending empty.
+                        if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                            raise RuntimeError(f"stream error from {endpoint}: {json.dumps(chunk['error'])[:500]}")
+                        streamed = True
+                        yield chunk
+            return
+        except (_RetryableStatus, aiohttp.ClientConnectionError, asyncio.TimeoutError) as exc:
+            if streamed or attempt == len(_RETRY_DELAYS):
+                if isinstance(exc, _RetryableStatus):
+                    raise RuntimeError(str(exc)) from None
+                raise
+            delay = _RETRY_DELAYS[attempt]
+            logger.warning("LLM call to %s failed before streaming (%s: %s); retry %d in %.0fs",
+                           model, type(exc).__name__, str(exc)[:200], attempt + 1, delay)
+            await asyncio.sleep(delay)
 
 
 def assemble_assistant_message(

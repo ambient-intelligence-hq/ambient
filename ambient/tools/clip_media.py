@@ -41,11 +41,11 @@ async def produce_window_media(
         map back to absolute video time by adding it.
 
     `step` is the media_plan key ("search_clip" / "focus_clip"). `model`/`base_url`
-    default to the vision endpoint (`settings.llm_model` / `settings.llm_base_url`),
-    the endpoint these clips are actually analyzed on.
+    are the endpoint that reads these clips; they default to the vision endpoint
+    (`settings.llm_model` / `settings.llm_base_url`).
     """
-    q = get_provider_quality_settings(settings.llm_model)
     model = model or settings.llm_model
+    q = get_provider_quality_settings(model)
     base_url = base_url if base_url is not None else settings.llm_base_url
     span = max(float(end_time) - float(start_time), 0.1)
     plan = plan_media(step, base_url, model, span)

@@ -203,7 +203,13 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
         return;
       }
       if (error instanceof ChatbotError) {
-        toast({ description: error.message, type: "error" });
+        // Bad requests carry the failed check as `cause` (e.g. "Message is too
+        // long"); show it, since the generic message alone isn't actionable.
+        const detail =
+          error.type === "bad_request" && typeof error.cause === "string"
+            ? error.cause
+            : null;
+        toast({ description: detail ?? error.message, type: "error" });
         return;
       }
       // A generic stream/network drop mid-run. The engine run is independent and

@@ -15,6 +15,7 @@ Events are persisted to the SQLite store *and* fanned out to subscribers in real
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 import uuid
@@ -32,6 +33,7 @@ from ambient.server.store import Store
 from ambient.tools import TOOLS
 from ambient.server.ingest import ensure_description
 from ambient.config import get_model_modalities, self_video_analysis_enabled
+from ambient import media_budget as mb
 import logging
 
 log = logging.getLogger(__name__)
@@ -40,7 +42,34 @@ log = logging.getLogger(__name__)
 # limit videos per prompt (observed: "At most 20 video(s) may be provided in one
 # prompt"), so without this a long, clip-heavy session eventually 400s and dies.
 MAX_CLIPS = settings.max_clips_per_prompt
-MAX_FRAMES = settings.max_frames_per_prompt
+
+_TOOL_LIMIT_NUDGE = (
+    "You have reached the tool-use limit for this run, so no more tools "
+    "are available. Do not attempt to call any tool. Using everything you "
+    "have already gathered, write your complete final answer now."
+)
+# After this many media-budget reductions in one run, tell the agent (once) that its
+# older frames keep being removed. On tight providers (Fireworks: 95 images) some
+# models otherwise keep collecting frames for 100+ turns.
+_CHURN_REDUCTIONS = 8
+_CHURN_NUDGE = (
+    "Note: you have inspected a lot of media in this run, and older frames keep being "
+    "removed to fit this provider's request limits. Unless one specific detail is still "
+    "unverified, stop collecting frames and write your final answer from your notes."
+)
+_CLIP_DEFERRED = (
+    "Not run: this provider accepts only {limit} video clip(s) per request, so this turn "
+    "shows the earlier clip(s). Review them, then request {start:g}-{end:g} s in a later turn."
+)
+_NO_VIDEO_SLOT = (
+    "Not run: this provider accepts only one video per request and the whole video already "
+    "fills it, so clips can't be shown. Use grab_frames for a close look at a short span."
+)
+_LENGTH_NUDGE = (
+    "Your previous reply used up its output length before you wrote an answer. "
+    "Do not deliberate further and do not call tools. Using everything gathered so "
+    "far, write your complete final answer now."
+)
 
 _TOKEN_FIELDS = (
     "input_tokens",
@@ -141,7 +170,8 @@ def _normalize_for_openai(messages: list[dict]) -> list[dict]:
                 out.append({"role": "user", "content": merged})
                 continue
 
-        out.append(message)
+        # Fields starting with "_" are engine bookkeeping (media_budget.FRAMES_KEY).
+        out.append({k: v for k, v in message.items() if not k.startswith("_")})
     return out
 
 
@@ -209,6 +239,9 @@ class SessionRunner:
         self.messages: list[dict] = messages or self._get_seed_messages(model_modalities)
         self._run_task: Optional[asyncio.Task] = None
         self._run_lock = asyncio.Lock()
+        self._run_finished = True   # no run in progress
+        self._run_reductions = 0    # media-budget reductions in the current run
+        self._run_model = model     # the model the current run talks to
         self._status = "created"
         self._cancel_requested = False
         # Background task that resolves the video description off the critical
@@ -490,6 +523,11 @@ class SessionRunner:
 
     async def _run_until_done(self, model: str) -> None:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
+        self._run_finished = False
+        self._run_reductions = 0
+        # Tools that add media to this conversation size it for this endpoint.
+        self._dispatcher.agent_endpoint = (model, self._agent_base_url())
+        self._run_model = model
         await self._set_status("running")
         await self._emit("run.started", {"run_id": run_id, "model": model})
         stop_reason = "end_turn"
@@ -529,8 +567,7 @@ class SessionRunner:
                     "progress": {"message": "attaching video"},
                 })
                 await self._await_source_ready()
-                await self._attach_video_context(
-                    settings.agent_base_url or settings.llm_base_url, model)
+                await self._attach_video_context(self._agent_base_url(), model)
 
             for turn in range(1, self.max_turns_per_run + 1):
                 # Keep the ownership lease alive for the duration of the run.
@@ -544,9 +581,7 @@ class SessionRunner:
                         "text": f"{self._DESC_INJECT_MARKER} now available:\n{self.video_description}",
                     }]})
 
-                prepared = _normalize_for_openai(self.messages)
-                prepared = _retain_last_n_by_type(prepared, "video_url", MAX_CLIPS)
-                prepared = _retain_last_n_by_type(prepared, "image_url", MAX_FRAMES)
+                prepared = await self._prepare_messages(run_id, turn, model)
 
                 chunks: list[dict] = []
                 try:
@@ -598,6 +633,17 @@ class SessionRunner:
                     "finish_reason": finish_reason or "stop",
                 })
 
+                if finish_reason == "length" and not text and not tool_uses:
+                    # The output budget went to reasoning before any answer was
+                    # written. Ask once more for the answer alone, so the run doesn't
+                    # end empty.
+                    log.warning("[agent] session %s turn %s: hit max output tokens with "
+                                "no answer; forcing an answer turn", self.session_id, turn)
+                    final_answer = await self._synthesize_final_answer(
+                        run_id, model, turn + 1, nudge=_LENGTH_NUDGE, reasoning_enabled=False)
+                    stop_reason = "end_turn"
+                    break
+
                 if finish_reason in (None, "stop", "length"):
                     final_answer = text
                     stop_reason = "end_turn"
@@ -619,31 +665,115 @@ class SessionRunner:
                 # completion so the client still gets a real, synthesized answer
                 # (from everything gathered) instead of trailing off mid-investigation.
                 # Fall back to the last non-empty assistant text only if that fails.
-                forced = await self._synthesize_final_answer(run_id, model)
+                forced = await self._synthesize_final_answer(
+                    run_id, model, self.max_turns_per_run + 1)
                 final_answer = forced or final_answer or last_assistant_text
 
-            await self._emit("run.completed", {
+            await self._finish_run({
                 "run_id": run_id,
                 "stop_reason": stop_reason,
                 "answer": final_answer,
                 "usage": self.usage,
             })
         except asyncio.CancelledError:
-            await self._emit("run.completed", {
+            await self._finish_run({
                 "run_id": run_id,
                 "stop_reason": "cancelled",
                 "answer": "",
             })
+        except Exception as exc:  # noqa: BLE001
+            # Anything unexpected (a DB/Redis timeout under load, a bug) must still end
+            # the run visibly: otherwise the task dies silently and the client waits on
+            # session.status_running forever.
+            await self._fail_run(run_id, exc, final_answer or last_assistant_text)
         finally:
+            await self._finish_run(None)
+
+    async def _finish_run(self, completion: Optional[dict]) -> None:
+        """End the current run once: persist, mark ready, release the run lease, and
+        only then emit `run.completed` (None = no event, e.g. an unexpected error).
+
+        Clients read run.completed (SDK: session.status_idle) as "ready for the next
+        message" and send it straight away; emitting it before the lease is released
+        made that send race the cleanup and fail with 409 "a run is already in
+        flight"."""
+        if self._run_finished:
+            return
+        self._run_finished = True
+        try:
             await self.store.save_messages(self.session_id, self.messages)
             await self._persist_usage()
             await self._set_status("ready")
             # Release the run-ownership lease so any worker can serve the next turn.
             await self.broker.release(self.session_id)
+        except Exception:  # noqa: BLE001 - logged; the client still gets run.completed
+            log.exception("run cleanup failed (session=%s)", self.session_id)
+        finally:
+            # Even if persistence failed, the client must not hang on "running".
+            if completion is not None:
+                await self._emit("run.completed", completion)
 
-    async def _synthesize_final_answer(self, run_id: str, model: str) -> str:
-        """Force one tool-free completion so a run that hit the turn cap still ends
-        with a real answer instead of trailing off mid tool-use.
+    async def _fail_run(self, run_id: str, exc: BaseException, answer: str) -> None:
+        """End a run that raised unexpectedly: log it, tell the client, finish."""
+        log.exception("run failed (session=%s run=%s): %s", self.session_id, run_id, exc)
+        try:
+            await self._emit("error", {"code": "run_failed", "message": f"{type(exc).__name__}: {exc}"[:500],
+                                       "fatal": False})
+        except Exception:  # noqa: BLE001 - the emit path may be what failed
+            log.exception("could not emit run failure (session=%s)", self.session_id)
+        await self._finish_run({"run_id": run_id, "stop_reason": "error", "answer": answer,
+                                "usage": self.usage})
+
+    def _agent_base_url(self) -> Optional[str]:
+        """The endpoint agent completions go to (same fallback as the LLM client)."""
+        return self.base_url or settings.agent_base_url or settings.llm_base_url
+
+    async def _prepare_messages(self, run_id: str, turn: int, model: str) -> list[dict]:
+        """The conversation in OpenAI shape, fitted to the provider's request limits."""
+        if settings.media_budget_enabled:
+            await self._fit_media_budget(run_id, turn, model)
+        prepared = _normalize_for_openai(self.messages)
+        prepared = _retain_last_n_by_type(prepared, "video_url", MAX_CLIPS)
+        if not settings.media_budget_enabled:
+            prepared = _retain_last_n_by_type(prepared, "image_url", settings.max_frames_per_prompt)
+        return prepared
+
+    async def _fit_media_budget(self, run_id: str, turn: int, model: str) -> None:
+        """Reduce older tool media so the next request fits the provider's limits
+        (ambient.media_budget). Usually a no-op; when it acts, the reduction is
+        persisted with the messages and recorded in the session usage, and clients
+        get a progress note, because older frames are no longer visible to the
+        agent."""
+        budget = mb.budget_for(self._agent_base_url(), model)
+        sizes = None
+        if budget.url_bytes is not None:   # provider limits downloaded bytes: measure URLs
+            sizes = await mb.url_sizes(mb.hosted_urls(self.messages))
+        red = mb.fit_media_budget(self.messages, budget, sizes)
+        if red is None:
+            return
+        log.info("[media_budget] session %s turn %s: %s", self.session_id, turn, red.summary())
+        stats = self.usage.setdefault("media_budget", {"reductions": 0, "thumbnailed": 0, "removed": 0})
+        stats["reductions"] += 1
+        stats["thumbnailed"] += red.thumbnailed
+        stats["removed"] += red.removed
+        stats["last"] = {"turn": turn, **red.as_dict()}
+        self._run_reductions += 1
+        if self._run_reductions == _CHURN_REDUCTIONS:
+            log.info("[media_budget] session %s turn %s: %d reductions this run; nudging the "
+                     "agent to answer", self.session_id, turn, self._run_reductions)
+            self.messages.append({"role": "user", "content": [{"type": "text", "text": _CHURN_NUDGE}]})
+        await self._emit("tool.progress", {
+            "run_id": run_id,
+            "turn": turn,
+            "progress": {"message": red.summary(), "media_budget": red.as_dict()},
+        })
+
+    async def _synthesize_final_answer(self, run_id: str, model: str, turn: int,
+                                       nudge: Optional[str] = None,
+                                       reasoning_enabled: bool = True) -> str:
+        """Force one tool-free completion so a run that hit the turn cap (or ran out
+        of output tokens before answering, `nudge=_LENGTH_NUDGE`) still ends with a
+        real answer instead of trailing off.
 
         The agent has spent its whole turn budget calling tools; those tool results
         are already in ``self.messages``. We nudge it to stop calling tools and
@@ -654,16 +784,10 @@ class SessionRunner:
         """
         self.messages.append({"role": "user", "content": [{
             "type": "text",
-            "text": (
-                "You have reached the tool-use limit for this run, so no more tools "
-                "are available. Do not attempt to call any tool. Using everything you "
-                "have already gathered, write your complete final answer now."
-            ),
+            "text": nudge or _TOOL_LIMIT_NUDGE,
         }]})
 
-        prepared = _normalize_for_openai(self.messages)
-        prepared = _retain_last_n_by_type(prepared, "video_url", MAX_CLIPS)
-        prepared = _retain_last_n_by_type(prepared, "image_url", MAX_FRAMES)
+        prepared = await self._prepare_messages(run_id, turn, model)
 
         chunks: list[dict] = []
         try:
@@ -671,6 +795,7 @@ class SessionRunner:
                 model=model,
                 messages=prepared,
                 tools=[],  # no tools -> the model must answer with text
+                reasoning_enabled=reasoning_enabled,
                 base_url=self.base_url,
                 api_key=self.api_key,
             ):
@@ -690,12 +815,11 @@ class SessionRunner:
         )
         self.messages.append(assistant_msg)
         self.usage["turns"] = int(self.usage.get("turns", 0)) + 1
-        forced_turn = self.max_turns_per_run + 1
-        await self._record_usage(run_id, forced_turn, model, agent_usage, "agent")
+        await self._record_usage(run_id, turn, model, agent_usage, "agent")
         if settings.expose_thinking and reasoning:
             await self._emit("agent.reasoning", {
                 "run_id": run_id,
-                "turn": forced_turn,
+                "turn": turn,
                 "reasoning": reasoning,
             })
         return self._extract_answer_text(assistant_msg)
@@ -737,7 +861,7 @@ class SessionRunner:
         # Duration drives the per-step sampling budget (frames = fps x duration,
         # capped). Youtube imports carry it under "youtube"; uploads carry a top-level
         # "duration" probed at ingest (store_video). 0 -> tools probe for it.
-        duration = 0.0
+        duration, size_bytes = 0.0, None
         try:
             rec = await self.store.get_file(self.video_id)
             if rec:
@@ -745,10 +869,17 @@ class SessionRunner:
                     (rec.get("youtube") or {}).get("duration")
                     or rec.get("duration") or 0
                 ) or 0.0
+                size_bytes = rec.get("size_bytes")
         except Exception:  # noqa: BLE001
             pass
 
-        plan = plan_media("context", base_url, model, duration)
+        # size_bytes lets the plan skip a video_url the provider would reject as too large.
+        plan = plan_media("context", base_url, model, duration, video_bytes=size_bytes)
+        # Agent mode keeps half the request budget for tool media; fast mode is one
+        # request, so the context may use all of it.
+        budget = mb.budget_for(base_url, model)
+        share = mb.CONTEXT_SHARE if self.mode == "agent" else 1.0
+        sized = settings.media_budget_enabled
 
         # Dense-video path (endpoint samples internally): send the source URL — no
         # sandbox, no frame upload (~3-4x faster than the e2b frame pipeline).
@@ -756,12 +887,17 @@ class SessionRunner:
             print(f"[plan_media] attaching video context for session {self.session_id}, video_id: {self.video_id} , duration: {duration}")
             url = await fm.source_video_url(self.video_id, self.store)
             if url:
-                self.messages.insert(1, fm.build_fast_video_message(url, video_id=self.video_id))
+                video_message = fm.build_fast_video_message(url, video_id=self.video_id)
+                if sized:
+                    video_message[mb.FRAMES_KEY] = mb.video_context_frames(base_url, model, plan, duration, budget)
+                self.messages.insert(1, video_message)
                 log.info(f"[video_context] session {self.session_id}: video_url "
                          f"(fps~{plan.fps:.2f}, <={plan.max_frames}f)")
                 return
             # No S3 URL to host the video -> force the frames path instead.
             plan = plan_media("context", base_url, model, duration, force_frames=True)
+        if sized and plan.max_frames > mb.context_frame_cap(budget, share):
+            plan = dataclasses.replace(plan, max_frames=mb.context_frame_cap(budget, share))
 
         # Frames path (endpoints that can't control video sampling / image-only
         # models): uniformly sample and attach as timestamp-labeled image blocks.
@@ -771,6 +907,16 @@ class SessionRunner:
         await self._ensure_media_box()
         frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, plan,
                                                    duration=duration or None)
+        # The byte budget needs the frames' real encoded size, known only now.
+        sampled = len(frames)
+        if sized:
+            sizes = None
+            if budget.url_bytes is not None:
+                sizes = await mb.url_sizes([f.frame_url for f in frames if f.frame_url])
+            frames = mb.fit_context_frames(frames, budget, share, sizes)
+        if len(frames) < sampled:
+            log.info("[video_context] session %s: thinned %d -> %d frames to fit the request budget",
+                     self.session_id, sampled, len(frames))
         print(f"[plan_media] attaching frames context for session {self.session_id}, Number of frames: {len(frames)}")
 
         self.messages.insert(1, fm.build_fast_frames_message(frames))
@@ -795,6 +941,8 @@ class SessionRunner:
 
     async def _run_fast(self, model: str) -> None:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
+        self._run_finished = False
+        self._run_reductions = 0
         await self._set_status("running")
         await self._emit("run.started", {"run_id": run_id, "model": model})
         await self._seed_usage_once()
@@ -821,8 +969,8 @@ class SessionRunner:
                                   self.session_id, exc)
                     await self._emit("error", {"code": "fast_frames_failed",
                                                "message": str(exc), "fatal": False})
-                    await self._emit("run.completed", {"run_id": run_id, "stop_reason": "error",
-                                                       "answer": "", "usage": self.usage})
+                    await self._finish_run({"run_id": run_id, "stop_reason": "error",
+                                            "answer": "", "usage": self.usage})
                     return
 
             response_format = None
@@ -871,17 +1019,38 @@ class SessionRunner:
                     await self._emit("agent.reasoning", {"run_id": run_id, "turn": 1, "reasoning": reasoning})
                 final_answer = self._extract_answer_text(assistant_msg)
 
-            await self._emit("run.completed", {
+            await self._finish_run({
                 "run_id": run_id, "stop_reason": stop_reason,
                 "answer": final_answer, "usage": self.usage,
             })
         except asyncio.CancelledError:
-            await self._emit("run.completed", {"run_id": run_id, "stop_reason": "cancelled", "answer": ""})
+            await self._finish_run({"run_id": run_id, "stop_reason": "cancelled", "answer": ""})
+        except Exception as exc:  # noqa: BLE001 - see _run_until_done
+            await self._fail_run(run_id, exc, "")
         finally:
-            await self.store.save_messages(self.session_id, self.messages)
-            await self._persist_usage()
-            await self._set_status("ready")
-            await self.broker.release(self.session_id)
+            await self._finish_run(None)
+
+    def _deferred_clips(self, tool_uses: list[dict]) -> dict[str, str]:
+        """tool_use_id -> why it won't run, for clips over the provider's video-count
+        limit (a request with too many videos is rejected outright)."""
+        clips = [b for b in tool_uses if b["name"] == "focus_clip"]
+        if not clips or not settings.media_budget_enabled or not self_video_analysis_enabled(self._run_model):
+            return {}
+        from ambient.media_plan import plan_media
+
+        base_url = self._agent_base_url()
+        slots = mb.free_video_slots(self.messages, mb.budget_for(base_url, self._run_model))
+        if slots is None or plan_media("self_focus_clip", base_url, self._run_model, 60).method != "video":
+            return {}
+        if slots == 0:
+            return {b["id"]: _NO_VIDEO_SLOT for b in clips}
+        deferred = {}
+        for b in clips[slots:]:
+            tool_input = b.get("input") or {}
+            start = float(tool_input.get("start_time") or 0)
+            deferred[b["id"]] = _CLIP_DEFERRED.format(limit=slots, start=start,
+                                                      end=start + (mb.tool_span(tool_input) or 0))
+        return deferred
 
     async def _run_tool_calls(self, run_id: str, turn: int, tool_uses: list[dict]) -> None:
         # Media tools read the source from S3; for a fresh youtube import that
@@ -897,6 +1066,7 @@ class SessionRunner:
         await self._await_source_ready(on_wait=_on_wait)
 
         tool_uses_by_id = {b["id"]: b["name"] for b in tool_uses}
+        deferred_clips = self._deferred_clips(tool_uses)
 
         async def _run_one(block: dict) -> tuple[str, dict | None, dict | None]:
             tool_use_id = block["id"]
@@ -909,6 +1079,8 @@ class SessionRunner:
                 "name": name,
                 "input": tool_input,
             })
+            if tool_use_id in deferred_clips:
+                return tool_use_id, {"analysis": deferred_clips[tool_use_id]}, None
             result_data: dict | None = None
             failure: dict | None = None
             async for ev in self._dispatcher.call_tool(tool_use_id, name, tool_input):
@@ -933,6 +1105,11 @@ class SessionRunner:
 
         results = await asyncio.gather(*(_run_one(b) for b in tool_uses))
 
+        # Tool media (clip frames etc.) goes after *all* tool results: the OpenAI
+        # shape requires every tool message of a parallel group to directly follow
+        # the assistant's tool_calls, and strict providers (Together) reject a user
+        # message interleaved between them.
+        media_messages: list[dict] = []
         for tool_use_id, result_data, failure in results:
             if failure is not None:
                 await self._emit("tool.failed", {
@@ -953,7 +1130,12 @@ class SessionRunner:
 
             data = result_data or {}
             analysis = data.get("analysis", "")
-            attachments = data.get("attachments") or []
+            # Event attachments are previews for clients. Inline frames (data URLs) are
+            # left out: a clip's can be tens of MB, which bloats the event log and
+            # pushes live subscribers past Redis' pub/sub output limit (32 MB), which
+            # drops their stream. The model still gets them via user_message_contents.
+            attachments = [a for a in (data.get("attachments") or [])
+                           if not str(a.get("url") or "").startswith("data:")]
             user_message_contents = data.get("user_message_contents") or []
 
             # Attribute any LLM usage this tool incurred (e.g. clip/frame analysis)
@@ -981,7 +1163,14 @@ class SessionRunner:
                 }],
             })
             if user_message_contents:
-                self.messages.append({"role": "user", "content": user_message_contents})
+                # Name the window up front so the media budget can say which range
+                # it reduced (and how to re-open it) if this media is trimmed later.
+                block = next((b for b in tool_uses if b["id"] == tool_use_id), {})
+                label = mb.media_label(block.get("name", "tool"), block.get("input") or {})
+                if label and (user_message_contents[0] or {}).get("type") != "text":
+                    user_message_contents = [{"type": "text", "text": label}, *user_message_contents]
+                media_messages.append({"role": "user", "content": user_message_contents})
+        self.messages.extend(media_messages)
 
     # --- helpers ----------------------------------------------------------
 

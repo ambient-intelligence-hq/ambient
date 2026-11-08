@@ -83,7 +83,18 @@ path and a presigned download URL. Use it when the user should be able to downlo
 a deliverable — then include the returned URL in your answer.
 """
 
-    tool_prompt = f"{tool_prompt}\n{escalation_ladder}\n{other_videos_prompt}\n{artifact_prompt}"
+    # The media budget (ambient/media_budget.py) may thin or remove older tool
+    # media to fit provider request limits; the agent should not rely on it.
+    media_budget_prompt = "" if not settings.media_budget_enabled else """
+## Older frames may be reduced
+To fit the provider's request limits, frames and clips from earlier tool calls may
+later be thinned to every 4th frame or replaced with a note naming the range. Your
+own notes and the tool results' text are always kept. So as you inspect media,
+write down what you saw with timestamps, and if you need a reduced range again,
+call focus_clip on it.
+"""
+
+    tool_prompt = f"{tool_prompt}\n{escalation_ladder}\n{other_videos_prompt}\n{artifact_prompt}\n{media_budget_prompt}"
 
     return (f"""
 You are a helpful video research assistant that can perform tasks and answer questions about a long video. 

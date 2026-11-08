@@ -51,7 +51,11 @@ class Broker:
         self._release = None  # registered Lua script
 
     async def connect(self) -> None:
-        self._redis = aioredis.from_url(self.url, decode_responses=True)
+        # Bounded so a dead socket raises instead of hanging a run's lease renewal or
+        # event publish forever. socket_timeout stays above the 15 s pub/sub poll
+        # (BrokerSubscription.get); the health check replaces sockets that died idle.
+        self._redis = aioredis.from_url(self.url, decode_responses=True, socket_connect_timeout=5,
+                                        socket_timeout=30, health_check_interval=30)
         self._release = self._redis.register_script(_RELEASE_LUA)
 
     async def close(self) -> None:

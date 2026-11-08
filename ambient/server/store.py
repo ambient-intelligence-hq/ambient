@@ -88,7 +88,9 @@ class Store:
         self._pool: Optional[asyncpg.Pool] = None
 
     async def connect(self) -> None:
-        self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10)
+        # command_timeout bounds every statement: a connection that dies mid-query
+        # (seen under heavy host load) raises instead of hanging the run forever.
+        self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=10, command_timeout=60)
         async with self._pool.acquire() as conn:
             await conn.execute(SCHEMA)
 

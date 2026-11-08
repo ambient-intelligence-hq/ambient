@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Optional
 from ambient.config import settings, get_provider_quality_settings
-from ambient.tools.video_backend import resolve_video_tools
+from ambient.tools.video_backend import current_agent_endpoint, resolve_video_tools
 from ambient.utils.s3 import get_s3_client
 from pydantic import BaseModel, Field
 # from ambient.tools.video_description import get_video_description
@@ -28,7 +28,9 @@ async def self_focus_clip(
 ) -> tuple[str, List[Dict]]:
 
     user_message_contents = []
-    provider_quality_settings = get_provider_quality_settings(settings.llm_model)
+    # This media goes to the agent model itself, so it follows the agent's endpoint.
+    model, base_url = current_agent_endpoint.get() or (None, None)
+    provider_quality_settings = get_provider_quality_settings(model or settings.llm_model)
     video_tools = resolve_video_tools(
         video_id, video_path, max_frame_dimention=provider_quality_settings.max_dimentions
     )
@@ -41,7 +43,7 @@ async def self_focus_clip(
     # frames instead. Clips ride a single 0-based timeline; the model reads them as
     # one clip and cites mm:ss within the window.
     kind, media, _clip_start, _plan = await produce_window_media(
-        video_tools, "focus_clip", start_time, end_time)
+        video_tools, "self_focus_clip", start_time, end_time, model=model, base_url=base_url)
 
     print(f"[Tool call] self_focus_clip: kind: {kind} , media_count: {len(media)} , _clip_start: {_clip_start} , _plan: {_plan} ")
 

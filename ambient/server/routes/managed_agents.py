@@ -611,16 +611,15 @@ async def build_session_record(body: dict, store) -> dict:
     model = _model_id(agent_rec.get("model"))
     session_id = _new_id("ses")
     now = _now()
-    # The Managed Agents session has no turns field; the video agent typically
-    # needs ~6 turns, so default well above settings.max_turns_per_run (which
-    # exists for the native API). Allow metadata override for tuning.
+    # Callers may override via metadata.max_turns_per_run. Studio sends only
+    # video_id + mode, so it inherits settings.max_turns_per_run.
     meta = body.get("metadata") or {}
     if meta.get("mode") is not None and meta["mode"] not in _MODES:
         raise bad_request(f"metadata.mode must be 'agent' or 'fast', got {meta['mode']!r}")
     try:
-        max_turns = int(meta.get("max_turns_per_run") or 20)
+        max_turns = int(meta.get("max_turns_per_run") or settings.max_turns_per_run)
     except (TypeError, ValueError):
-        max_turns = 20
+        max_turns = settings.max_turns_per_run
         
     backend = settings.sandbox_backend
     limits_dict = {
