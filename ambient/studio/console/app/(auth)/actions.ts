@@ -2,6 +2,7 @@
 
 import { z } from "zod";
 
+import { isClosedAccess } from "@/lib/constants";
 import { createUser, getUser } from "@/lib/db/queries";
 
 import { signIn } from "./auth";
@@ -55,6 +56,11 @@ export const register = async (
   _: RegisterActionState,
   formData: FormData
 ): Promise<RegisterActionState> => {
+  // Server actions can be invoked from any page, so hiding /register isn't enough.
+  if (isClosedAccess()) {
+    return { status: "failed" };
+  }
+
   try {
     const validatedData = authFormSchema.parse({
       email: formData.get("email"),

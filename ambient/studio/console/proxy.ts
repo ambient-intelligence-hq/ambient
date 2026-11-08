@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
-import { guestRegex, isSecureRequest } from "./lib/constants";
+import { guestRegex, isClosedAccess, isSecureRequest } from "./lib/constants";
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
@@ -20,6 +20,17 @@ export async function proxy(request: NextRequest) {
   });
 
   const base = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+
+  // A guest cookie from before the install was closed doesn't count as signed in.
+  if (isClosedAccess() && (!token || guestRegex.test(token.email ?? ""))) {
+    if (pathname === "/login") {
+      return NextResponse.next();
+    }
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+    return NextResponse.redirect(new URL(`${base}/login`, request.url));
+  }
 
   if (!token) {
     const redirectUrl = encodeURIComponent(new URL(request.url).pathname);

@@ -1,7 +1,10 @@
+import { genSaltSync, hashSync } from "bcrypt-ts";
 import { config } from "dotenv";
+import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import postgres from "postgres";
+import { user } from "./schema";
 
 config({
   path: ".env.local",
@@ -28,10 +31,44 @@ async function ensureDatabase(url: string) {
       console.log(`Created database ${name}`);
     }
   } catch (err) {
-    console.warn(`Could not ensure database ${name} exists:`, (err as Error).message);
+    console.warn(
+      `Could not ensure database ${name} exists:`,
+      (err as Error).message
+    );
   } finally {
     await sql.end();
   }
+}
+
+// Create or update the account from STUDIO_ADMIN_EMAIL / STUDIO_ADMIN_PASSWORD on
+// every start, so changing the password variable and restarting rotates it. This is
+// how a closed install (STUDIO_ACCESS=closed) gets its first account.
+async function ensureAdminUser(db: ReturnType<typeof drizzle>) {
+  const email = process.env.STUDIO_ADMIN_EMAIL?.trim();
+  const password = process.env.STUDIO_ADMIN_PASSWORD;
+
+  if (!email || !password) {
+    if (process.env.STUDIO_ACCESS === "closed") {
+      console.warn(
+        "STUDIO_ACCESS=closed without STUDIO_ADMIN_EMAIL and STUDIO_ADMIN_PASSWORD: no admin account was set up."
+      );
+    }
+    return;
+  }
+  if (password.length < 12) {
+    throw new Error("STUDIO_ADMIN_PASSWORD must be at least 12 characters");
+  }
+
+  const hashed = hashSync(password, genSaltSync(10));
+  const updated = await db
+    .update(user)
+    .set({ password: hashed })
+    .where(eq(user.email, email))
+    .returning({ id: user.id });
+  if (updated.length === 0) {
+    await db.insert(user).values({ email, password: hashed });
+  }
+  console.log("Admin account ready");
 }
 
 const runMigrate = async () => {
@@ -52,6 +89,8 @@ const runMigrate = async () => {
   const end = Date.now();
 
   console.log("Migrations completed in", end - start, "ms");
+
+  await ensureAdminUser(db);
   process.exit(0);
 };
 

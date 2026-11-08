@@ -74,4 +74,4 @@ jobs:
           HUSKY: "0"
 
       - name: Run tests
-        run: pnpm exec tsx --test lib/ambient/turn.test.ts
+        run: pnpm exec tsx --test lib/ambient/turn.test.ts proxy.test.ts
