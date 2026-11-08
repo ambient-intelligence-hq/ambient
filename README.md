@@ -1,218 +1,154 @@
-<h1 align="center"><img src="demo/web/logo.jpg" alt="" width="28" style="vertical-align:-6px; border-radius:6px; margin-right:6px;" /> Ambient - Video in. Any Outcome out</h1>
+<h1 align="center">Ambient: video in, any outcome out</h1>
 
 <p align="center">
-  <img src="docs/assets/ambient-prompts.gif" alt="Ambient: turn video into … — a cycle of five example outcomes" width="800" />
+  <img src="docs/assets/ambient-prompts.gif" alt="Ambient turning a video into five example outcomes" width="800" />
 </p>
 
+Give Ambient a video, from a short clip to hours of footage, and ask for what you need: answers with timestamps, reports, datasets, annotated clips, GIFs and more.
 
-Ambient is a video agent that reasons over your footage, short clips or hours long, and turns it into what you need: a structured reports, datasets,  processed clips with bounding boxannotations , GIFs and more.
+🏆 Won 2 tracks and placed second in a third at the [Meta Wearable AI Challenge, ECCV 2026](https://huggingface.co/spaces/facebook/wearable-ai-leaderboard).
 
-<div align="center">
+## Install
 
-#### 🏆 Ambient wins at ECCV 2026
+**You need two things:**
 
-Ambient won **2 tracks** and placed **runner-up in a third** at the<br>
-**Meta Wearable AI Challenge, ECCV 2026**.
+1. **Docker, installed and running.** Get [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Mac or Windows (on Windows, run the commands below in WSL2). On Linux, install Docker Engine with the Compose plugin.
+2. **An API key** from a model provider. See [Pick a model](#pick-a-model).
 
-🥇 **EgoProactive — Large Model** &nbsp;·&nbsp;
-🥇 **EgoLongQA — Small Model** &nbsp;·&nbsp;
-🥈 **EgoProactive — Small Model**
+Then choose one option. The first install downloads about 1.5 GB and takes a few minutes.
 
-[Leaderboard](https://huggingface.co/spaces/facebook/wearable-ai-leaderboard) ·
-[EgoProactive Report](https://arxiv.org/abs/2609.07099) ·
-[EgoLongQA Report](https://arxiv.org/abs/2609.07154) ·
-[Models & Datasets](https://huggingface.co/collections/ambient-intelligence-labs/wearables-ai-workshop-eccv-2026)
+### Option A: let your coding agent do it (easiest)
 
-</div>
+Paste this into Claude Code, Codex, Cursor, or any agent that can run commands:
 
----
-
-## Quick start (local)
-
-The fastest way to try Ambient on your own machine: one command installs the
-engine and the Studio (web UI) with Postgres and Redis, all in Docker. No S3, no
-cloud sandbox — videos are processed locally with ffmpeg inside the engine
-container.
-
-**You need:** Docker ([Docker Desktop](https://www.docker.com/products/docker-desktop/)
-on macOS/Windows; Docker Engine + the compose plugin on Linux) and an API key for
-an OpenAI-compatible LLM endpoint ([OpenRouter](https://openrouter.ai/keys) by
-default).
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ambient-intelligence-hq/ambient/main/install/install.sh | bash
+```text
+Set up Ambient, an open-source video engine for AI agents, on this machine.
+Read the setup guide and follow it:
+curl -fsSL https://goambient.ai/agents/setup.md
+Show me your plan before installing anything
 ```
 
-The installer:
+The agent checks Docker, asks for your model and API key, shows you its plan, and waits for your OK before installing.
 
-1. checks Docker is installed and running;
-2. asks for the LLM endpoint, the **agent model** (plans and answers), the
-   **video model** (watches clips; must accept video input) and your API key;
-3. writes `~/.ambient/` — `docker-compose.yml`, a private `.env` with generated
-   secrets, and `bin/ambientctl` (also linked into `~/.local/bin`);
-4. pulls the images, starts everything, waits until it's healthy and opens the
-   Studio.
+### Option B: run one command
 
-| | URL |
+```bash
+curl -fsSL https://goambient.ai/install.sh | bash
+```
+
+It asks three questions. Use the answers from [Pick a model](#pick-a-model), or press Enter to accept the default:
+
+| Question | Default |
 |---|---|
-| Studio (web UI) | http://localhost:3000 |
-| API (Anthropic SDK `base_url`) | http://localhost:8080 — key: `ambientctl config get ENGINE_API_KEY` |
+| LLM endpoint | `https://openrouter.ai/api/v1` |
+| Model | `qwen/qwen3.8-27b` |
+| API key | Empty. You can add it later. |
 
-If a port is taken, the next free one is used and printed at the end.
+When it finishes, the Studio opens in your browser.
 
-**First run:** open the Studio, click **Add video** (or drop a file on the stage,
-or paste a YouTube URL), then ask a question. **Agent** mode works step by step
-with tools; **Fast** mode answers in one quick pass.
+## Use it
 
-**Day to day:**
+1. Open the Studio at **http://localhost:3000**. If that port was taken, the installer prints the one it used.
+2. Click **Add video**, drop in a file, or paste a YouTube link.
+3. Type a question, like *"List the key moments with timestamps."*
+
+Choose **Agent** mode for careful, step-by-step answers, or **Fast** mode for one quick pass.
+
+## Pick a model
+
+Ambient is recommended to use the following models and providers for best performance. Even though, you can use any model and provider you want.
+
+| Model | Use it when | Best provider | Also good |
+|---|---|---|---|
+| **DeepSeek V4.1 Flash** | You want low cost. Good place to start. | [Modal](https://modal.com) | [Together](https://www.together.ai) |
+| **Kimi K3** | You don't mind about 10× DeepSeek's input cost for an answer in fewer steps. | [Modal](https://modal.com/docs/guide/shared-endpoints) Shared endpoint | [Together](https://www.together.ai) |
+| **GPT-6.1 Sol** | You want OpenAI's higher tier. | [OpenAI](https://platform.openai.com) | [OpenRouter](https://openrouter.ai) |
+| **GPT-6 Luna** | You want OpenAI at the lowest cost. | [OpenAI](https://platform.openai.com) | [OpenRouter](https://openrouter.ai) |
+
+Each provider has its own endpoint and its own name for the model. Copy both from this table:
+
+| Provider | LLM endpoint | Model names |
+|---|---|---|
+| Modal | Your own endpoint URL from Modal, ending in `/v1` | `deepseek-ai/DeepSeek-V4.1-Flash-1017`, `moonshotai/Kimi-K3` |
+| Together | `https://api.together.ai/v1` | `deepseek-ai/DeepSeek-V4.1-Flash-1017`, `moonshotai/Kimi-K3` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-6.1-sol`, `gpt-6-luna` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-6.1-sol`, `openai/gpt-6-luna` |
+
+Your provider can limit how many images and how much video fit in one request. Ambient handles this for you. To compare providers, see [vlm.fyi](https://vlm.fyi).
+
+**To change model later,** run these and replace the values with your own. Each command applies right away:
 
 ```bash
-ambientctl status                 # containers + URLs
-ambientctl logs [engine|studio]   # follow logs
-ambientctl stop | start | restart
-ambientctl update                 # pull newer images and restart
-ambientctl config show            # settings (secrets redacted)
-ambientctl config set AGENT_MODEL google/gemini-3.1-pro-preview   # applies immediately
-ambientctl config set LLM_API_KEY sk-or-...
-ambientctl uninstall              # remove containers, keep data (--purge deletes it)
+ambientctl config set LLM_BASE_URL https://api.together.ai/v1
+ambientctl config set AGENT_MODEL deepseek-ai/DeepSeek-V4.1-Flash-1017
+ambientctl config set LLM_MODEL deepseek-ai/DeepSeek-V4.1-Flash-1017
+ambientctl config set LLM_API_KEY your-key-here
 ```
 
-Re-running the install command upgrades in place and keeps your settings and
-data. Installer options (`--dir`, `--version`, `--no-start`, …) and environment
-knobs are listed in `bash install/install.sh --help`.
+## Everyday commands
 
-> Working from a clone? `bash install/install.sh` does the same thing.
-
----
-
-## Self-hosting
-
-Running Ambient for a team or on a server? See the
-**[self-hosting guide](docs/self-hosting.md)**. It covers:
-
-- the layers (Studio, engine, Postgres, Redis, media sandbox, object storage,
-  LLM endpoint) and what each needs;
-- three ways to deploy: the install script, Docker Compose, or external managed
-  Postgres / Redis / S3;
-- running media in an **e2b sandbox** (recommended for shared installs: it
-  isolates the agent's shell and ffmpeg work from your server);
-- HTTPS, access control, upgrades, backups and a configuration reference.
-
----
-
-## Development: run from source
-
-For working on Ambient itself. The installer above runs the published images;
-this runs the engine from your checkout.
-
-### 1. Prerequisites
-- [uv](https://docs.astral.sh/uv/) and Python 3.13
-- Docker (for the bundled Postgres + Redis, or the full stack)
-- An OpenAI-compatible LLM endpoint (e.g. OpenRouter) for the agent model
-- Optional: S3/R2 bucket (required for the `e2b` backend) and an e2b account
-
-### 2. Configure
-Create a `.env` in the repo root:
-
-```dotenv
-# --- LLM (OpenAI-compatible chat-completions gateway) ---
-LLM_BASE_URL=https://openrouter.ai/api/v1
-LLM_API_KEY=sk-...
-AGENT_MODEL=deepseek/deepseek-v4.1-flash          # any model your gateway serves
-
-# --- server ---
-API_KEY=dev-token                    # clients send this as x-api-key
-SANDBOX_BACKEND=inprocess            # "inprocess" (local ffmpeg) or "e2b"
-
-# --- persistence / coordination (match docker-compose) ---
-DATABASE_URL=postgresql://ambient:ambient@localhost:5432/ambient
-REDIS_URL=redis://localhost:6379/0
-
-# --- S3 / R2 (required for SANDBOX_BACKEND=e2b) ---
-S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
-S3_BUCKET=video-analysis-tests
-S3_VIDEO_BASE_KEY=videos
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-
-# --- e2b (only for SANDBOX_BACKEND=e2b) ---
-E2B_API_KEY=e2b_...
-E2B_TEMPLATE=video-analysis-v1-dev
-```
-
-### 3. Run
-
-**Full stack (recommended) — API + Postgres + Redis:**
 ```bash
-docker compose up -d --build          # server on http://127.0.0.1:8080
+ambientctl status      # is it running? shows the URLs
+ambientctl open        # open the Studio
+ambientctl stop        # stop it
+ambientctl start       # start it again
+ambientctl update      # get the latest version
+ambientctl logs engine # watch the logs (Ctrl+C to exit)
 ```
 
-**Or run the server from source against the bundled infra:**
-```bash
-docker compose up -d postgres redis
-uv run python -m ambient.server       # http://127.0.0.1:8080
-```
+To remove Ambient but keep your data, run `ambientctl uninstall`.
 
-Health check: `curl http://127.0.0.1:8080/v1/healthz` → `{"status":"ok"}`.
+## If something goes wrong
 
-> For local dev without e2b/S3, keep `SANDBOX_BACKEND=inprocess` (needs `ffmpeg`
-> on PATH). The `inprocess` tools read videos from `VIDEO_FOLDER`.
+| What you see | What to do |
+|---|---|
+| `Docker is not installed` or `Cannot connect to the Docker daemon` | Install Docker, or start Docker Desktop, then run the install again. |
+| `ambientctl: command not found` | Use the full path: `~/.ambient/bin/ambientctl status` |
+| The Studio doesn't open | Run `ambientctl status` and use the URL it prints. |
+| Questions fail with a 401 or 403 error | Your API key is wrong or out of credit. Set a new one: `ambientctl config set LLM_API_KEY your-key-here` |
+| A service is unhealthy or keeps restarting | Run `ambientctl logs engine`. It's often a wrong model name or endpoint. |
 
----
+Running the install command again is always safe. It keeps your settings and videos.
 
-## Usage with the Anthropic SDK
+## Use it from code
 
-The server implements the Managed Agents surface, so the official SDK drives it:
+Ambient works with the official Anthropic Python SDK. Run `pip install anthropic`, then get your key with `ambientctl config get ENGINE_API_KEY`.
 
 ```python
+import time
 from anthropic import Anthropic
 
-DEFAULT_AGENT_ID = "ambient_v1"
-DEFAULT_ENV_ID = "default"
+client = Anthropic(base_url="http://localhost:8080", api_key="your-engine-api-key")
 
-client = Anthropic(base_url="http://127.0.0.1:8080", api_key="dev-token")
-
-# 1. Upload a video (also pushed to S3 so the e2b sandbox can fetch it).
+# 1. Upload a video and open a session on it
 video = client.beta.files.upload(file=open("clip.mp4", "rb"))
-
-# 2. Create an agent + environment, then a session over the video.
-agent = client.beta.agents.create(
-    name="Video Analyst",
-    model="openai/gpt-5.5",
-    system="Analyze videos and answer with citations.",
-    tools=[{"type": "agent_toolset_20260401"}],
-)
-
 session = client.beta.sessions.create(
-    agent=DEFAULT_AGENT_ID,
-    environment_id=DEFAULT_ENV_ID,
-    metadata={"video_id": video.id},   # where the video lives
+    agent="ambient_v1",            # or "ambient_fast" for Fast mode
+    environment_id="default",
+    metadata={"video_id": video.id},
 )
-
-# 3. Wait for the sandbox to boot, then ask a question.
-import time
 while client.beta.sessions.retrieve(session.id).status != "idle":
     time.sleep(1)
 
-client.beta.sessions.events.send(session.id, events=[{
-    "type": "user.message",
-    "content": "How long after the accident did the police car arrive?",
-}])
+# 2. Ask a question
+client.beta.sessions.events.send(session.id, events=[
+    {"type": "user.message", "content": "List the key moments with timestamps."},
+])
 
-# 4. Stream the run: tool calls, tool results, and the final answer.
-answer = ""
+# 3. Read the answer
 with client.beta.sessions.events.stream(session.id) as stream:
-    for ev in stream:
-        if ev.type == "agent.tool_use":
-            print("tool:", ev.name)
-        elif ev.type == "agent.tool_result":
-            print("result:", "".join(b.text for b in ev.content)[:200])
-        elif ev.type == "agent.message":
-            answer = "".join(b.text for b in ev.content)
-        elif ev.type == "session.status_idle":
+    for event in stream:
+        if event.type == "agent.message":
+            print("".join(block.text for block in event.content))
+        elif event.type == "session.status_idle":
             break
-print(answer)
 ```
 
-Follow-up questions reuse the same `session.id` (the conversation + analysis are
-preserved). A runnable version is in [`notebooks/test_sdk.ipynb`](notebooks/test_sdk.ipynb).
+To ask a follow-up, send another message on the same `session.id`. More examples are in [`examples/`](examples/).
+
+## Learn more
+
+- [Documentation](https://goambient.ai/docs/)
+- [Self-hosting for a team or server](docs/self-hosting.md)
+- [Run from source](https://goambient.ai/docs/quickstart/)
+- ECCV 2026 reports: [EgoProactive](https://arxiv.org/abs/2609.07099), [EgoLongQA](https://arxiv.org/abs/2609.07154), [models and datasets](https://huggingface.co/collections/ambient-intelligence-labs/wearables-ai-workshop-eccv-2026)
