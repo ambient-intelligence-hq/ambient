@@ -79,7 +79,9 @@ class Settings(BaseSettings):
     embedding_dimension: int = 1536
     embedding_client: str = "gemini"
 
-    video_folder: str = "/Users/logesh/self/video-llm-tests/videos"
+    # Local video storage when running from source. The Docker image and installer
+    # set VIDEO_FOLDER=/data/videos. Override with VIDEO_FOLDER.
+    video_folder: str = os.path.expanduser("~/.local/share/ambient/videos")
     box_video_folder: str = "/tmp/videos/"
     video_clip_duration: int = 60 # secs
     video_clip_fps: int = 5
@@ -91,6 +93,14 @@ class Settings(BaseSettings):
     # never dies with a provider HTTP 400. Keep a small margin under the real cap.
     max_clips_per_prompt: int = 18
     max_frames_per_prompt: int = 500
+    # Per-request media budget defaults for endpoints vlm.fyi hasn't measured
+    # (ambient/media_budget.py). Frame equivalents = images + video-clip frames;
+    # 600 stays under vLLM's default decoded-media cap (~715 MB, ~720 frames).
+    # Off restores the old behavior (flat 500-image trim, measured caps only lower
+    # the image cap, no context sizing) as a kill switch and for A/B runs.
+    media_budget_enabled: bool = True
+    media_budget_frames: int = 600
+    media_budget_inline_bytes: int = 27_000_000   # base64 data URLs per request
 
     # Server / agent API
     api_key: str = "dev-token"
@@ -143,7 +153,10 @@ class Settings(BaseSettings):
     sandbox_memory_mb: int = 4096
     sandbox_wall_seconds: int = 1800
     e2b_template: str = "video-analysis-v1"
-    max_turns_per_run: int = 5
+    # Turn budget for one user message. Session create uses this when
+    # metadata.max_turns_per_run is omitted (Studio never sends it). Override
+    # with MAX_TURNS_PER_RUN.
+    max_turns_per_run: int = 120
     # Analysis-clip quality for the local (non-gemini) vision endpoint. Lower
     # fps/dimension and a size cap make each focus_clip/search_clip analysis call
     # dramatically faster on the vLLM endpoint (60s@2fps/768px≈18s vs
@@ -234,6 +247,8 @@ class Settings(BaseSettings):
     model_definitions_file: str = os.path.join(os.path.dirname(__file__),"artifacts","models.json")
     # Per-model preferred OpenRouter upstream + image-block cap (routing + frames budget).
     openrouter_providers_file: str = os.path.join(os.path.dirname(__file__),"artifacts","openrouter_providers.json")
+    # Measured per-provider limits, vendored from vlm.fyi (scripts/sync_capabilities.py).
+    capabilities_file: str = os.path.join(os.path.dirname(__file__),"artifacts","capabilities.json")
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -281,8 +296,10 @@ _KEEP_TOKENS = {
 
 def _core_model_key(model: str) -> str:
     """Normalize a model id to a comparable core: drop the org prefix and any
-    OpenRouter `:variant`, lowercase, and strip trailing quant/format tokens."""
+    OpenRouter `:variant`, lowercase, read Fireworks-style `4p1` versions as `4.1`,
+    and strip trailing quant/format tokens."""
     m = (model or "").strip().lower().split("/")[-1].split(":")[0]
+    m = re.sub(r"(?<=\d)p(?=\d)", ".", m)
     parts = m.split("-")
     while len(parts) > 1 and _QUANT_RE.match(parts[-1]) and parts[-1] not in _KEEP_TOKENS:
         parts.pop()
@@ -292,12 +309,14 @@ def _core_model_key(model: str) -> str:
 def match_model(model: str, model_id: str) -> bool:
     """True if `model` (e.g. a served quant like unsloth/Qwen3.8-27B-NVFP4) refers
     to the same model as the catalog `model_id` (e.g. qwen/qwen3.8-27b). Matches on
-    the normalized core, so it bridges org prefix, case, and quant suffix."""
+    the normalized core, so it bridges org prefix, case, quant suffix, Fireworks
+    `p`-versions (deepseek-v4p1) and hyphenation (qwen-3.8 vs qwen3.8)."""
     if not model or not model_id:
         return False
     if model == model_id:
         return True
-    return _core_model_key(model) == _core_model_key(model_id)
+    a, b = _core_model_key(model), _core_model_key(model_id)
+    return a == b or a.replace("-", "") == b.replace("-", "")
 
 
 def _find_input_modalities(entries: list, model: str) -> Optional[list]:

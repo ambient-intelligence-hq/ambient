@@ -25,7 +25,6 @@ demo/
 **/.DS_Store
 .vscode/
 notebooks/
-tests/
 *.sqlite
 *.sqlite-*
 *.mp4
@@ -33,6 +32,8 @@ tests/
 *.srt
 ambient/trajectories/
 .cursor/
+benchmarks/provider_matrix/
+tests/annotation.json
 
 # Ambient Studio — Next.js console (ambient/studio/console) + legacy Vite web
 # (ambient/studio/web). Mirrors the console's own .gitignore so the root rules

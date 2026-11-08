@@ -32,6 +32,12 @@ from ambient.config import settings
 
 # Holds the active MediaSandbox for the current tool call (None -> host backend).
 current_media_box: ContextVar[Optional[object]] = ContextVar("current_media_box", default=None)
+# (model, base_url) of the session's agent endpoint, for tools whose media goes into
+# the agent's own conversation (self_focus_clip): their size limits are that endpoint's,
+# which can differ from the LLM_* vision endpoint (AGENT_*, or a per-agent base_url).
+# Set by the ToolDispatcher, like current_media_box. None outside a session.
+current_agent_endpoint: ContextVar[Optional[tuple[str, Optional[str]]]] = ContextVar(
+    "current_agent_endpoint", default=None)
 
 
 def make_video_tools(video_id: str, max_frame_dimention: Optional[int] = None,

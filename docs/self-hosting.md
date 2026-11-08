@@ -4,7 +4,7 @@ This guide covers running Ambient on your own infrastructure: what the pieces
 are, three ways to deploy them, how to use external Postgres, Redis and S3, and
 why we recommend the **e2b sandbox** for any shared or long-lived install.
 
-For a quick local try-out, see [Quick start](../README.md#quick-start-local)
+For a quick local try-out, see [Install](../README.md#install)
 in the main README.
 
 - [Architecture: the layers](#architecture-the-layers)

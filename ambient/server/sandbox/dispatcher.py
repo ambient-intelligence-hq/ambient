@@ -19,7 +19,7 @@ import traceback
 from typing import Any, AsyncIterator, Optional
 
 from ambient.server.sandbox.interface import ToolEvent
-from ambient.tools.video_backend import current_media_box
+from ambient.tools.video_backend import current_agent_endpoint, current_media_box
 from ambient.llm import usage_sink
 
 
@@ -64,6 +64,8 @@ class ToolDispatcher:
         # The per-session E2B media box, set by the runner for the "e2b" backend.
         # None for "inprocess".
         self.media_box: Optional[object] = None
+        # (model, base_url) the agent's completions go to; set by the runner per run.
+        self.agent_endpoint: Optional[tuple[str, Optional[str]]] = None
         # The session's real video_id. Forced onto every tool call so the model can't
         # mis-supply it (some models pass a placeholder like "video" or mangle the
         # opaque id) or target a different video.
@@ -95,6 +97,7 @@ class ToolDispatcher:
 
         # Publish the media box for the worker thread (to_thread copies this context).
         token = current_media_box.set(self.media_box)
+        endpoint_token = current_agent_endpoint.set(self.agent_endpoint)
         # Collect any LLM usage this tool incurs. `to_thread` copies the context,
         # so llm_call (running off-thread) appends into this same list object.
         usage_records: list = []
@@ -157,4 +160,5 @@ class ToolDispatcher:
             )
         finally:
             current_media_box.reset(token)
+            current_agent_endpoint.reset(endpoint_token)
             usage_sink.reset(usage_token)

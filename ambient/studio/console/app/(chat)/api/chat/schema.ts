@@ -1,7 +1,17 @@
 import { z } from "zod";
 
+// Ambient prompts are often long task specs (annotation guidelines, report
+// formats), so the template's 2,000-char cap was far too low. The engine has no
+// limit of its own; this only guards against runaway pastes.
+export const MAX_MESSAGE_CHARS = 100_000;
+
 const textPartSchema = z.object({
-  text: z.string().min(1).max(2000),
+  text: z
+    .string()
+    .min(1)
+    .max(MAX_MESSAGE_CHARS, {
+      error: `Message is too long (max ${MAX_MESSAGE_CHARS.toLocaleString("en-US")} characters).`,
+    }),
   type: z.enum(["text"]),
 });
 

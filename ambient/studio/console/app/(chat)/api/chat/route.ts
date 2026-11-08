@@ -8,6 +8,7 @@ import {
   toUIMessageStream,
 } from "ai";
 import { checkBotId } from "botid/server";
+import { z } from "zod";
 import { auth } from "@/app/(auth)/auth";
 import {
   allowedModelIds,
@@ -120,8 +121,11 @@ export async function POST(request: Request) {
   try {
     const json = await request.json();
     requestBody = postRequestBodySchema.parse(json);
-  } catch {
-    return new ChatbotError("bad_request:api").toResponse();
+  } catch (error) {
+    // Say which check failed (e.g. message too long) so the toast is actionable.
+    const cause =
+      error instanceof z.ZodError ? error.issues[0]?.message : undefined;
+    return new ChatbotError("bad_request:api", cause).toResponse();
   }
 
   try {

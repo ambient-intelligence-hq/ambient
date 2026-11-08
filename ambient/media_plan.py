@@ -63,6 +63,9 @@ SAMPLING: dict[str, SamplingSpec] = {
     "context":     SamplingSpec(max_frames=500, fps=1.0),
     # Agent tools that analyze a window with a vision sub-call.
     "focus_clip":  SamplingSpec(max_frames=300, fps=2.0),
+    # focus_clip in self-video-analysis: the window's media goes to the agent model
+    # itself and shares the request with the opening context (AGENT_WINDOW_STEPS).
+    "self_focus_clip": SamplingSpec(max_frames=300, fps=2.0),
     "search_clip": SamplingSpec(max_frames=300, fps=2.0),
     # Raw frames handed to the agent model to inspect directly (always frames).
     "grab_frames": SamplingSpec(max_frames=30,  fps=1.0),
@@ -71,6 +74,11 @@ SAMPLING: dict[str, SamplingSpec] = {
 # Steps whose output is raw frames the *agent* model looks at itself (not a vision
 # sub-call), so they must always be `frames` regardless of endpoint capability.
 FRAME_ONLY_STEPS = frozenset({"grab_frames"})
+
+# Steps whose frames land in the agent's own conversation next to the opening
+# context, which holds up to media_budget.CONTEXT_SHARE of the image budget. Their
+# frame cap is the rest, so one window plus the context always fits a request.
+AGENT_WINDOW_STEPS = frozenset({"self_focus_clip"})
 
 # Steps that tolerate an uncontrolled frame *count* (a whole-video attachment cited
 # only approximately), so a densely-sampling pinned provider's video_url may be used
@@ -102,6 +110,11 @@ ENDPOINT_PROFILES: dict[str, EndpointProfile] = {
     # the preferred-provider lookup (image_block_cap()); this is only the unmapped floor.
     "openrouter":  EndpointProfile("openrouter",  video_frame_control=False, image_block_cap=100),
     "vercel":      EndpointProfile("vercel",      video_frame_control=False, image_block_cap=200),
+    # Hosted inference APIs: no control over video sampling, so frames-only.
+    # Image caps are conservative until measured with the provider matrix benchmark.
+    "fireworks":   EndpointProfile("fireworks",   video_frame_control=False, image_block_cap=100),
+    "together":    EndpointProfile("together",    video_frame_control=False, image_block_cap=100),
+    "openai":      EndpointProfile("openai",      video_frame_control=False, image_block_cap=100),
 }
 
 # Substring -> service. First match wins; anything unmatched is treated as our own
@@ -111,6 +124,10 @@ _SERVICE_PATTERNS: list[tuple[str, str]] = [
     ("vercel", "vercel"),
     ("modal", "modal"),
     ("jarvislabs", "jarvislabs"),
+    ("fireworks.ai", "fireworks"),
+    ("together.ai", "together"),
+    ("together.xyz", "together"),
+    ("api.openai.com", "openai"),
 ]
 
 
@@ -148,8 +165,22 @@ def image_block_cap(base_url: Optional[str], model: str) -> int:
     On OpenRouter this is a *per-model* property, not a flat endpoint constant: the
     cap swings 0-250 by upstream provider, so it's read from the maintained
     preferred-provider lookup (same table that pins routing). Elsewhere it's the
-    endpoint profile's flat cap. Warns once per model when an OpenRouter model has no
-    preferred provider (auto-route at the conservative floor)."""
+    endpoint profile's flat cap. Measured limits (ambient.capabilities) replace
+    both; the request's byte budget is enforced on the frames themselves
+    (media_budget), since frame sizes vary ~5x between videos. Warns once per
+    model when an OpenRouter model has no preferred provider (auto-route at the
+    conservative floor)."""
+    from ambient.config import settings
+    from ambient.media_budget import budget_for
+    if not settings.media_budget_enabled:
+        # Without the per-request budget, measured limits may only lower the cap.
+        from ambient.capabilities import resolve
+        caps, legacy = resolve(base_url, model), _legacy_image_block_cap(base_url, model)
+        return min(legacy, caps.image_cap()) if caps and caps.image_cap() else legacy
+    return budget_for(base_url, model).images
+
+
+def _legacy_image_block_cap(base_url: Optional[str], model: str) -> int:
     prof = profile_for(base_url)
     if prof.service == "openrouter":
         from ambient.config import get_openrouter_route
@@ -204,6 +235,7 @@ def plan_media(
     *,
     spec: Optional[SamplingSpec] = None,
     force_frames: bool = False,
+    video_bytes: Optional[int] = None,
 ) -> MediaPlan:
     """Decide the input type + sampling for one media step.
 
@@ -213,12 +245,23 @@ def plan_media(
     span_seconds: duration of the span (whole video for "context", window for clips).
     spec:        optional per-call override of the step's default budget.
     force_frames: caller forces the frames path (e.g. no S3 to host a video_url).
+    video_bytes: size of the video file a video_url would point at, if known.
+
+    Measured capabilities (ambient.capabilities, vendored from vlm.fyi) can only
+    veto the video path: when the provider rejects or ignores video, caps frames per
+    video below what this step needs, or can't take a file this big.
     """
     spec = spec or SAMPLING.get(step) or SAMPLING["focus_clip"]
     prof = profile_for(base_url)
     mods = model_modalities(model)
     eff_fps = spec.effective_fps(span_seconds)
-    img_cap = image_block_cap(base_url, model)  # per-model on OpenRouter, flat elsewhere
+    img_cap = image_block_cap(base_url, model)  # measured, else per-model on OpenRouter, else flat
+    from ambient.capabilities import resolve
+    caps = resolve(base_url, model)
+    veto = caps.video_vetoed(spec.frames_for(span_seconds), video_bytes, frames_alternative=img_cap) if caps else None
+    if veto and "video" in mods:
+        mods = [m for m in mods if m != "video"]
+        log.info("media_plan: no video path for %s on %s: %s", model, prof.service, veto)
 
     # Raw-frame steps (grab_frames) and forced-frames always deliver image frames.
     if force_frames or step in FRAME_ONLY_STEPS:
@@ -249,10 +292,14 @@ def plan_media(
     # image-only models). Drop fps if the frame count would exceed the block cap.
     if "image" in mods:
         cap = min(spec.max_frames, img_cap)
+        from ambient.config import settings
+        if step in AGENT_WINDOW_STEPS and settings.media_budget_enabled:
+            from ambient.media_budget import CONTEXT_SHARE
+            cap = min(cap, max(1, math.floor(img_cap * (1 - CONTEXT_SHARE))))
         fps = min(eff_fps, cap / max(span_seconds, 1))
         return MediaPlan("frames", fps=fps, max_frames=cap, max_dim=spec.max_dim,
                          meta={"service": prof.service,
-                               "reason": "no video frame-control -> frames"})
+                               "reason": f"video vetoed: {veto}" if veto else "no video frame-control -> frames"})
 
     # Video-only model (no image) on a no-control endpoint: coarse, provider-sampled.
     if "video" in mods:
