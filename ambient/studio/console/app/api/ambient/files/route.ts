@@ -1,9 +1,23 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/app/(auth)/auth";
 import { listFiles, uploadFileStream } from "@/lib/ambient/engine";
+import { isClosedAccess } from "@/lib/constants";
+
+// This path is excluded from the proxy (see POST below), so both handlers have to
+// check sign-in themselves, including a guest cookie left from before closing.
+async function isSignedIn() {
+  const session = await auth();
+  if (!session?.user) {
+    return false;
+  }
+  return !(isClosedAccess() && session.user.type === "guest");
+}
 
 // GET /api/ambient/files — list videos in the engine.
 export async function GET() {
+  if (!(await isSignedIn())) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
   try {
     const data = await listFiles();
     return NextResponse.json(data);
@@ -17,16 +31,22 @@ export async function GET() {
 // memory and cut it off at 10MB. So sign-in is checked here, and the body is
 // streamed through to the engine untouched.
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user) {
+  if (!(await isSignedIn())) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.startsWith("multipart/form-data") || !request.body) {
-    return NextResponse.json({ error: "multipart file upload required" }, { status: 400 });
+    return NextResponse.json(
+      { error: "multipart file upload required" },
+      { status: 400 }
+    );
   }
   try {
-    const meta = await uploadFileStream(request.body, contentType, request.signal);
+    const meta = await uploadFileStream(
+      request.body,
+      contentType,
+      request.signal
+    );
     return NextResponse.json(meta);
   } catch (e) {
     return NextResponse.json({ error: (e as Error).message }, { status: 502 });

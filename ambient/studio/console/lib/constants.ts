@@ -10,6 +10,12 @@ export const isTestEnvironment = Boolean(
 
 export const guestRegex = /^guest-\d+$/;
 
+// STUDIO_ACCESS=closed: sign-in is required and there are no guests or public
+// sign-ups. Read at runtime, so the same image serves open and closed installs.
+export function isClosedAccess(): boolean {
+  return process.env.STUDIO_ACCESS === "closed";
+}
+
 // Whether the session cookie for this request is the HTTPS-only
 // (`__Secure-`) variant. Must match Auth.js's own rule — it issues the secure
 // cookie only when the request URL is https (behind a TLS proxy, per

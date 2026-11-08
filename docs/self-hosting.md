@@ -367,10 +367,24 @@ AWS_SECRET_ACCESS_KEY=...
 
 ## Reverse proxy and access control
 
-> **Put access control in front of the Studio.** Sign-in is currently off:
-> every visitor gets a guest session, and every question spends your LLM
-> credits. Don't expose it to the internet without proxy auth, SSO, a VPN or a
+> **Control access to the Studio.** By default, sign-in is off: every visitor
+> gets a guest session, and every question spends your LLM credits. Don't expose
+> it to the internet without closed mode (below), proxy auth, SSO, a VPN or a
 > private network such as Tailscale.
+
+**Closed mode** requires sign-in and turns off guests and public sign-ups:
+
+```dotenv
+STUDIO_ACCESS=closed
+STUDIO_ADMIN_EMAIL=admin@example.com
+STUDIO_ADMIN_PASSWORD=<at least 12 characters, e.g. openssl rand -hex 24>
+```
+
+The Studio creates or updates this account on every start, so changing the
+password and restarting rotates it. With the install script, add these to the
+`studio` service in `~/.ambient/docker-compose.override.yml`. Everyone signed in
+shares the same engine and video library, and login attempts aren't rate limited,
+so use a long random password.
 
 [Caddy](https://caddyserver.com/docs/install) handles TLS automatically.
 `/etc/caddy/Caddyfile`:
@@ -465,5 +479,7 @@ Studio settings:
 | `POSTGRES_URL` | Studio database (created on first start) |
 | `AUTH_SECRET` | Session encryption (`openssl rand -base64 32`) |
 | `ENGINE_URL`, `ENGINE_API_KEY` | How the Studio reaches the engine (server-side only) |
+| `STUDIO_ACCESS` | `closed` requires sign-in, with no guests or public sign-ups. Unset = guest sessions |
+| `STUDIO_ADMIN_EMAIL`, `STUDIO_ADMIN_PASSWORD` | Account created or updated on every start (password: 12+ characters) |
 | `STUDIO_MAX_MESSAGES_PER_HOUR` | Optional per-user message quota |
 | `NEXT_PUBLIC_BASE_PATH` | Serve under a sub-path (build-time) |
