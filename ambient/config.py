@@ -132,7 +132,7 @@ class Settings(BaseSettings):
     # it is OFF by default; enable only when you trust the model + prompt, and
     # prefer the e2b backend for anything untrusted. Host runs get soft hygiene
     # only: a timeout, an output byte cap, cwd confinement, and process-group kill.
-    enable_bash_tool: bool = True
+    enable_bash_tool: bool = False
     bash_timeout_seconds: int = 120           # per-command wall clock before SIGKILL
     bash_max_output_bytes: int = 20000        # stdout/stderr each truncated to this
     bash_cwd: str | None = None               # host working dir; None -> video_folder

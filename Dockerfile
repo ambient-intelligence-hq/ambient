@@ -57,9 +57,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 USER appuser
 EXPOSE 8080
-# Uploaded videos land here (the sqlite store is gone; sessions/events live in
-# Postgres). For the inprocess backend the tools read videos back from this dir.
-VOLUME ["/data"]
+# Uploaded videos land in /data (the sqlite store is gone; sessions/events live in
+# Postgres). For the inprocess backend the tools read videos back from this dir, so
+# mount a volume there. No VOLUME instruction: Railway rejects it at build time, and
+# the compose files already mount their own.
 
 # Durable state (Postgres) and cross-worker coordination (Redis) live outside the
 # process, so the server is multi-worker safe. Set SERVER_WORKERS>1 (and point

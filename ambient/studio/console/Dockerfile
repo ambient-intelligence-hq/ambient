@@ -18,8 +18,9 @@ RUN npm install -g pnpm@10.32.1
 FROM base AS deps
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
-RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
-    pnpm install --frozen-lockfile
+# No BuildKit cache mount here: Railway requires its own cache id format, and this
+# dependency layer is already cached until the lockfile changes.
+RUN pnpm install --frozen-lockfile
 
 ############################  build  ###########################
 FROM base AS build
