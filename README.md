@@ -1,4 +1,4 @@
-<h1 align="center">Ambient: video in, any outcome out</h1>
+<h1 align="center">Ambient: Video Engine for AI Agents - Video In, Action out </h1>
 
 <p align="center">
   <img src="docs/assets/ambient-prompts.gif" alt="Ambient turning a video into five example outcomes" width="800" />
@@ -85,34 +85,11 @@ ambientctl config set LLM_MODEL deepseek-ai/DeepSeek-V4.1-Flash-1017
 ambientctl config set LLM_API_KEY your-key-here
 ```
 
-## Everyday commands
-
-```bash
-ambientctl status      # is it running? shows the URLs
-ambientctl open        # open the Studio
-ambientctl stop        # stop it
-ambientctl start       # start it again
-ambientctl update      # get the latest version
-ambientctl logs engine # watch the logs (Ctrl+C to exit)
-```
-
 To remove Ambient but keep your data, run `ambientctl uninstall`.
-
-## If something goes wrong
-
-| What you see | What to do |
-|---|---|
-| `Docker is not installed` or `Cannot connect to the Docker daemon` | Install Docker, or start Docker Desktop, then run the install again. |
-| `ambientctl: command not found` | Use the full path: `~/.ambient/bin/ambientctl status` |
-| The Studio doesn't open | Run `ambientctl status` and use the URL it prints. |
-| Questions fail with a 401 or 403 error | Your API key is wrong or out of credit. Set a new one: `ambientctl config set LLM_API_KEY your-key-here` |
-| A service is unhealthy or keeps restarting | Run `ambientctl logs engine`. It's often a wrong model name or endpoint. |
-
-Running the install command again is always safe. It keeps your settings and videos.
 
 ## Use it from code
 
-Ambient works with the official Anthropic Python SDK. Run `pip install anthropic`, then get your key with `ambientctl config get ENGINE_API_KEY`.
+Ambient is built for scalable workflows. It works programmatically with the official Anthropic Python SDK. Run `pip install anthropic`, then get your key with `ambientctl config get ENGINE_API_KEY`.
 
 ```python
 import time
