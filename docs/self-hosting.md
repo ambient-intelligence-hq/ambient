@@ -49,14 +49,14 @@ process — so engine workers and replicas are interchangeable.
 
 ## Choose a deployment
 
-| | A. Install script | B. Docker Compose | C. External services |
-|---|---|---|---|
-| Best for | One VM, fastest setup | Your own compose file / CI-managed stack | Production, multiple replicas |
-| Postgres + Redis | Bundled containers | Bundled or yours | Managed (RDS, Cloud SQL, Upstash, …) |
-| Media backend | `inprocess` (add e2b with an override) | Your choice | `e2b` recommended |
-| Updates | `ambientctl update` | `docker compose pull && up -d` | Your deploy pipeline |
+| | A. Install script | B. Docker Compose | C. External services | D. Railway |
+|---|---|---|---|---|
+| Best for | One VM, fastest setup | Your own compose file / CI-managed stack | Production, multiple replicas | A hosted URL with no server to manage |
+| Postgres + Redis | Bundled containers | Bundled or yours | Managed (RDS, Cloud SQL, Upstash, …) | Railway databases |
+| Media backend | `inprocess` (add e2b with an override) | Your choice | `e2b` recommended | `inprocess` |
+| Updates | `ambientctl update` | `docker compose pull && up -d` | Your deploy pipeline | Railway image updates |
 
-All three run the same published images:
+All four run the same published images:
 `ghcr.io/ambient-intelligence-hq/ambient-engine` and
 `ghcr.io/ambient-intelligence-hq/ambient-studio` (linux/amd64 + arm64, tagged
 `latest`, `main`, `sha-<commit>` and release versions).
@@ -362,6 +362,50 @@ AWS_SECRET_ACCESS_KEY=...
   read every video. With `e2b` they're fully interchangeable.
 - The load balancer needs no sticky sessions, but must allow long-lived
   streaming responses (see the nginx settings below).
+
+---
+
+## Option D — Railway
+
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE?utm_medium=integration&utm_source=button&utm_campaign=ambient)
+
+The template creates four services in one Railway project:
+
+| Service | Image | Storage | Public? |
+|---|---|---|---|
+| Studio | `ambient-studio:latest` | None | Yes, on a Railway domain |
+| Engine | `ambient-engine:latest` | Volume at `/data` | No, private network only |
+| Postgres | Railway database | Volume | No |
+| Redis | Railway database | Volume | No |
+
+1. Click the button and enter your LLM endpoint, key and a model that accepts
+   video.
+2. Wait for all four services to come online.
+3. Open the `studio` service's **Variables** tab to find `STUDIO_ADMIN_EMAIL` and
+   `STUDIO_ADMIN_PASSWORD`, then sign in at its domain.
+
+Studio runs in [closed mode](#reverse-proxy-and-access-control), and the shell
+tool is off. Railway generates `API_KEY`, `AUTH_SECRET` and the admin password when
+you deploy.
+
+**Limits of this setup:**
+
+- **One engine replica.** Railway doesn't allow replicas on a service with a
+  volume. To scale, give the engine more CPU and memory, and raise `SERVER_WORKERS`.
+- **Upload memory.** The engine reads each upload fully into memory, so it needs
+  free RAM larger than your biggest video.
+- **Disk space.** Uploaded videos aren't cleaned up automatically. Railway's default
+  volume is 5 GB on Hobby and 50 GB on Pro.
+- **Redeploys.** A service with a volume has a short outage on each deploy, and
+  runs in progress stop.
+
+**Cost.** Railway bills for usage on top of its plan. See
+[Railway pricing](https://docs.railway.com/pricing/plans). Model usage is billed
+separately by your LLM provider, and this is usually the larger cost.
+
+**Updates.** The services follow `:latest`. Railway shows an update button in a
+service's settings when a new image is available, and can apply updates on a
+schedule. Update the engine first, then Studio.
 
 ---
 

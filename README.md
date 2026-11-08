@@ -8,6 +8,8 @@ Give Ambient a video, from a short clip to hours of footage, and ask for what yo
 
 🏆 Won 2 tracks and placed second in a third at the [Meta Wearable AI Challenge, ECCV 2026](https://huggingface.co/spaces/facebook/wearable-ai-leaderboard).
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/TEMPLATE_CODE?utm_medium=integration&utm_source=button&utm_campaign=ambient)
+
 ## Install
 
 **You need two things:**
@@ -45,6 +47,10 @@ It asks three questions. Use the answers from [Pick a model](#pick-a-model), or 
 | API key | Empty. You can add it later. |
 
 When it finishes, the Studio opens in your browser.
+
+### Option C: deploy on Railway
+
+Want a hosted URL instead of a local install? This needs a [Railway](https://railway.com) account and an API key, but not Docker. Click the **Deploy on Railway** button above, then follow the [Railway guide](https://goambient.ai/docs/railway/) to sign in. Railway charges for what the services use.
 
 ## Use it
 
