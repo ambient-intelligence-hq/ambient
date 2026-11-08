@@ -32,6 +32,7 @@ notebooks/
 *.srt
 ambient/trajectories/
 .cursor/
+benchmarks/provider_matrix/
 tests/annotation.json
 
 # Ambient Studio — Next.js console (ambient/studio/console) + legacy Vite web

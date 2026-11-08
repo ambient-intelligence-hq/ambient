@@ -1,0 +1,105 @@
+name: Install smoke test
+
+# Runs the one-line installer from a clean machine state against images built
+# from the PR, then checks that the engine and Studio actually work. Needs no
+# secrets or LLM key, so it also runs on PRs from forks.
+#
+# Images are built for linux/amd64 only (the runner's platform); arm64 is built
+# when images.yml publishes.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "ambient/**"
+      - "install/**"
+      - ".github/workflows/install-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-test-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  AMBIENT_ENGINE_IMAGE: ambient-ci/engine
+  AMBIENT_STUDIO_IMAGE: ambient-ci/studio
+  AMBIENT_VERSION: ci
+  AMBIENT_ENGINE_PORT: "8080"
+  AMBIENT_STUDIO_PORT: "3000"
+
+jobs:
+  install:
+    name: Install, engine health, Studio
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Layers come from the cache images.yml writes on main. PRs only read it,
+      # so they can't evict the layers main relies on.
+      - name: Build engine image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: ${{ env.AMBIENT_ENGINE_IMAGE }}:${{ env.AMBIENT_VERSION }}
+          cache-from: type=gha,scope=ambient-engine
+
+      - name: Build Studio image
+        uses: docker/build-push-action@v6
+        with:
+          context: ambient/studio/console
+          file: ambient/studio/console/Dockerfile
+          load: true
+          tags: ${{ env.AMBIENT_STUDIO_IMAGE }}:${{ env.AMBIENT_VERSION }}
+          cache-from: type=gha,scope=ambient-studio
+
+      # Fed to bash on stdin, as in `curl | bash`. AMBIENT_SKIP_PULL keeps the
+      # images built above; Postgres and Redis are still pulled. The installer
+      # waits for every container to report healthy and exits non-zero if one doesn't.
+      - name: Run installer
+        env:
+          AMBIENT_SKIP_PULL: "1"
+        run: bash -s -- --yes --no-open < install/install.sh
+
+      - name: Check engine health
+        run: curl -fsS "http://127.0.0.1:${AMBIENT_ENGINE_PORT}/v1/healthz" | jq -e '.status == "ok"'
+
+      # Loading / with no cookie goes through the guest sign-in, which writes to
+      # Studio's database, so a 200 and a session cookie also prove migrations ran.
+      - name: Check Studio
+        run: |
+          base="http://127.0.0.1:${AMBIENT_STUDIO_PORT}"
+          jar="$(mktemp)"
+          page="$(mktemp)"
+          test "$(curl -fsS "$base/ping")" = "pong"
+          curl -fsSL --max-redirs 10 -c "$jar" -b "$jar" -o "$page" "$base/"
+          grep -q "session-token" "$jar"
+          grep -qi "<html" "$page"
+
+      - name: Check Studio can reach the engine
+        run: |
+          cd ~/.ambient
+          docker compose exec -T studio node -e \
+            "fetch(process.env.ENGINE_URL + '/v1/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          cd ~/.ambient || exit 0
+          docker compose ps
+          docker compose logs --tail=200

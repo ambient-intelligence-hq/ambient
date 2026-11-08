@@ -3,8 +3,10 @@
   "_default": { "provider": null, "image_cap": 100, "video": false },
   "qwen/qwen3.8-27b": { "provider": "alibaba", "image_cap": 250, "video": false },
   "deepseek/deepseek-v4.1-flash-1017": { "provider": "fireworks", "image_cap": 100, "video": false },
-  "z-ai/glm-5.3-flash": { "provider": "z-ai", "image_cap": 100, "video": true },
+  "z-ai/glm-5.3-flash": { "provider": "z-ai", "image_cap": 100, "video": false },
   "minimax/minimax-m3.1-flash": { "provider": "minimax", "image_cap": 100, "video": true },
   "qwen/qwen3.6-35b-a3b": { "provider": null, "image_cap": 100, "video": false },
+  "openai/gpt-6.1-sol": { "provider": "openai", "image_cap": 100, "video": false },
+  "openai/gpt-6-luna": { "provider": "openai", "image_cap": 100, "video": false },
   "gemini": { "provider": "google-ai-studio", "image_cap": 200, "video": true }
 }
