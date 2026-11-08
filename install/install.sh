@@ -25,8 +25,9 @@
 # Environment (all optional):
 #   AMBIENT_LLM_KEY        LLM API key (OpenRouter by default)
 #   AMBIENT_LLM_BASE_URL   OpenAI-compatible base URL (default: OpenRouter)
-#   AMBIENT_MODEL          model that plans + answers (the agent; default below)
-#   AMBIENT_VIDEO_MODEL    model that watches the clips (must accept video)
+#   AMBIENT_MODEL          model for planning, answering and watching clips
+#                          (must accept video; default below)
+#   AMBIENT_VIDEO_MODEL    separate model for watching clips (default: AMBIENT_MODEL)
 #   AMBIENT_BIND           address the ports bind to (default: 127.0.0.1 — this
 #                          machine only; use 0.0.0.0 on a server behind a proxy)
 #   AMBIENT_STUDIO_PORT    Studio port (default: 3000)
@@ -42,7 +43,6 @@ set -euo pipefail
 
 DEFAULT_BASE_URL="https://openrouter.ai/api/v1"
 DEFAULT_MODEL="qwen/qwen3.8-27b"
-DEFAULT_VIDEO_MODEL="qwen/qwen3.8-27b"
 DEFAULT_ENGINE_IMAGE="ghcr.io/ambient-intelligence-hq/ambient-engine"
 DEFAULT_STUDIO_IMAGE="ghcr.io/ambient-intelligence-hq/ambient-studio"
 
@@ -453,10 +453,7 @@ main() {
     ask base_url "LLM endpoint (OpenAI-compatible)" "$DEFAULT_BASE_URL"
   fi
   if [ -z "$model" ]; then
-    ask model "Agent model (plans + answers)" "$DEFAULT_MODEL"
-  fi
-  if [ -z "$video_model" ]; then
-    ask video_model "Video model (watches the clips)" "$DEFAULT_VIDEO_MODEL"
+    ask model "Model (must accept video)" "$DEFAULT_MODEL"
   fi
   if [ -z "$llm_key" ]; then
     if [ "$HAVE_TTY" = 1 ]; then
@@ -466,7 +463,9 @@ main() {
   fi
   base_url="${base_url:-$DEFAULT_BASE_URL}"
   model="${model:-$DEFAULT_MODEL}"
-  video_model="${video_model:-$DEFAULT_VIDEO_MODEL}"
+  # One model does both jobs unless a separate video model was set
+  # (AMBIENT_VIDEO_MODEL, or LLM_MODEL kept from an existing .env).
+  video_model="${video_model:-$model}"
   ok "LLM: $base_url · agent $model · video $video_model · key $([ -n "$llm_key" ] && echo set || echo "${YELLOW}not set${RESET}")"
 
 
