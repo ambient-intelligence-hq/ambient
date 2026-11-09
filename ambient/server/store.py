@@ -6,7 +6,8 @@ serializes whole records, mirroring the original SQLite design.
 
 Tables:
   sessions(id, status, payload_json, messages, ...)  -- `messages` is the runner's
-      conversation context, persisted so any worker can rehydrate a session.
+      conversation context, persisted so any worker can rehydrate a session. Inline
+      media is stored as files and referenced from here (ambient.session_media).
   events(seq BIGSERIAL, ...)                          -- append-only event log.
   agents / environments / files                       -- managed-agents metadata
       that used to live in in-memory app.state dicts.
@@ -21,6 +22,7 @@ from typing import Any, Optional
 import asyncpg
 
 from ambient.config import settings
+from ambient.session_media import SessionMedia
 
 
 def _now() -> str:
@@ -86,6 +88,7 @@ class Store:
     def __init__(self, dsn: Optional[str] = None) -> None:
         self.dsn = dsn or settings.database_url
         self._pool: Optional[asyncpg.Pool] = None
+        self.media = SessionMedia()
 
     async def connect(self) -> None:
         # command_timeout bounds every statement: a connection that dies mid-query
@@ -150,7 +153,10 @@ class Store:
     async def delete_session(self, session_id: str) -> bool:
         result = await self._pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
         # asyncpg returns e.g. "DELETE 1"
-        return result.rsplit(" ", 1)[-1] != "0"
+        deleted = result.rsplit(" ", 1)[-1] != "0"
+        if deleted:
+            await self.media.delete_session(session_id)
+        return deleted
 
     # --- runner messages (rehydration state) ------------------------------
 
@@ -160,12 +166,13 @@ class Store:
         )
         if row is None or row["messages"] is None:
             return []
-        return json.loads(row["messages"])
+        return await self.media.hydrate(session_id, json.loads(row["messages"]))
 
     async def save_messages(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        stored = await self.media.dehydrate(session_id, messages)
         await self._pool.execute(
             "UPDATE sessions SET messages = $1, updated_at = $2 WHERE id = $3",
-            json.dumps(messages), _now(), session_id,
+            json.dumps(stored), _now(), session_id,
         )
 
     # --- events -----------------------------------------------------------

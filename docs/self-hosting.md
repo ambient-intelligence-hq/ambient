@@ -203,6 +203,14 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - max_wal_size=256MB
+      - -c
+      - min_wal_size=64MB
+      - -c
+      - wal_compression=on
     environment:
       POSTGRES_USER: ambient
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -346,7 +354,8 @@ AWS_SECRET_ACCESS_KEY=...
   (`https://s3.<region>.amazonaws.com`) and set `AWS_DEFAULT_REGION`.
 - Layout: `videos/<video_id>.mp4` (sources), `<video_id>/tiles/…` (pre-cut
   clips), `artifacts/<video_id>/…` (files the agent exports, shared as presigned
-  links valid for `ARTIFACT_URL_TTL_SECONDS`, default 7 days).
+  links valid for `ARTIFACT_URL_TTL_SECONDS`, default 7 days),
+  `session-media/<session_id>/…` (clips and frames kept for resuming sessions).
 - The key needs `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the
   bucket. Keep the bucket private — everything is served through the engine or
   presigned URLs.
@@ -359,7 +368,8 @@ AWS_SECRET_ACCESS_KEY=...
 - `SERVER_WORKERS` runs several processes in one container; replicas run
   several containers. Both coordinate through Postgres + Redis.
 - With `inprocess`, replicas need S3 (or a shared `/data` volume) so each can
-  read every video. With `e2b` they're fully interchangeable.
+  read every video and every session's saved media. With `e2b` they're fully
+  interchangeable.
 - The load balancer needs no sticky sessions, but must allow long-lived
   streaming responses (see the nginx settings below).
 
@@ -435,13 +445,21 @@ To serve the Studio under a sub-path (e.g. `/studio`), build it with
   the installer with a new `--version`). The Studio migrates its database and
   the engine creates any new tables on start. If you use e2b, rebuild the
   template when `ambient/sandboxes/e2b/templates/` changed in the release.
-- **Backups:** Postgres holds everything except videos:
+- **Backups:** Postgres holds everything except videos and session media:
   ```bash
   docker compose exec -T postgres pg_dumpall -U ambient > ambient-$(date +%F).sql
   ```
-  Videos live in the `videos` volume and, when configured, in S3. With the
-  installer, back up `~/.ambient/.env` too: the restored database needs its
-  `POSTGRES_PASSWORD`.
+  Videos and session media live in the `videos` volume (`/data`) and, when
+  configured, in S3. A session restored without its media loads with notes where
+  the media was. With the installer, back up `~/.ambient/.env` too: the restored
+  database needs its `POSTGRES_PASSWORD`.
+- **Disk use:** with `inprocess`, the agent's clips and frames are kept as files so
+  a resumed session has the same media: under `SESSION_MEDIA_FOLDER`, or in S3 when
+  it's configured. Nothing removes them automatically, so watch free space on that
+  volume. Keep Postgres on at least a few GB too. The bundled Postgres sets
+  `max_wal_size=256MB`, `min_wal_size=64MB` and `wal_compression=on` so write-ahead
+  logs don't fill a small disk. For an external Postgres on a small disk, set the
+  same values.
 - **Costs:** LLM usage dominates. Every session reports token usage and cost
   (the Studio's "Usage & cost" line). With e2b, sandboxes stop after
   `SANDBOX_WALL_SECONDS` idle.
@@ -469,6 +487,7 @@ Engine settings are read from the environment (or a `.env` file), case-insensiti
 | `S3_ENDPOINT`, `S3_BUCKET`, `S3_VIDEO_BASE_KEY` | —, —, `videos` | Object storage |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | — | Object storage credentials |
 | `VIDEO_FOLDER` | `/data/videos` (image) | Local video storage |
+| `SESSION_MEDIA_FOLDER` | `/data/session-media` (image) | Clips and frames kept for resuming sessions, when S3 isn't configured |
 | `YOUTUBE_IMPORT_ENABLED` | `true` | YouTube URL imports |
 | `YOUTUBE_MAX_DURATION_SECONDS` | `10800` | Longest YouTube video accepted (3 h) |
 

@@ -160,6 +160,14 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - max_wal_size=256MB
+      - -c
+      - min_wal_size=64MB
+      - -c
+      - wal_compression=on
     environment:
       POSTGRES_USER: ambient
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run the installer to generate .env}
