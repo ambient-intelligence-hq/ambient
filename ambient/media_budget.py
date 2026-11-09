@@ -32,7 +32,8 @@ limits come in three units, all measured per provider (ambient.capabilities):
      agent's own notes and the tool results' text are never touched.
 
 Reductions are written into the persisted messages, so later turns send the same
-reduced content and caching resumes from the edit point.
+reduced content and caching resumes from the edit point. The originals stay in session
+storage, and a reduced message lists them under ARCHIVE_KEY (ambient.session_media).
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ambient.config import settings
+from ambient.session_media import ARCHIVE_KEY, reference
 
 log = logging.getLogger(__name__)
 
@@ -305,6 +307,20 @@ def _placeholder(msg: dict) -> dict:
 
 # --- fitting ---------------------------------------------------------------------
 
+def _media_urls(msg: dict) -> set[str]:
+    return {_url(b, str(b.get("type"))) for b in _blocks(msg) if b.get("type") in ("image_url", "video_url")}
+
+
+def _keep_originals(old: dict, new: dict) -> dict:
+    """`new` with references to the inline media it dropped from `old`. Every tool turn
+    is saved before the next reduction, so those originals are already in storage."""
+    dropped = sorted(_media_urls(old) - _media_urls(new))
+    refs = [r for r in map(reference, dropped) if r]
+    if not refs:
+        return new
+    return {**new, ARCHIVE_KEY: [*old.get(ARCHIVE_KEY, []), *refs]}
+
+
 @dataclass
 class Reduction:
     before: Cost
@@ -369,7 +385,7 @@ def fit_media_budget(messages: list[dict], budget: MediaBudget,
         else:
             red.thumbnailed += 1
         red.fresh_touched += int(is_fresh)
-        messages[i] = new
+        messages[i] = _keep_originals(messages[i], new)
 
     for degrade in (_thumbnail, _placeholder):
         for i in older:

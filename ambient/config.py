@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     # Local video storage when running from source. The Docker image and installer
     # set VIDEO_FOLDER=/data/videos. Override with VIDEO_FOLDER.
     video_folder: str = os.path.expanduser("~/.local/share/ambient/videos")
+    # Clips and frames a session's agent has seen, kept so a resumed session has the
+    # same media. Used when S3 isn't configured. Defaults to "session-media" next to
+    # video_folder, which is /data/session-media in the Docker image.
+    session_media_folder: str | None = None
     box_video_folder: str = "/tmp/videos/"
     video_clip_duration: int = 60 # secs
     video_clip_fps: int = 5

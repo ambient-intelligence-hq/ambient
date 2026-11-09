@@ -27,6 +27,15 @@ services:
 
   postgres:
     image: postgres:16
+    # The default max_wal_size of 1 GB can fill a small disk (docs/self-hosting.md).
+    command:
+      - postgres
+      - -c
+      - max_wal_size=256MB
+      - -c
+      - min_wal_size=64MB
+      - -c
+      - wal_compression=on
     environment:
       POSTGRES_USER: ambient
       POSTGRES_PASSWORD: ambient
