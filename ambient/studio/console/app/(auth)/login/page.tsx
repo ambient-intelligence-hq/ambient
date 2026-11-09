@@ -6,7 +6,7 @@ import { LoginForm } from "./login-form";
 // Read at request time: the same image serves open and closed installs.
 async function LoginFormForAccess() {
   await connection();
-  return <LoginForm allowSignUp={!isClosedAccess()} />;
+  return <LoginForm openAccess={!isClosedAccess()} />;
 }
 
 export default function Page() {

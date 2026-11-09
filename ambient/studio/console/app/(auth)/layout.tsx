@@ -1,7 +1,5 @@
-import { ArrowLeftIcon } from "lucide-react";
-import Link from "next/link";
-import { SparklesIcon, VercelIcon } from "@/components/chat/icons";
-import { Preview } from "@/components/chat/preview";
+import { AmbientAvatar } from "@/components/chat/ambient-mark";
+import { Card, CardContent } from "@/components/ui/card";
 
 export default function AuthLayout({
   children,
@@ -9,35 +7,23 @@ export default function AuthLayout({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex h-dvh w-screen bg-sidebar">
-      <div className="flex w-full flex-col bg-background p-8 xl:w-[600px] xl:shrink-0 xl:rounded-r-2xl xl:border-r xl:border-border/40 md:p-16">
-        <Link
-          className="flex w-fit items-center gap-1.5 text-[13px] text-muted-foreground transition-colors hover:text-foreground"
-          href="/"
-        >
-          <ArrowLeftIcon className="size-3.5" />
-          Back
-        </Link>
-        <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-10">
-          <div className="flex flex-col gap-2">
-            <div className="mb-2 flex size-9 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground ring-1 ring-border/50">
-              <SparklesIcon size={14} />
-            </div>
-            {children}
+    <main className="flex min-h-dvh w-full flex-col items-center justify-center bg-sidebar px-4 py-16">
+      <div className="flex w-full max-w-sm flex-col gap-8">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <AmbientAvatar className="size-14 rounded-2xl" />
+          <div className="flex flex-col gap-1">
+            <p className="text-xl font-semibold tracking-tight">Ambient</p>
+            <p className="text-sm text-muted-foreground">
+              Video engine for AI agents
+            </p>
           </div>
         </div>
+        <Card className="rounded-2xl border-border/50">
+          <CardContent className="flex flex-col gap-1.5 p-6 sm:p-8">
+            {children}
+          </CardContent>
+        </Card>
       </div>
-
-      <div className="hidden flex-1 flex-col overflow-hidden pl-12 xl:flex">
-        <div className="flex items-center gap-1.5 pt-8 text-[13px] text-muted-foreground/50">
-          Powered by
-          <VercelIcon size={14} />
-          <span className="font-medium text-muted-foreground">AI Gateway</span>
-        </div>
-        <div className="flex-1 pt-4">
-          <Preview />
-        </div>
-      </div>
-    </div>
+    </main>
   );
 }

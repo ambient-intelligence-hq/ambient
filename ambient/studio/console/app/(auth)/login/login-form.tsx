@@ -9,8 +9,9 @@ import { AuthForm } from "@/components/chat/auth-form";
 import { SubmitButton } from "@/components/chat/submit-button";
 import { toast } from "@/components/chat/toast";
 import { type LoginActionState, login } from "../actions";
+import { BackLink } from "../back-link";
 
-export function LoginForm({ allowSignUp }: { allowSignUp: boolean }) {
+export function LoginForm({ openAccess }: { openAccess: boolean }) {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [isSuccessful, setIsSuccessful] = useState(false);
@@ -45,13 +46,14 @@ export function LoginForm({ allowSignUp }: { allowSignUp: boolean }) {
 
   return (
     <>
+      {openAccess ? <BackLink /> : null}
       <h1 className="text-2xl font-semibold tracking-tight">Welcome back</h1>
       <p className="text-sm text-muted-foreground">
         Sign in to your account to continue
       </p>
       <AuthForm action={handleSubmit} defaultEmail={email}>
         <SubmitButton isSuccessful={isSuccessful}>Sign in</SubmitButton>
-        {allowSignUp ? (
+        {openAccess ? (
           <p className="text-center text-[13px] text-muted-foreground">
             {"No account? "}
             <Link

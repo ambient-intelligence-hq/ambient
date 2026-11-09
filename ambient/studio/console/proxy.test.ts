@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { NextRequest } from "next/server";
 import { encode } from "next-auth/jwt";
-import { proxy } from "./proxy";
+import { config, proxy } from "./proxy";
 
 process.env.AUTH_SECRET = "test-secret-for-proxy-tests";
 
@@ -88,5 +88,21 @@ describe("open access", () => {
 
   it("lets guests through", async () => {
     assert.ok(passedThrough(await proxy(await request("/", "guest-123"))));
+  });
+});
+
+describe("matcher", () => {
+  const gated = (path: string) =>
+    config.matcher.some((pattern) => new RegExp(`^${pattern}$`).test(path));
+
+  it("leaves the assets the login page shows signed out public", () => {
+    assert.equal(gated("/icon.png"), false);
+    assert.equal(gated("/ambient-mark.jpg"), false);
+  });
+
+  it("still gates pages and API routes", () => {
+    assert.equal(gated("/"), true);
+    assert.equal(gated("/settings"), true);
+    assert.equal(gated("/api/history"), true);
   });
 });
