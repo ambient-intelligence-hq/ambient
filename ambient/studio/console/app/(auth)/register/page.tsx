@@ -8,6 +8,7 @@ import { AuthForm } from "@/components/chat/auth-form";
 import { SubmitButton } from "@/components/chat/submit-button";
 import { toast } from "@/components/chat/toast";
 import { type RegisterActionState, register } from "../actions";
+import { BackLink } from "../back-link";
 
 export default function Page() {
   const router = useRouter();
@@ -47,8 +48,9 @@ export default function Page() {
 
   return (
     <>
+      <BackLink />
       <h1 className="text-2xl font-semibold tracking-tight">Create account</h1>
-      <p className="text-sm text-muted-foreground">Get started for free</p>
+      <p className="text-sm text-muted-foreground">Get started with Ambient</p>
       <AuthForm action={handleSubmit} defaultEmail={email}>
         <SubmitButton isSuccessful={isSuccessful}>Sign up</SubmitButton>
         <p className="text-center text-[13px] text-muted-foreground">

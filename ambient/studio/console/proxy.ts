@@ -53,12 +53,13 @@ export const config = {
   // `api/ambient/files$` (the video upload) is left out on purpose: a matched
   // request's body is buffered in memory and truncated at 10MB before the route
   // sees it. That route checks sign-in itself. Its subpaths stay matched.
+  // The favicon and brand mark are public: the login page shows them signed out.
   matcher: [
     "/",
     "/chat/:id",
     "/login",
     "/register",
 
-    "/((?!_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt|api/ambient/files$).*)",
+    "/((?!_next/static|_next/image|icon.png|ambient-mark.jpg|sitemap.xml|robots.txt|api/ambient/files$).*)",
   ],
 };
