@@ -16,9 +16,7 @@
   <a href="examples/">Examples</a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/ambient-prompts.gif" alt="Ambient turning a video into five example outcomes" width="800" />
-</p>
+https://github.com/user-attachments/assets/deb79609-dc52-470a-9525-d5f4a78c45dd
 
 🏆 Won 2 tracks and placed second in a third at the [Meta Wearable AI Challenge, ECCV 2026](https://huggingface.co/spaces/facebook/wearable-ai-leaderboard).
 
