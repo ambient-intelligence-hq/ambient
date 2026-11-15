@@ -77,6 +77,8 @@ class E2BMediaSandbox(MediaSandbox):
         self._sem = threading.Semaphore(_MAX_CONCURRENT_CMDS)
         self.sandbox = None
         self.envs = _media_env()
+        # Per-thread handles to the same box (see _handle).
+        self._local = threading.local()
 
     def create(self, *args, **kwargs):
         template = kwargs.get("template")
@@ -85,6 +87,7 @@ class E2BMediaSandbox(MediaSandbox):
         envs = kwargs.get("envs") or  self.envs
         self._keepalive_secs = keepalive
         self.sandbox = Sandbox.create(template, timeout=keepalive,envs=envs)
+        self._local.sandbox = self.sandbox
 
     def connect(self, sandbox_id: str) -> None:
         """Reattach to an already-running sandbox by id.
@@ -94,12 +97,30 @@ class E2BMediaSandbox(MediaSandbox):
         """
         self._keepalive_secs = self._keepalive_secs if getattr(self, "_keepalive_secs", None) else 1800
         self.sandbox = Sandbox.connect(sandbox_id)
+        self._local.sandbox = self.sandbox
 
     @property
     def id(self) -> str:
         if self.sandbox is None:
             raise RuntimeError("Sandbox not created")
         return self.sandbox.sandbox_id
+
+    def _handle(self) -> Sandbox:
+        """This thread's handle to the box.
+
+        The e2b SDK keeps one HTTP/2 connection to the box per thread, but a
+        Sandbox object keeps using the connection of the thread that built it.
+        Tool calls run on separate threads, so sharing one Sandbox made
+        concurrent commands share one connection across threads, and when one
+        command's stream ended the others failed with
+        `httpcore.ReadError: [Errno 35] Resource temporarily unavailable`.
+        Connecting by id from this thread gives it its own connection to the
+        same box."""
+        sb = getattr(self._local, "sandbox", None)
+        if sb is None or sb.sandbox_id != self.sandbox.sandbox_id:
+            sb = Sandbox.connect(self.sandbox.sandbox_id)
+            self._local.sandbox = sb
+        return sb
 
     def run(self, argv: list[str]) -> dict:
         if self.sandbox is None:
@@ -108,10 +129,11 @@ class E2BMediaSandbox(MediaSandbox):
 
         cmd = "python /app/main.py " + " ".join(shlex.quote(a) for a in argv)
         with self._sem:
+            box = self._handle()
             # Refresh the idle timeout so an active session isn't reaped mid-turn.
-            self.sandbox.set_timeout(self._keepalive_secs)
+            box.set_timeout(self._keepalive_secs)
             try:
-                res = self.sandbox.commands.run(
+                res = box.commands.run(
                     cmd,
                     envs=self.envs,
                     cwd="/app",
@@ -137,9 +159,10 @@ class E2BMediaSandbox(MediaSandbox):
         from e2b.sandbox.commands.command_handle import CommandExitException
 
         with self._sem:
-            self.sandbox.set_timeout(self._keepalive_secs)
+            box = self._handle()
+            box.set_timeout(self._keepalive_secs)
             try:
-                res = self.sandbox.commands.run(
+                res = box.commands.run(
                     command,
                     envs=self.envs,
                     cwd="/app",
