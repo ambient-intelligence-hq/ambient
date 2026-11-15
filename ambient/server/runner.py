@@ -238,6 +238,8 @@ class SessionRunner:
         # caller passes the persisted list (already includes the seeded turns).
         self.messages: list[dict] = messages or self._get_seed_messages(model_modalities)
         self._run_task: Optional[asyncio.Task] = None
+        # Serializes _emit: see there.
+        self._emit_lock = asyncio.Lock()
         self._run_lock = asyncio.Lock()
         self._run_finished = True   # no run in progress
         self._run_reductions = 0    # media-budget reductions in the current run
@@ -567,7 +569,7 @@ class SessionRunner:
                     "progress": {"message": "attaching video"},
                 })
                 await self._await_source_ready()
-                await self._attach_video_context(self._agent_base_url(), model)
+                await self._attach_video_context_or_continue(run_id, model)
 
             for turn in range(1, self.max_turns_per_run + 1):
                 # Keep the ownership lease alive for the duration of the run.
@@ -843,6 +845,28 @@ class SessionRunner:
             ):
                 return True
         return False
+
+    async def _attach_video_context_or_continue(self, run_id: str, model: str) -> None:
+        """Agent mode: attach the whole-video context, but never let it end the run.
+
+        The context is a head start; the agent can still inspect the video with
+        its tools. Before this, any media failure here (e.g. the sandbox failing to
+        decode the source) failed the run before the first LLM call, and because
+        the context was never attached, every later message retried and failed the
+        same way, so the session could not answer at all. Nothing is inserted on
+        failure, so the next run tries again (the failure may be transient)."""
+        try:
+            await self._attach_video_context(self._agent_base_url(), model)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - degrade to tools-only
+            log.exception("video context attach failed; continuing without it "
+                          "(session=%s run=%s): %s", self.session_id, run_id, exc)
+            await self._emit("tool.progress", {
+                "run_id": run_id,
+                "turn": 1,
+                "progress": {"message": "video preview unavailable; using tools"},
+            })
 
     async def _attach_video_context(self, base_url: Optional[str], model: str) -> None:
         """Attach the whole video once as a cacheable prefix (right after the system
@@ -1385,7 +1409,14 @@ class SessionRunner:
             })
 
     async def _emit(self, type: str, payload: dict[str, Any]) -> None:
-        ev = await self.store.append_event(self.session_id, type, payload)
-        # Fan out to SSE subscribers on any worker via Redis pub/sub. The store
-        # write above is the durable record; this is the live push.
-        await self.broker.publish(self.session_id, ev)
+        # The store assigns `seq`, then the event is published. Parallel tool
+        # calls emit concurrently, so without the lock an event could be
+        # published after one with a higher seq; live SSE tails skip events at
+        # or below the highest seq they've sent, so that event (e.g. a tool's
+        # agent.tool_use) never reached live clients. Studio then saw a tool
+        # result with no tool call, failed the stream, and replayed the turn.
+        async with self._emit_lock:
+            ev = await self.store.append_event(self.session_id, type, payload)
+            # Fan out to SSE subscribers on any worker via Redis pub/sub. The
+            # store write above is the durable record; this is the live push.
+            await self.broker.publish(self.session_id, ev)
