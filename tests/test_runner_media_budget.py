@@ -161,6 +161,48 @@ class UnexpectedFailureTests(unittest.TestCase):
         self.assertEqual(done[0]["stop_reason"], "error")
 
 
+class VideoContextFailureTests(unittest.TestCase):
+    def _run_with_failing_context(self):
+        r, events = _runner()
+        attempts = []
+
+        async def attach_fails(*_a, **_k):
+            attempts.append(1)
+            raise RuntimeError("sandbox tool failed: DECORDError: cannot find video stream")
+        r._attach_video_context = attach_fails
+        r._has_video_context = lambda: False
+        r.messages.append({"role": "user", "content": [{"type": "text", "text": "q"}]})
+        seen: list = []
+        with mock.patch.object(runner_mod, "self_video_analysis_enabled", lambda _m: True), \
+                mock.patch.object(runner_mod, "stream_chat_completion",
+                                  _fake_stream([_chunks(content="answer from tools")], seen)), \
+                self.assertLogs("ambient.server.runner", level="ERROR"):
+            asyncio.run(r._run_until_done(r.model))
+        return r, events, attempts, seen
+
+    def test_agent_run_continues_without_the_video_context(self):
+        """A media failure while attaching the whole-video context (e.g. the sandbox
+        can't decode the source) used to fail every run before the first LLM call."""
+        r, events, attempts, seen = self._run_with_failing_context()
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(seen), 1)                     # the agent still ran
+        self.assertNotIn("error", [t for t, _ in events])
+        done = [p for t, p in events if t == "run.completed"][-1]
+        self.assertEqual(done["stop_reason"], "end_turn")
+        self.assertEqual(done["answer"], "answer from tools")
+        notes = [p["progress"]["message"] for t, p in events if t == "tool.progress"]
+        self.assertIn("video preview unavailable; using tools", notes)
+
+    def test_cancel_during_attach_is_not_swallowed(self):
+        r, _ = _runner()
+
+        async def cancelled(*_a, **_k):
+            raise asyncio.CancelledError
+        r._attach_video_context = cancelled
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(r._attach_video_context_or_continue("run_x", r.model))
+
+
 class AgentEndpointTests(unittest.TestCase):
     """Clips that go into the agent's conversation are sized for the agent's endpoint,
     not the LLM_* vision endpoint (they differ with AGENT_* or a per-agent base_url)."""
