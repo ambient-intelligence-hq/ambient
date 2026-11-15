@@ -238,6 +238,8 @@ class SessionRunner:
         # caller passes the persisted list (already includes the seeded turns).
         self.messages: list[dict] = messages or self._get_seed_messages(model_modalities)
         self._run_task: Optional[asyncio.Task] = None
+        # Serializes _emit: see there.
+        self._emit_lock = asyncio.Lock()
         self._run_lock = asyncio.Lock()
         self._run_finished = True   # no run in progress
         self._run_reductions = 0    # media-budget reductions in the current run
@@ -1407,7 +1409,14 @@ class SessionRunner:
             })
 
     async def _emit(self, type: str, payload: dict[str, Any]) -> None:
-        ev = await self.store.append_event(self.session_id, type, payload)
-        # Fan out to SSE subscribers on any worker via Redis pub/sub. The store
-        # write above is the durable record; this is the live push.
-        await self.broker.publish(self.session_id, ev)
+        # The store assigns `seq`, then the event is published. Parallel tool
+        # calls emit concurrently, so without the lock an event could be
+        # published after one with a higher seq; live SSE tails skip events at
+        # or below the highest seq they've sent, so that event (e.g. a tool's
+        # agent.tool_use) never reached live clients. Studio then saw a tool
+        # result with no tool call, failed the stream, and replayed the turn.
+        async with self._emit_lock:
+            ev = await self.store.append_event(self.session_id, type, payload)
+            # Fan out to SSE subscribers on any worker via Redis pub/sub. The
+            # store write above is the durable record; this is the live push.
+            await self.broker.publish(self.session_id, ev)
