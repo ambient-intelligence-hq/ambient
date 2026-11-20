@@ -35,7 +35,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --extra e2b
 
       # Modules are listed rather than discovered so one can be left out.
       # test_inspection_metric needs benchmarks/, which isn't committed yet.
@@ -46,7 +46,7 @@ jobs:
               | sed -e 's#/#.#' -e 's#\.py$##' | sort
           )
           echo "Running ${#modules[@]} test modules"
-          uv run --locked python -m unittest "${modules[@]}"
+          uv run --locked --extra e2b python -m unittest "${modules[@]}"
 
   studio:
     name: Studio
