@@ -202,17 +202,87 @@ async def sample_fast_frames(video_id: str, media_box, strategy: "FastStrategy",
         current_media_box.reset(token)
 
 
-def build_fast_frames_message(frames: list) -> dict:
+def build_fast_frames_message(frames: list, note: Optional[str] = None) -> dict:
     """A stable user message carrying the sampled frames as timestamp-labeled
     image blocks. Kept identical across follow-up turns so it stays a cacheable
-    prefix."""
+    prefix. `note` (see `frames_context_note`) tells the agent how much of the
+    video these frames show."""
     from ambient.llm import construct_payload
 
     payload = construct_payload(frames=frames)
+    header = "Frames sampled uniformly across the video (in time order):"
+    if note:
+        header = f"{header}\n{note}"
     return {"role": "user", "content": [
-        {"type": "text", "text": "Frames sampled uniformly across the video (in time order):"},
+        {"type": "text", "text": header},
         *payload,
     ]}
+
+
+# Frames per second that focus_clip / grab_frames return on the frames path (the
+# e2b and range-proxy backends use 1-2 fps).
+TOOL_FRAMES_PER_SECOND = 2
+
+
+def probe_source_video(path: Optional[str]) -> Optional[dict]:
+    """Width, height and frame rate of a local video file via ffprobe, or None."""
+    import json
+    import os
+    import subprocess
+
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,avg_frame_rate", "-of", "json", path],
+            capture_output=True, timeout=30)
+        s = json.loads(r.stdout.decode() or "{}").get("streams", [{}])[0]
+        num, _, den = str(s.get("avg_frame_rate") or "0/1").partition("/")
+        fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+        if not s.get("width") or not s.get("height"):
+            return None
+        return {"width": int(s["width"]), "height": int(s["height"]), "fps": round(fps, 2) or None}
+    except Exception:  # noqa: BLE001 - the note just omits the source details
+        return None
+
+
+def frames_context_note(n_frames: int, duration: float, source: Optional[dict] = None,
+                        frame_dim: Optional[int] = None) -> Optional[str]:
+    """Tell the agent how densely the attached frames cover the video, and so how
+    far it can answer from them. Without this the agent treats even near-complete
+    coverage as a sparse overview and keeps calling tools that cannot show more
+    (and, with the bash tool, crops and upscales frames one image per step)."""
+    if n_frames <= 0 or not duration or duration <= 0:
+        return None
+    gap = duration / n_frames
+    rate = n_frames / duration
+    src = ""
+    at_source_res = False
+    if source:
+        w, h, fps = source.get("width"), source.get("height"), source.get("fps")
+        src = f" The source video is {w}×{h}"
+        if fps:
+            share = min(100.0, 100.0 * n_frames / (fps * duration))
+            src += f" at {fps:g} fps, so these are {share:.0f}% of all its frames"
+        src += "."
+        at_source_res = bool(frame_dim and w and h and max(w, h) <= frame_dim)
+    head = (f"{n_frames} frames over {duration:.1f} s: one every {gap:.2f} s "
+            f"({rate:.1f} per second).{src}")
+    if rate >= TOOL_FRAMES_PER_SECOND:
+        detail = (" No tool shows more than the source's pixels: enlarging, cropping or "
+                  "upscaling these frames adds no detail." if at_source_res else "")
+        return (f"{head} That is at least as dense as focus_clip and grab_frames return "
+                f"(up to {TOOL_FRAMES_PER_SECOND} frames per second).{detail} Answer from "
+                "these frames. Use a tool only for something they do not show, such as the "
+                "exact moment between two of them.")
+    if gap <= 5:
+        return (f"{head} Use them to follow the sequence and find where things happen; "
+                "check fine timing or small details between them with focus_clip or "
+                "grab_frames.")
+    return (f"{head} They are sparse: use them as a map to find where things probably "
+            "happen, then inspect those windows with focus_clip or grab_frames before "
+            "relying on details.")
 
 
 # --- direct video (self-hosted vLLM samples frames itself) -------------------

@@ -620,7 +620,16 @@ async def build_session_record(body: dict, store) -> dict:
         max_turns = int(meta.get("max_turns_per_run") or settings.max_turns_per_run)
     except (TypeError, ValueError):
         max_turns = settings.max_turns_per_run
-        
+    # Per-run spend caps (metadata.max_tool_calls_per_run / max_input_tokens_per_run;
+    # 0 disables one). Omitted -> the engine defaults at run time.
+    run_budget = {}
+    for key in ("max_tool_calls_per_run", "max_input_tokens_per_run"):
+        if meta.get(key) is not None:
+            try:
+                run_budget[key] = max(0, int(meta[key]))
+            except (TypeError, ValueError):
+                raise bad_request(f"metadata.{key} must be an integer, got {meta[key]!r}")
+
     backend = settings.sandbox_backend
     limits_dict = {
         "cpu_seconds": settings.sandbox_cpu_seconds,
@@ -646,6 +655,7 @@ async def build_session_record(body: dict, store) -> dict:
         "quota": {},
         "usage": _empty_usage(),
         "max_turns_per_run": max_turns,
+        "run_budget": run_budget,
         "subtitle_path": None,
         # Managed-Agents echo-back fields:
         "environment_id": environment_id,
@@ -668,6 +678,7 @@ async def create_session(request: Request, body: dict[str, Any] = Body(...)) -> 
         video_id=record["video_id"],
         model=record["model"],
         max_turns_per_run=record["max_turns_per_run"],
+        run_budget=record.get("run_budget"),
         backend=record["sandbox"]["backend"],
         limits=SandboxLimits(**record["sandbox"]["limits"]),
         store=store,
@@ -764,6 +775,7 @@ async def _get_or_rehydrate_runner(session_id: str, request: Request) -> Optiona
         video_id=record["video_id"],
         model=record["model"],
         max_turns_per_run=record["max_turns_per_run"],
+        run_budget=record.get("run_budget"),
         backend=sandbox.get("backend") or settings.sandbox_backend,
         limits=SandboxLimits(**(sandbox.get("limits") or {})),
         store=store,

@@ -161,6 +161,14 @@ class Settings(BaseSettings):
     # metadata.max_turns_per_run is omitted (Studio never sends it). Override
     # with MAX_TURNS_PER_RUN.
     max_turns_per_run: int = 120
+    # Per-run spend caps for one user message (0 = no cap). When a run reaches one,
+    # it stops dispatching tools and the agent writes its final answer from what it
+    # has gathered; it is warned as it nears the cap. Normal runs use about 5-50
+    # tool calls; runaway runs (e.g. the bash tool turning every image into its own
+    # step) went past 150 calls and 10M input tokens. Override per session with
+    # metadata.max_tool_calls_per_run / metadata.max_input_tokens_per_run.
+    max_tool_calls_per_run: int = 60
+    max_input_tokens_per_run: int = 0
     # Analysis-clip quality for the local (non-gemini) vision endpoint. Lower
     # fps/dimension and a size cap make each focus_clip/search_clip analysis call
     # dramatically faster on the vLLM endpoint (60s@2fps/768px≈18s vs

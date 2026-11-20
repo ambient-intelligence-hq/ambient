@@ -48,6 +48,11 @@ _TOOL_LIMIT_NUDGE = (
     "are available. Do not attempt to call any tool. Using everything you "
     "have already gathered, write your complete final answer now."
 )
+_BUDGET_NUDGE = (
+    "You have used this run's budget, so no more tools are available. Do not "
+    "attempt to call any tool. Using everything you have already gathered, write "
+    "your complete final answer now, in the format the task asks for."
+)
 # After this many media-budget reductions in one run, tell the agent (once) that its
 # older frames keep being removed. On tight providers (Fireworks: 95 images) some
 # models otherwise keep collecting frames for 100+ turns.
@@ -102,6 +107,14 @@ def _add_usage_bucket(bucket: dict, usage_norm: dict, cost: float) -> None:
 
 class SandboxNotReady(Exception):
     """A rehydrating worker found no sandbox id yet (creator boot in progress)."""
+
+
+def _local_video_path(video_id: str, rec: Optional[dict]) -> Optional[str]:
+    """The session video on this host's disk (upload copy or VIDEO_FOLDER), if any."""
+    candidates = [(rec or {}).get("local_path")]
+    candidates += [os.path.join(settings.video_folder, f"{video_id}{ext}")
+                   for ext in (".mp4", ".mov", ".mkv", ".webm", ".m4v")]
+    return next((p for p in candidates if p and os.path.exists(p)), None)
 
 
 def _retain_last_n_by_type(messages: list[dict], content_type: str, n: int) -> list[dict]:
@@ -192,8 +205,18 @@ class SessionRunner:
         system: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        run_budget: Optional[dict] = None,
     ):
         self.session_id = session_id
+        # Per-run spend caps (0 = none); see settings.max_tool_calls_per_run.
+        budget = run_budget or {}
+        self.max_tool_calls_per_run = int(budget.get("max_tool_calls_per_run",
+                                                     settings.max_tool_calls_per_run) or 0)
+        self.max_input_tokens_per_run = int(budget.get("max_input_tokens_per_run",
+                                                       settings.max_input_tokens_per_run) or 0)
+        self._run_tool_call_count = 0
+        self._run_input_tokens = 0
+        self._budget_warned = False
         self.video_id = video_id
         self.video_description = None
         # "agent" -> multi-step tool loop; "fast" -> single dense-frame vision call.
@@ -527,6 +550,9 @@ class SessionRunner:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         self._run_finished = False
         self._run_reductions = 0
+        self._run_tool_call_count = 0
+        self._run_input_tokens = 0
+        self._budget_warned = False
         # Tools that add media to this conversation size it for this endpoint.
         self._dispatcher.agent_endpoint = (model, self._agent_base_url())
         self._run_model = model
@@ -614,6 +640,8 @@ class SessionRunner:
 
                 self.usage["turns"] = int(self.usage.get("turns", 0)) + 1
                 await self._record_usage(run_id, turn, model, agent_usage, "agent")
+                if agent_usage:
+                    self._run_input_tokens += int(normalize_usage(agent_usage).get("input_tokens") or 0)
 
                 # Surface the agent's extended thinking as its own event (a text
                 # carrier via the SDK-visible agent.thinking event) so clients can
@@ -653,10 +681,23 @@ class SessionRunner:
 
                 if finish_reason == "tool_calls" and tool_uses:
                     await self._run_tool_calls(run_id, turn, tool_uses)
+                    self._run_tool_call_count += len(tool_uses)
+                    exhausted = self._run_budget_exhausted()
+                    if not exhausted:
+                        self._maybe_warn_budget()
                     # Persist the grown context so another worker can rehydrate it
                     # mid-conversation.
                     await self.store.save_messages(self.session_id, self.messages)
                     await self._persist_usage()
+                    if exhausted:
+                        log.warning("[agent] session %s: run budget reached (%s: %d tool calls, "
+                                    "%d input tokens); forcing the final answer", self.session_id,
+                                    exhausted, self._run_tool_call_count, self._run_input_tokens)
+                        stop_reason = exhausted
+                        forced = await self._synthesize_final_answer(
+                            run_id, model, turn + 1, nudge=_BUDGET_NUDGE)
+                        final_answer = forced or last_assistant_text
+                        break
                 else:
                     final_answer = text
                     stop_reason = "end_turn"
@@ -690,6 +731,35 @@ class SessionRunner:
             await self._fail_run(run_id, exc, final_answer or last_assistant_text)
         finally:
             await self._finish_run(None)
+
+    def _run_budget_exhausted(self) -> Optional[str]:
+        """The stop reason if this run has used up a per-run cap, else None."""
+        if self.max_tool_calls_per_run and self._run_tool_call_count >= self.max_tool_calls_per_run:
+            return "max_tool_calls"
+        if self.max_input_tokens_per_run and self._run_input_tokens >= self.max_input_tokens_per_run:
+            return "max_input_tokens"
+        return None
+
+    def _maybe_warn_budget(self) -> None:
+        """Once per run, when about a quarter of a cap is left, tell the agent so it
+        can spend the rest on what decides the answer instead of being cut off."""
+        if self._budget_warned:
+            return
+        parts = []
+        cap = self.max_tool_calls_per_run
+        if cap and cap - self._run_tool_call_count <= max(3, cap // 4):
+            parts.append(f"{self._run_tool_call_count} of {cap} tool calls used")
+        cap = self.max_input_tokens_per_run
+        if cap and self._run_input_tokens >= 0.75 * cap:
+            parts.append(f"{self._run_input_tokens:,} of {cap:,} input tokens used")
+        if not parts:
+            return
+        self._budget_warned = True
+        self.messages.append({"role": "user", "content": [{
+            "type": "text",
+            "text": (f"Run budget: {'; '.join(parts)}. Stop exploring. Use what is left only "
+                     "for the checks that decide your answer, then write the final answer."),
+        }]})
 
     async def _finish_run(self, completion: Optional[dict]) -> None:
         """End the current run once: persist, mark ready, release the run lease, and
@@ -885,7 +955,7 @@ class SessionRunner:
         # Duration drives the per-step sampling budget (frames = fps x duration,
         # capped). Youtube imports carry it under "youtube"; uploads carry a top-level
         # "duration" probed at ingest (store_video). 0 -> tools probe for it.
-        duration, size_bytes = 0.0, None
+        duration, size_bytes, rec = 0.0, None, None
         try:
             rec = await self.store.get_file(self.video_id)
             if rec:
@@ -943,7 +1013,9 @@ class SessionRunner:
                      self.session_id, sampled, len(frames))
         print(f"[plan_media] attaching frames context for session {self.session_id}, Number of frames: {len(frames)}")
 
-        self.messages.insert(1, fm.build_fast_frames_message(frames))
+        source = await asyncio.to_thread(fm.probe_source_video, _local_video_path(self.video_id, rec))
+        note = fm.frames_context_note(len(frames), duration or _dur or 0.0, source, plan.max_dim)
+        self.messages.insert(1, fm.build_fast_frames_message(frames, note=note))
         log.info(f"[video_context] session {self.session_id}: sampled {len(frames)} frames "
                  f"(cap {plan.max_frames})")
 
