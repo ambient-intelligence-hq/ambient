@@ -15,6 +15,7 @@ Events are persisted to the SQLite store *and* fanned out to subscribers in real
 from __future__ import annotations
 
 import asyncio
+import aiohttp
 import dataclasses
 import json
 import time
@@ -48,6 +49,9 @@ _TOOL_LIMIT_NUDGE = (
     "are available. Do not attempt to call any tool. Using everything you "
     "have already gathered, write your complete final answer now."
 )
+# Waits before re-requesting a turn whose stream the provider dropped mid-response
+# (see SessionRunner._stream_turn). Gateway restarts take a few seconds.
+_STREAM_DROP_DELAYS = (3.0, 10.0)
 _BUDGET_NUDGE = (
     "You have used this run's budget, so no more tools are available. Do not "
     "attempt to call any tool. Using everything you have already gathered, write "
@@ -611,17 +615,8 @@ class SessionRunner:
 
                 prepared = await self._prepare_messages(run_id, turn, model)
 
-                chunks: list[dict] = []
                 try:
-                    async for chunk in stream_chat_completion(
-                        model=model,
-                        messages=prepared,
-                        tools=TOOLS,
-                        base_url=self.base_url,
-                        api_key=self.api_key,
-                    ):
-                        chunks.append(chunk)
-                        await self._emit("chat.completion.chunk", chunk)
+                    chunks = await self._stream_turn(run_id, turn, model, prepared)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -731,6 +726,45 @@ class SessionRunner:
             await self._fail_run(run_id, exc, final_answer or last_assistant_text)
         finally:
             await self._finish_run(None)
+
+    async def _stream_turn(self, run_id: str, turn: int, model: str, prepared: list[dict]) -> list[dict]:
+        """Stream one agent completion, re-requesting it when the provider drops the
+        stream mid-response (connection reset, truncated chunked body).
+
+        llm_client retries failures before the first chunk; this covers drops after
+        it. Some gateways restart and cut every open stream at once (Jarvislabs:
+        "Response payload is not completed"); without this one dropped turn ended
+        the whole run. The retry resends the same messages; only the final
+        attempt's chunks are returned. Clients already received the dropped
+        attempt's deltas, so they get a progress note that the step restarts."""
+        for attempt in range(len(_STREAM_DROP_DELAYS) + 1):
+            chunks: list[dict] = []
+            try:
+                async for chunk in stream_chat_completion(
+                    model=model,
+                    messages=prepared,
+                    tools=TOOLS,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                ):
+                    chunks.append(chunk)
+                    await self._emit("chat.completion.chunk", chunk)
+                return chunks
+            except (aiohttp.ClientPayloadError, aiohttp.ClientConnectionError, ConnectionResetError) as exc:
+                if attempt == len(_STREAM_DROP_DELAYS):
+                    raise
+                delay = _STREAM_DROP_DELAYS[attempt]
+                log.warning("[agent] session %s turn %s: provider stream dropped after %d chunks (%s); "
+                            "retrying the turn in %.0fs (%d/%d)", self.session_id, turn, len(chunks),
+                            type(exc).__name__, delay, attempt + 1, len(_STREAM_DROP_DELAYS))
+                await self._emit("tool.progress", {
+                    "run_id": run_id,
+                    "turn": turn,
+                    "progress": {"message": "model connection dropped; retrying this step",
+                                 "stream_retry": attempt + 1},
+                })
+                await asyncio.sleep(delay)
+        return []  # unreachable: the last attempt returns or raises
 
     def _run_budget_exhausted(self) -> Optional[str]:
         """The stop reason if this run has used up a per-run cap, else None."""

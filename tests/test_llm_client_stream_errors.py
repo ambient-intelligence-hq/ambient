@@ -166,6 +166,12 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(asyncio.run(go()), [chunk])
         self.assertEqual(len(calls), 2)
 
+    def test_request_body_timeout_408_is_retried(self):
+        chunk = {"choices": [{"index": 0, "delta": {"content": "ok"}}]}
+        go, calls = self._serve([(408, []), (200, [json.dumps(chunk), "[DONE]"])])
+        self.assertEqual(asyncio.run(go()), [chunk])
+        self.assertEqual(len(calls), 2)
+
     def test_gives_up_after_retries(self):
         go, calls = self._serve([(503, [])])
         with self.assertRaisesRegex(RuntimeError, "HTTP 503"):
