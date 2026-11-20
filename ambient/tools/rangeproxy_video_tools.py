@@ -31,6 +31,15 @@ from ambient.utils.s3 import get_s3_client
 _RECONNECT = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
 
 
+def _fit_filter(dim: int) -> str:
+    """ffmpeg -vf that fits the frame inside dim x dim (aspect kept) WITHOUT
+    enlarging a smaller source, then snaps both sides to even (libx264 clips need
+    even dimensions). A fixed `scale=dim:-2` upscaled small videos (320x180 ->
+    768x432: 2.5x the bytes, no new detail) and let portrait ones exceed dim."""
+    return (f"scale='min(iw,{dim})':'min(ih,{dim})':force_original_aspect_ratio=decrease,"
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+
+
 class RangeProxyVideoFrameTools:
     FPS = 2
     OVERVIEW_FPS = 2
@@ -96,7 +105,7 @@ class RangeProxyVideoFrameTools:
         reconnect, src = self._input_spec()
         cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", *reconnect,
                "-ss", f"{ts:.3f}", "-i", src, "-frames:v", "1", "-threads", "1",
-               "-vf", f"scale={self.max_dim}:-2", "-pix_fmt", "yuvj420p", "-q:v", "3",
+               "-vf", _fit_filter(self.max_dim), "-pix_fmt", "yuvj420p", "-q:v", "3",
                out_path]
         r = subprocess.run(cmd, capture_output=True)
         return r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0
@@ -162,7 +171,7 @@ class RangeProxyVideoFrameTools:
         reconnect, src = self._input_spec()
         cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", *reconnect,
                "-ss", str(start), "-i", src, "-t", str(dur),
-               "-vf", f"scale={self.max_dim}:-2,fps={fps}",
+               "-vf", f"{_fit_filter(self.max_dim)},fps={fps}",
                "-c:v", "libx264", "-crf", str(crf if crf is not None else 28), "-an",
                "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
         proc = subprocess.run(cmd, capture_output=True)
@@ -213,7 +222,7 @@ class RangeProxyVideoFrameTools:
             reconnect, src = self._input_spec()
             cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", *reconnect,
                    "-ss", str(start), "-i", src, "-t", str(dur),
-                   "-vf", f"scale={self.max_dim}:-2,fps={fps}",
+                   "-vf", f"{_fit_filter(self.max_dim)},fps={fps}",
                    # yuvj420p = JPEG full-range; without it, full-range-YUV sources
                    # make the mjpeg encoder abort ("Non full-range YUV is non-standard").
                    "-pix_fmt", "yuvj420p", "-q:v", "3",
@@ -258,7 +267,7 @@ class RangeProxyVideoFrameTools:
             reconnect, src = self._input_spec()
             cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", *reconnect,
                    "-ss", str(timestamp), "-i", src, "-frames:v", "1",
-                   "-vf", f"scale={dim}:-2", "-pix_fmt", "yuvj420p", "-q:v", "2", out]
+                   "-vf", _fit_filter(dim), "-pix_fmt", "yuvj420p", "-q:v", "2", out]
             r = subprocess.run(cmd, capture_output=True)
             if r.returncode != 0 or not os.path.exists(out):
                 raise RuntimeError(f"range-proxy annotate ffmpeg failed: {r.stderr.decode('utf-8', 'replace')[:200]}")

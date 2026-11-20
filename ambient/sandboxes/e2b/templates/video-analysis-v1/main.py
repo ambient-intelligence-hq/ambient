@@ -98,10 +98,18 @@ TILE_MAX_DIM = int(os.environ.get("TILE_MAX_DIM", "768"))
 TILE_WORKERS = int(os.environ.get("TILE_WORKERS", str(os.cpu_count() or 4)))
 
 
-def _scale_even_filter(dim: int) -> str:
-    """ffmpeg -vf scale that fits within dim x dim (aspect preserved) AND forces
-    even width/height.
+# Marks tile manifests baked with _scale_even_filter's no-upscale fit. Manifests
+# without it were baked by the older filter (small sources enlarged to max_dim)
+# and are rebuilt rather than reused.
+TILE_SCALE = "fit"
 
+
+def _scale_even_filter(dim: int) -> str:
+    """ffmpeg -vf scale that fits within dim x dim (aspect preserved), never
+    enlarges a smaller source, AND forces even width/height.
+
+    The target box is min(source, dim) per side: a fixed `dim:dim` box enlarged
+    small sources (320x180 -> 768x432: 2.5x the bytes, no new detail).
     `force_original_aspect_ratio=decrease` alone can yield an odd side (e.g.
     573x768), which libx264 rejects ("width not divisible by 2"). The trailing
     ``scale=trunc(iw/2)*2:trunc(ih/2)*2`` snaps both sides down to even. Written as
@@ -109,7 +117,7 @@ def _scale_even_filter(dim: int) -> str:
     works on any ffmpeg build in the sandbox base image.
     """
     return (
-        f"scale={dim}:{dim}:force_original_aspect_ratio=decrease,"
+        f"scale='min(iw,{dim})':'min(ih,{dim})':force_original_aspect_ratio=decrease,"
         "scale=trunc(iw/2)*2:trunc(ih/2)*2"
     )
 
@@ -1739,6 +1747,7 @@ def cmd_transcode_tiles(args: argparse.Namespace) -> None:
         and existing.get("fps") == args.fps
         and existing.get("max_dim") == args.max_dim
         and existing.get("tile_seconds") == args.tile_seconds
+        and existing.get("scale") == TILE_SCALE
         and existing.get("tiles")
     ):
         print(f"[tiles] manifest exists ({len(existing['tiles'])} tiles); skipping", file=sys.stderr)
@@ -1815,6 +1824,7 @@ def cmd_transcode_tiles(args: argparse.Namespace) -> None:
         "video_id": args.video_id,
         "fps": args.fps,
         "max_dim": args.max_dim,
+        "scale": TILE_SCALE,
         "tile_seconds": args.tile_seconds,
         "duration": duration,
         "tiles": [
