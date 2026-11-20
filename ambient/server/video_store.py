@@ -148,6 +148,11 @@ def store_video(data: bytes, filename: str | None, mime_type: str | None) -> dic
     if ext in _FASTSTART_EXTS:
         _faststart_in_place(local_path)
     duration = _probe_duration_local(local_path)
+    # Width/height/fps, persisted so every backend (incl. e2b / S3-only workers with
+    # no local copy) can cap frame sampling at the source rate and describe the
+    # source to the agent without probing over the network.
+    from ambient.fast_mode import probe_source_video
+    video_info = probe_source_video(local_path)
 
     r2_key: str | None = None
     try:
@@ -176,6 +181,7 @@ def store_video(data: bytes, filename: str | None, mime_type: str | None) -> dic
         "local_path": local_path,
         "r2_key": r2_key,
         "duration": duration,
+        "video_info": video_info,
         "source_type": "upload",
         "source_status": "ready",
         "source_error": None,
