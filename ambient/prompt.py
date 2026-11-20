@@ -94,13 +94,43 @@ write down what you saw with timestamps, and if you need a reduced range again,
 call focus_clip on it.
 """
 
-    tool_prompt = f"{tool_prompt}\n{escalation_ladder}\n{other_videos_prompt}\n{artifact_prompt}\n{media_budget_prompt}"
+    # The bash tool (settings.enable_bash_tool) is for file work. Without this the
+    # agent used it to crop, upscale and tile the session video's frames and then
+    # opened each result with read_image, one image per step, for 60-80 steps.
+    bash_prompt = "" if not settings.enable_bash_tool else """
+## Shell
+- bash(command): Run a shell command for file work and computation: ffprobe,
+converting or exporting files, measuring or counting values. Do NOT use it as
+another way to look at the session video (extracting, cropping, upscaling, tiling
+or diffing its frames). Upscaling cannot add detail the source does not have, and
+every image you then open costs a full extra step. To look at the video use the
+attached frames, focus_clip and grab_frames. Cropping is worth it only when the
+frames you have are smaller than the source resolution stated with the attached
+frames.
+- If you do open several images with read_image, call read_image for all of them
+in the SAME turn: they run in parallel instead of one step each.
+"""
 
-    return (f"""
-You are a helpful video research assistant that can perform tasks and answer questions about a long video. 
-You have access to tools to search the video and get the highlevel description of the video.
+    tool_prompt = (f"{tool_prompt}\n{escalation_ladder}\n{other_videos_prompt}\n{artifact_prompt}"
+                   f"\n{bash_prompt}\n{media_budget_prompt}")
 
-## What you are given
+    if self_video_analysis_enabled():
+        given_prompt = """## What you are given
+- A `video_id` and the user's question.
+- The video itself, attached at the start of the conversation: either as a video,
+  or as frames sampled uniformly across it. The frames come with a note saying how
+  many there are, how densely they cover the video, and the source resolution.
+- Optional: the required JSON SCHEMA your final answer must conform to.
+
+How far you can trust the attached video depends on that note. When the frames
+are sparse (seconds apart), use them to LOCATE where something probably happens,
+then confirm fine details, exact counts and exact timings with a tool before you
+commit to them. When they are dense (several per second, close to the source frame
+rate), they show the video in as much detail as any tool can: answer from them and
+use tools only for what they do not show.
+"""
+    else:
+        given_prompt = """## What you are given
 - A `video_id` and the user's question.
 - A partial, high-level OVERVIEW of the video, produced by an LLM from fewer than
   ~100 uniformly sampled frames. It is a bird's-eye view: a grouped, timestamped
@@ -112,6 +142,13 @@ timestamps are approximate, so it is reliable for *locating* where something
 probably happens but NOT for deciding fine details, exact counts, exact
 timings, or "what happened at second N". Always confirm the deciding detail with
 a tool before you commit to it.
+"""
+
+    return (f"""
+You are a helpful video research assistant that can perform tasks and answer questions about a long video. 
+You have access to tools to search the video and get the highlevel description of the video.
+
+{given_prompt}
 
 ## How to work the problem
 1. Read the question carefully. If it has multiple parts, decompose it into
@@ -131,8 +168,10 @@ a tool before you commit to it.
 5. For "how does it end / what remained / final state" questions, explicitly
    inspect the ACTUAL end of the video — the overview under-samples endings.
 6. Before answering, VERIFY the deciding evidence at the finest resolution the
-   question warrants (a focused clip, or individual frames). If the tools cannot
-   resolve the answer, say so rather than inventing one.
+   question warrants (a focused clip, or individual frames). If the attached frames
+   are already as dense as the tools return, they ARE that finest view: do not
+   re-inspect the same moments with tools. If you cannot resolve the answer, say so
+   rather than inventing one.
 
 {tool_prompt}
 

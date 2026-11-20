@@ -91,7 +91,7 @@ IMAGE_MODALITY_ONLY_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_image",
-            "description": "Read a standalone image FILE at an absolute path and inspect it directly (e.g. a screenshot, chart, or frame you saved via the bash tool). For frames of the session video use grab_frames instead.",
+            "description": "Read a standalone image FILE at an absolute path and inspect it directly (e.g. a screenshot, chart, or frame you saved via the bash tool). For frames of the session video use grab_frames instead. To look at several images, call read_image for all of them in the same turn (they run in parallel), not one per turn.",
             "parameters": ReadImageTool.model_json_schema(),
         },
     },
@@ -140,8 +140,10 @@ BASH_TOOLS = [
             "description": (
                 "Run a non-interactive shell command via `/bin/sh -c` and get back its "
                 "exit code, stdout, and stderr. Runs inside the session sandbox when one "
-                "is active, otherwise on the host. Use for ffmpeg/ffprobe, inspecting "
-                "files in the working directory, or quick computations."
+                "is active, otherwise on the host. Use for ffprobe/ffmpeg file work, "
+                "inspecting files in the working directory, or quick computations. Not "
+                "for viewing the session video: cropping or upscaling its frames adds no "
+                "detail beyond the source resolution; use focus_clip / grab_frames."
             ),
             "parameters": BashTool.model_json_schema(),
         },

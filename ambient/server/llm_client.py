@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 
 # Transient upstream failures are retried, but only before the first chunk: once
 # output has streamed to the client, a retry would duplicate it. One provider 500
-# (seen on OpenRouter/Alibaba) used to end the whole agent run.
-_RETRY_STATUS = frozenset({429, 500, 502, 503, 504, 529})
+# (seen on OpenRouter/Alibaba) used to end the whole agent run. 408 is a gateway
+# giving up on reading a large (inline-media) request body under load (Jarvislabs:
+# "Request body timed out"); the same request succeeds when resent.
+_RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
 _RETRY_DELAYS = (2.0, 8.0)
 
 
