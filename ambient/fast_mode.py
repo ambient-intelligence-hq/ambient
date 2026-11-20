@@ -159,13 +159,17 @@ def service_from_base_url(base_url: Optional[str]) -> str:
 
 
 async def sample_fast_frames(video_id: str, media_box, strategy: "FastStrategy",
-                             duration: Optional[float] = None):
+                             duration: Optional[float] = None,
+                             source_fps: Optional[float] = None):
     """Uniformly sample `strategy.max_frames` frames across the whole video.
 
     Runs the (blocking) media work on a worker thread; `media_box` is published on
     the `current_media_box` ContextVar so the e2b backend picks it up (None for the
     inprocess backend). `duration` (seconds), when known from the file record, is
-    passed to the tools so they don't probe it. Returns `(frames, duration_seconds)`.
+    passed to the tools so they don't probe it. `source_fps`, when known, caps the
+    sample at the frames the source actually has: asking a 10.4 s, 10 fps clip
+    (104 frames) for 192 made the extractor sample at 19 fps and repeat frames.
+    Returns `(frames, duration_seconds)`.
     """
     from ambient.tools.video_backend import current_media_box, make_video_tools
 
@@ -185,12 +189,16 @@ async def sample_fast_frames(video_id: str, media_box, strategy: "FastStrategy",
             tools.fetch_frames(fps=1, start_time_sec=0, end_time_sec=None, max_frames=1)
             dur = getattr(tools, "_duration_sec", None)
         if dur and dur > 0:
+            # Never ask for more frames than the source has: above the source rate
+            # the extractor repeats frames (pure token cost, no new content).
+            cap = source_frame_count(dur, source_fps)
+            want = min(n, cap) if cap else n
             # The extractor needs an integer fps >= 1 and samples `max_frames`
             # uniformly across the window. Pick the smallest integer fps whose grid
-            # yields >= n candidates, then let max_frames downsample to exactly n.
-            fps = max(1, math.ceil(n / dur))
+            # yields >= want candidates, then let max_frames downsample to exactly want.
+            fps = max(1, math.ceil(want / dur))
             frames = tools.fetch_frames(fps=fps, start_time_sec=0,
-                                        end_time_sec=dur, max_frames=n)
+                                        end_time_sec=dur, max_frames=want)
         else:
             frames = tools.fetch_frames(fps=1, start_time_sec=0, end_time_sec=None, max_frames=n)
         return frames, (dur or 0.0)
@@ -200,6 +208,13 @@ async def sample_fast_frames(video_id: str, media_box, strategy: "FastStrategy",
         return await asyncio.to_thread(_work)
     finally:
         current_media_box.reset(token)
+
+
+def source_frame_count(duration: Optional[float], source_fps: Optional[float]) -> Optional[int]:
+    """Frames a source of `duration` s at `source_fps` holds (None when unknown)."""
+    if not duration or duration <= 0 or not source_fps or source_fps <= 0:
+        return None
+    return max(1, int(duration * source_fps))
 
 
 def build_fast_frames_message(frames: list, note: Optional[str] = None) -> dict:

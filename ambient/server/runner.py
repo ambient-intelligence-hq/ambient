@@ -1033,8 +1033,14 @@ class SessionRunner:
         # On e2b this is the one place fast mode needs a sandbox, so boot it now
         # (no-op if already up, e.g. agent self-video-analysis, or on inprocess).
         await self._ensure_media_box()
+        # Source resolution + frame rate: probed at upload (store_video), else from a
+        # local copy. The frame rate caps the sample at the frames the source has;
+        # both feed the density note.
+        source = (rec or {}).get("video_info") or await asyncio.to_thread(
+            fm.probe_source_video, _local_video_path(self.video_id, rec))
         frames, _dur = await fm.sample_fast_frames(self.video_id, self._media_box, plan,
-                                                   duration=duration or None)
+                                                   duration=duration or None,
+                                                   source_fps=(source or {}).get("fps"))
         # The byte budget needs the frames' real encoded size, known only now.
         sampled = len(frames)
         if sized:
@@ -1047,7 +1053,6 @@ class SessionRunner:
                      self.session_id, sampled, len(frames))
         print(f"[plan_media] attaching frames context for session {self.session_id}, Number of frames: {len(frames)}")
 
-        source = await asyncio.to_thread(fm.probe_source_video, _local_video_path(self.video_id, rec))
         note = fm.frames_context_note(len(frames), duration or _dur or 0.0, source, plan.max_dim)
         self.messages.insert(1, fm.build_fast_frames_message(frames, note=note))
         log.info(f"[video_context] session {self.session_id}: sampled {len(frames)} frames "
